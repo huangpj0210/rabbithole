@@ -1,0 +1,475 @@
+//! 运行时状态机:会话上下线、确认推进、健康上报、规则生命周期。
+//! 设计 §4.1 状态转换表为实现口径。
+
+use crate::session::Session;
+use crate::state::{AppState, ProxyRuntime, ProxyState, TcpPool};
+use rh_protocol::message::{
+    ApplyResult, HealthReport, ServerMessage, ServiceSync, ServiceUpdate, SyncEntity,
+};
+use rh_protocol::{ProxyKind, ProxySpec};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+/// 会话建立:重置确认、状态推进、预热。
+pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
+    let proxies = match state.db.list_proxies(Some(&sess.client_id)).await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    for (_id, _cid, spec) in proxies {
+        let Some(rt) = state.proxies.get(spec.id) else {
+            continue;
+        };
+        // confirmed 重置(会话替换/重连)
+        rt.confirmed_revision.store(0, Ordering::Relaxed);
+        let (st, _r) = rt.snapshot_state().await;
+        let new_state = match st {
+            ProxyState::Offline
+            | ProxyState::Pending
+            | ProxyState::ApplyError
+            | ProxyState::Unhealthy => ProxyState::Pending,
+            ProxyState::BindError | ProxyState::Disabled => st,
+            ProxyState::Running => ProxyState::Pending, // 等新会话确认
+        };
+        rt.set_state(new_state, "session up").await;
+    }
+}
+
+/// 会话断开:关池与通道,状态落 offline。
+pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
+    let proxies = match state.db.list_proxies(Some(&sess.client_id)).await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    // 会话死亡:该客户端全部 SUDP 常驻中继槽位一并清理
+    if let Ok(visitors) = state.db.list_visitors(Some(&sess.client_id)).await {
+        let mut relays = state.udp_relays.lock().await;
+        for (_vid, _, _, vspec) in &visitors {
+            relays.remove(&vspec.id);
+        }
+    }
+    // 若新会话已注册接管,本会话的清理不得波及新会话的池/通道
+    let replaced = state
+        .sessions
+        .get(&sess.client_id)
+        .map(|cur| cur.session_id != sess.session_id)
+        .unwrap_or(false);
+    if replaced {
+        return;
+    }
+    for (_id, _cid, spec) in proxies {
+        let Some(rt) = state.proxies.get(spec.id) else {
+            continue;
+        };
+        rt.confirmed_revision.store(0, Ordering::Relaxed);
+        crate::data::close_proxy_channels(&rt).await;
+        let (st, _) = rt.snapshot_state().await;
+        let new_state = match st {
+            ProxyState::Disabled | ProxyState::BindError => st,
+            _ => ProxyState::Offline,
+        };
+        rt.set_state(new_state, "session down").await;
+    }
+}
+
+/// APPLY_RESULT:推进确认与状态;预热 TCP 池 / 建立 UDP 通道。
+pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &ApplyResult) {
+    if !r.ok {
+        if let Some(err) = &r.error {
+            warn!(reason = %err.reason, "apply error from client");
+            // 定位规则
+            if let Some(pid) = err.service_id {
+                if let Some(rt) = state.proxies.get(pid) {
+                    rt.set_state(ProxyState::ApplyError, &err.reason).await;
+                }
+            }
+        }
+        sess.confirm_applied(r.revision, false).await;
+        // 全量重发
+        let entities = state.build_sync_entities(&sess.client_id).await;
+        let client = state.db.get_client(&sess.client_id).await.ok().flatten();
+        let rev = client.map(|c| c.config_revision.max(0) as u64).unwrap_or(0);
+        sess.mark_unconfirmed(rev).await;
+        let _ = sess
+            .send(ServerMessage::ServiceSync(ServiceSync {
+                revision: rev,
+                entities,
+            }))
+            .await;
+        return;
+    }
+    let still_waiting = sess.confirm_applied(r.revision, true).await;
+    let _ = still_waiting;
+    // 规则状态推进:confirmed ≥ latest → running
+    let proxies = state
+        .db
+        .list_proxies(Some(&sess.client_id))
+        .await
+        .unwrap_or_default();
+    for (_id, _cid, spec) in proxies {
+        let Some(rt) = state.proxies.get(spec.id) else {
+            continue;
+        };
+        rt.confirmed_revision.store(r.revision, Ordering::Relaxed);
+        let latest = rt.latest_revision.load(Ordering::Relaxed);
+        let (st, _) = rt.snapshot_state().await;
+        let confirmed_enough = r.revision >= latest;
+        let bound = rt.bound.load(Ordering::Relaxed);
+        let new_state = match st {
+            ProxyState::Pending if confirmed_enough && bound => ProxyState::Running,
+            ProxyState::ApplyError if confirmed_enough && bound => ProxyState::Running,
+            other => other,
+        };
+        if new_state != st {
+            rt.set_state(new_state, "applied").await;
+            if new_state == ProxyState::Running {
+                warm_proxy(state, sess, &rt, &spec).await;
+            }
+        } else if st == ProxyState::Running {
+            // 已 running 的补充预热(如重连后)
+            warm_proxy(state, sess, &rt, &spec).await;
+        }
+    }
+}
+
+/// 进入 running 后:TCP 池预热 / UDP 通道建立。
+pub async fn warm_proxy(
+    state: &Arc<AppState>,
+    sess: &Arc<Session>,
+    rt: &Arc<ProxyRuntime>,
+    spec: &ProxySpec,
+) {
+    match spec.kind {
+        ProxyKind::Tcp
+        | ProxyKind::Http
+        | ProxyKind::Https
+        | ProxyKind::TcpMux
+        | ProxyKind::Stcp => {
+            crate::data::tcp_refill(state, sess, rt).await;
+        }
+        ProxyKind::Udp => {
+            crate::data::udp_ensure_channel(state, sess, rt).await;
+        }
+        ProxyKind::Sudp => {} // 常驻通道由 visitor 中继按需建立(RelayProxy)
+        ProxyKind::Xtcp => {} // 打洞按需
+    }
+}
+
+/// 健康上报。
+pub async fn on_health_report(state: &Arc<AppState>, _sess: &Arc<Session>, h: HealthReport) {
+    let Some(rt) = state.proxies.get(h.proxy_id) else {
+        return;
+    };
+    rt.healthy.store(h.healthy, Ordering::Relaxed);
+    let (st, _) = rt.snapshot_state().await;
+    let new_state = if h.healthy {
+        if st == ProxyState::Unhealthy {
+            ProxyState::Running
+        } else {
+            st
+        }
+    } else if st == ProxyState::Running {
+        ProxyState::Unhealthy
+    } else {
+        st
+    };
+    if new_state != st {
+        rt.set_state(
+            new_state,
+            &if h.healthy {
+                "healthy".into()
+            } else {
+                format!("unhealthy: {}", h.reason)
+            },
+        )
+        .await;
+        state
+            .events
+            .emit(
+                if h.healthy { "info" } else { "warn" },
+                "service",
+                &format!(
+                    "proxy {} health {}",
+                    h.proxy_id,
+                    if h.healthy { "ok" } else { "failed" }
+                ),
+            )
+            .await;
+    }
+    // 组成员健康变化影响选路(实时读取 healthy)
+}
+
+// ---------------- 规则生命周期(串行域内调用) ----------------
+
+/// 运行态创建/重建规则(禁用状态仅返回 runtime 不 bind)。
+pub async fn spawn_runtime(
+    state: &Arc<AppState>,
+    client_id: &str,
+    spec: &ProxySpec,
+    revision: u64,
+) -> Arc<ProxyRuntime> {
+    if let Some(existing) = state.proxies.get(spec.id) {
+        existing.rule_cancel.cancel();
+    }
+    let rt = Arc::new(ProxyRuntime::new(
+        spec.id,
+        client_id.to_string(),
+        spec.clone(),
+    ));
+    rt.latest_revision.store(revision, Ordering::Relaxed);
+    state.proxies.runtimes.insert(spec.id, rt.clone());
+    let session = state.sessions.get(client_id);
+    let online = session.is_some();
+    let enabled_client = state
+        .db
+        .get_client(client_id)
+        .await
+        .map(|c| c.map(|c| c.enabled).unwrap_or(false))
+        .unwrap_or(false);
+
+    if !spec.enabled || !enabled_client {
+        rt.set_state(ProxyState::Disabled, "disabled").await;
+        state.proxies.rebuild_vhost_routes().await;
+        return rt;
+    }
+
+    // 绑定监听(tcp/udp 独享端口);无独享端口类型视为已绑定
+    let bind_ip: std::net::IpAddr =
+        rh_core::net::parse_bind_ip(&spec.bind_ip).unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+    let mut bind_error = false;
+    // 白名单资格同样适用于恢复/批量重建路径(§4.6 与创建共用资格判定)
+    if spec.kind.uses_bind_port()
+        && spec.bind_port != 0
+        && !state.proxies.port_allowed(spec.bind_port)
+    {
+        bind_error = true;
+        rt.set_state(ProxyState::BindError, "port not in allow_ports")
+            .await;
+        let st = state.clone();
+        let rt2 = rt.clone();
+        tokio::spawn(bind_error_retry(st, rt2));
+    }
+    match spec.kind {
+        ProxyKind::Tcp => {
+            match crate::data::bind_tcp_listener(state, spec, bind_ip).await {
+                Ok(l) => {
+                    // serve loop 独占 listener;运行时仅记录"已绑定"
+                    rt.bound.store(true, Ordering::Relaxed);
+                    *rt.tcp_listener.lock().await = marker_listener();
+                    let rt2 = rt.clone();
+                    let st2 = state.clone();
+                    tokio::spawn(async move {
+                        crate::data::tcp_serve_loop(st2, rt2, l).await;
+                    });
+                }
+                Err(e) => {
+                    bind_error = true;
+                    rt.set_state(ProxyState::BindError, &format!("bind: {e}"))
+                        .await;
+                    let st = state.clone();
+                    let rt2 = rt.clone();
+                    tokio::spawn(bind_error_retry(st, rt2));
+                }
+            }
+        }
+        ProxyKind::Udp => match crate::data::bind_udp_socket(state, spec, bind_ip).await {
+            Ok(sock) => {
+                rt.bound.store(true, Ordering::Relaxed);
+                *rt.udp_socket.lock().await = Some(sock.clone());
+                let st2 = state.clone();
+                let rt2 = rt.clone();
+                tokio::spawn(crate::data::udp_serve_loop(st2, rt2, sock));
+            }
+            Err(e) => {
+                bind_error = true;
+                rt.set_state(ProxyState::BindError, &format!("bind: {e}"))
+                    .await;
+                let st = state.clone();
+                let rt2 = rt.clone();
+                tokio::spawn(bind_error_retry(st, rt2));
+            }
+        },
+        // http/https/tcpmux/stcp/sudp/xtcp:无独享端口,绑定条件恒真
+        _ => rt.bound.store(true, Ordering::Relaxed),
+    }
+    // 初始池
+    if matches!(
+        spec.kind,
+        ProxyKind::Tcp | ProxyKind::Http | ProxyKind::Https | ProxyKind::TcpMux | ProxyKind::Stcp
+    ) {
+        *rt.pool.lock().await = Some(Arc::new(TcpPool::new(spec.pool_size.max(1) as usize)));
+    }
+    // 状态:bind_error 保持(§4.1:期间照常收集客户端确认);否则按在线与否
+    if !bind_error {
+        if online {
+            rt.set_state(ProxyState::Pending, "created").await;
+        } else {
+            rt.set_state(ProxyState::Offline, "created").await;
+        }
+    }
+    state.proxies.rebuild_vhost_routes().await;
+    // 入队增量(在线时;bind_error 也入队,恢复绑定后按 confirmed 直达 running)
+    if let Some(sess) = session {
+        rt.latest_revision.store(revision, Ordering::Relaxed);
+        sess.mark_unconfirmed(revision).await;
+        let _ = sess
+            .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                revision,
+                entity: SyncEntity::Proxy(Box::new(spec.clone())),
+            })))
+            .await;
+    }
+    rt
+}
+
+/// bind_error 周期重试(60s);port_auto 立即重分配由调用方处理。
+async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
+    loop {
+        tokio::select! {
+            _ = rt.rule_cancel.cancelled() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+        }
+        let spec = rt.spec.read().await.clone();
+        if !spec.enabled || !spec.kind.uses_bind_port() && spec.kind != ProxyKind::Tcp {
+            continue;
+        }
+        let bind_ip: std::net::IpAddr = rh_core::net::parse_bind_ip(&spec.bind_ip)
+            .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+        // 拉起 serve loop(首次绑定失败时从未启动)
+        let bound = if spec.kind == ProxyKind::Tcp {
+            match crate::data::bind_tcp_listener(&state, &spec, bind_ip).await {
+                Ok(l) => {
+                    let st2 = state.clone();
+                    let rt2 = rt.clone();
+                    tokio::spawn(async move {
+                        crate::data::tcp_serve_loop(st2, rt2, l).await;
+                    });
+                    true
+                }
+                Err(_) => false,
+            }
+        } else {
+            match crate::data::bind_udp_socket(&state, &spec, bind_ip).await {
+                Ok(sock) => {
+                    let st2 = state.clone();
+                    let rt2 = rt.clone();
+                    tokio::spawn(crate::data::udp_serve_loop(st2, rt2, sock));
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+        if !bound {
+            continue;
+        }
+        rt.bound.store(true, Ordering::Relaxed);
+        // 按会话与确认推进(§4.1 bind_error 恢复行)
+        if let Some(sess) = state.sessions.get(&rt.client_id) {
+            let confirmed = rt.confirmed_revision.load(Ordering::Relaxed);
+            let latest = rt.latest_revision.load(Ordering::Relaxed);
+            if confirmed >= latest && latest > 0 {
+                rt.set_state(ProxyState::Running, "bind recovered").await;
+                warm_proxy(&state, &sess, &rt, &spec).await;
+            } else {
+                // 未确认:入队增量等待确认后转 running
+                rt.set_state(ProxyState::Pending, "bind recovered").await;
+                let rev = latest.max(1);
+                sess.mark_unconfirmed(rev).await;
+                let _ = sess
+                    .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                        revision: rev,
+                        entity: SyncEntity::Proxy(Box::new(spec.clone())),
+                    })))
+                    .await;
+            }
+        } else {
+            rt.set_state(ProxyState::Offline, "bind recovered").await;
+        }
+        state
+            .events
+            .emit(
+                "info",
+                "service",
+                &format!("proxy {} bind recovered", spec.name),
+            )
+            .await;
+        return;
+    }
+}
+
+/// 移除运行态(取消域级联)。
+pub async fn teardown_runtime(state: &Arc<AppState>, proxy_id: u64) {
+    if let Some((_, rt)) = state.proxies.runtimes.remove(&proxy_id) {
+        rt.rule_cancel.cancel();
+        crate::data::close_proxy_channels(&rt).await;
+        // 失效该规则在途 CREATE 请求:迟到回显不得进入新运行时(§4.5 代次隔离)
+        if let Some(sess) = state.sessions.get(&rt.client_id) {
+            sess.invalidate_proxy_requests(proxy_id).await;
+        }
+    }
+    state.proxies.rebuild_vhost_routes().await;
+}
+
+pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
+    // 客户端重新 enable:全部规则批量恢复
+    let proxies = state
+        .db
+        .list_proxies(Some(client_id))
+        .await
+        .unwrap_or_default();
+    let client = state.db.get_client(client_id).await.ok().flatten();
+    let Some(c) = client else { return };
+    let revision = c.config_revision.max(0) as u64;
+    for (_id, _cid, mut spec) in proxies {
+        if !spec.enabled {
+            continue;
+        }
+        crate::db::normalize_spec(&mut spec, state.cfg.limits.default_pool_size);
+        let _rt = spawn_runtime(state, client_id, &spec, revision).await;
+        info!(proxy = spec.name, "recovered after client enable");
+    }
+    // visitors 重发(全量 SYNC 更简单且正确)
+    if let Some(sess) = state.sessions.get(client_id) {
+        let entities = state.build_sync_entities(client_id).await;
+        sess.mark_unconfirmed(revision).await;
+        let _ = sess
+            .send(ServerMessage::ServiceSync(ServiceSync {
+                revision,
+                entities,
+            }))
+            .await;
+    }
+}
+
+/// 占位 listener(表示"已绑定"状态;真正监听由 serve loop 持有)。
+fn marker_listener() -> Option<tokio::net::TcpListener> {
+    None
+}
+
+/// 非端口字段变更的原位发布(§4.3):listener/池不动,仅更新运行态快照并入队。
+/// 返回 false 表示不适用(端口/类型变更或运行时缺失),调用方走重建路径。
+pub async fn publish_spec_in_place(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    spec: &ProxySpec,
+    revision: u64,
+) -> bool {
+    *rt.spec.write().await = spec.clone();
+    rt.latest_revision.store(revision, Ordering::Relaxed);
+    if let Some(sess) = state.sessions.get(&rt.client_id) {
+        sess.mark_unconfirmed(revision).await;
+        let _ = sess
+            .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                revision,
+                entity: SyncEntity::Proxy(Box::new(spec.clone())),
+            })))
+            .await;
+        let (st, _) = rt.snapshot_state().await;
+        if st == ProxyState::Running {
+            rt.set_state(ProxyState::Pending, "updated").await;
+        }
+    }
+    state.proxies.rebuild_vhost_routes().await;
+    true
+}

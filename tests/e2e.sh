@@ -1,0 +1,725 @@
+#!/usr/bin/env bash
+# rabbithole E2E 多进程测试套件。
+# 用法: tests/e2e.sh [二进制目录](默认 target/release)
+# 自带临时目录与独立端口,不依赖外部状态;每项输出 PASS/FAIL。
+set -u
+BIN_DIR="${1:-$(dirname "$0")/../target/release}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORK=$(mktemp -d /tmp/rh-e2e.XXXXXX)
+SERVER="$ROOT/$BIN_DIR/rh-server"
+CLIENT="$ROOT/$BIN_DIR/rh-client"
+PASS=0; FAIL=0
+PIDS=()
+
+cleanup() {
+  for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  # 外部服务由本脚本启动的都在 PIDS 里;日志留档一份便于排查
+  rm -rf /tmp/rh-e2e-last
+  cp -r "$WORK" /tmp/rh-e2e-last 2>/dev/null
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+ok()   { PASS=$((PASS+1)); echo "PASS: $1"; }
+bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
+check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2"; fi; }
+
+# ---------- 端口(避开常用) ----------
+API_PORT=18080; CTL_PORT=18100; VHOST_HTTP=18081; TCPMUX_PORT=18082
+ECHO_TCP=18091; ECHO_UDP=18092; HTTP_ORIGIN=18093; HDR_PORT=18094
+P_TCP=18301; P_UDP=18302; P_COMP=18303; P_PPRO=18304; P_REFUSED=18305
+DEAD_PORT=18999  # 无监听端口(目标拒连测试)
+MM_PORT=18401; P_MM=18411   # 中间人端口 / multiplex=false 规则端口
+V_STCP=18310; V_SUDP=18311; V_XTCP=18312
+ADMIN_USER="admin"; ADMIN_PASS="E2e-pass-123"
+
+echo "== rabbithole E2E($WORK)=="
+# 全局卫生:清理先前运行残留的同端口进程(不同 WORK 目录的孤儿)
+for pid in $(ps -eo pid,args | grep -E "rh-(client|server) --config /tmp/rh-" | grep -v grep | grep -v "$WORK" | awk '{print $1}'); do kill "$pid" 2>/dev/null; done
+sleep 0.5
+
+# ---------- 基础服务 ----------
+python3 - "$ECHO_TCP" <<'EOF' &
+import socket, threading, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(64)
+def echo(c):
+    try:
+        while True:
+            d = c.recv(65536)
+            if not d: break
+            c.sendall(d)
+    except OSError: pass
+    finally: c.close()
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=echo, args=(c,), daemon=True).start()
+EOF
+PIDS+=($!)
+
+python3 - "$ECHO_UDP" <<'EOF' &
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    d, a = s.recvfrom(65536)
+    s.sendto(d, a)
+EOF
+PIDS+=($!)
+
+python3 - "$HTTP_ORIGIN" "$WORK/www" <<'EOF' &
+import http.server, socketserver, sys, os
+os.makedirs(sys.argv[2], exist_ok=True)
+open(os.path.join(sys.argv[2], "index.html"), "w").write("origin-ok")
+class H(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **k): super().__init__(*a, directory=sys.argv[2], **k)
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+EOF
+PIDS+=($!)
+
+python3 - "$HDR_PORT" "$WORK" <<'EOF' &
+import socket, threading, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
+def h(c):
+    try: open(sys.argv[2] + "/hdr.log", "wb").write(c.recv(65536))
+    except OSError: pass
+    c.close()
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=h, args=(c,), daemon=True).start()
+EOF
+PIDS+=($!)
+
+# DNS stub:任意 A 查询应答 127.0.0.1(客户端 dns_server 指向它)
+python3 - 19553 <<'DNSEOF' &
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    q, a = s.recvfrom(1500)
+    if len(q) < 12:
+        continue
+    resp = q[:2] + bytes([0x81, 0x80]) + q[4:6] + bytes([0, 1, 0, 0, 0, 0]) + q[12:]
+    resp += bytes([0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, 1])
+    s.sendto(resp, a)
+DNSEOF
+PIDS+=($!)
+sleep 1
+
+# ---------- 服务端 ----------
+ssh-keygen -q -t ed25519 -N "" -f "$WORK/sshkey" >/dev/null 2>&1
+printf '%s\n' "$(cat "$WORK/sshkey.pub")" > "$WORK/authorized_keys"
+cat > "$WORK/server.toml" <<EOF
+bind_addr = "127.0.0.1"
+bind_protocol = "tcp"
+bind_port = $CTL_PORT
+multiplex = true
+[web]
+bind_addr = "127.0.0.1"
+port = $API_PORT
+[vhost]
+http_port = $VHOST_HTTP
+https_port = 0
+tcpmux_port = $TCPMUX_PORT
+subdomain_host = "e2e.test"
+[ssh_gateway]
+enabled = true
+bind_port = 19700
+authorized_keys_file = "$WORK/authorized_keys"
+[ports]
+auto_range = "20000-21000"
+[log]
+level = "info"
+EOF
+
+"$SERVER" --config "$WORK/server.toml" admin create "$ADMIN_USER" "$ADMIN_PASS" >/dev/null 2>&1
+check $? "管理员创建"
+"$SERVER" --config "$WORK/server.toml" >"$WORK/server.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+
+api() { curl -s -m 10 -H "Authorization: Bearer $TOKEN" "$@"; }
+TOKEN=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["accessToken"])' 2>/dev/null)
+[ -n "$TOKEN" ]; check $? "登录获取 JWT"
+
+# 错误密码拒绝(envelope:HTTP200 + code!=0)
+lcode=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/auth/login" \
+  -H 'Content-Type: application/json' -d '{"username":"admin","password":"wrong"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')
+[ "$lcode" != "0" ]; check $? "错误密码拒绝(code!=0)"
+
+# 未授权 401
+code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$API_PORT/api/services")
+[ "$code" = "401" ]; check $? "无令牌 401"
+
+# ---------- 客户端 ----------
+CRESP=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/clients" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"name":"e2e"}')
+CID=$(echo "$CRESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')
+CSECRET=$(echo "$CRESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["secret"])')
+[ -n "$CID" ] && [ -n "$CSECRET" ]; check $? "创建客户端并取凭据"
+
+# 列表不泄露密钥
+leak=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" | grep -c "$CSECRET")
+[ "$leak" = "0" ]; check $? "列表响应不含密钥"
+
+cat > "$WORK/client.toml" <<EOF
+server_addr = "127.0.0.1:$CTL_PORT"
+protocol = "tcp"
+multiplex = true
+client_id = "$CID"
+secret = "$CSECRET"
+dns_server = "127.0.0.1:19553"
+log_level = "info"
+EOF
+"$CLIENT" --config "$WORK/client.toml" >"$WORK/client.log" 2>&1 &
+PIDS+=($!)
+sleep 3
+online=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["online"])')
+[ "$online" = "True" ]; check $? "客户端上线"
+
+mk_svc() { api -X POST "http://127.0.0.1:$API_PORT/api/services" -H 'Content-Type: application/json' -d "$1"; }
+mk_vis() { api -X POST "http://127.0.0.1:$API_PORT/api/visitors" -H 'Content-Type: application/json' -d "$1"; }
+
+# ---------- TCP ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":$P_TCP,\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true}" >/dev/null
+sleep 2
+python3 - "$P_TCP" <<'EOF' && ok "TCP 转发+大负载" || bad "TCP 转发+大负载"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+p = b"x" * 300000 + b"-TAIL-"
+s.sendall(p); s.settimeout(10)
+g = b""
+while len(g) < len(p):
+    d = s.recv(65536)
+    if not d: break
+    g += d
+sys.exit(0 if g == p else 1)
+EOF
+
+python3 - "$P_TCP" <<'EOF' && ok "TCP 半关闭" || bad "TCP 半关闭"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=8)
+s.sendall(b"half\n"); s.shutdown(socket.SHUT_WR); s.settimeout(8)
+g = b""
+while True:
+    d = s.recv(4096)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"half\n" else 1)
+EOF
+
+python3 - "$P_TCP" <<'EOF' && ok "TCP 10 并发" || bad "TCP 10 并发"
+import socket, sys, threading
+res = []
+def w(i):
+    try:
+        c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+        m = f"c{i}\n".encode(); c.sendall(m); c.settimeout(10)
+        r = b""
+        while len(r) < len(m):
+            d = c.recv(256)
+            if not d: break
+            r += d
+        res.append(r == m); c.close()
+    except Exception:
+        res.append(False)
+ts = [threading.Thread(target=w, args=(i,)) for i in range(10)]
+[t.start() for t in ts]; [t.join() for t in ts]
+sys.exit(0 if all(res) and len(res) == 10 else 1)
+EOF
+
+# ---------- UDP ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"udp\",\"kind\":\"udp\",\"bind_port\":$P_UDP,\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_UDP,\"enabled\":true}" >/dev/null
+sleep 2
+python3 - "$P_UDP" <<'EOF' && ok "UDP 转发" || bad "UDP 转发"
+import socket, sys
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(8)
+u.sendto(b"udp-ok\n", ("127.0.0.1", int(sys.argv[1])))
+try:
+    d, _ = u.recvfrom(65536)
+    sys.exit(0 if d == b"udp-ok\n" else 1)
+except socket.timeout:
+    sys.exit(1)
+EOF
+
+# ---------- 压缩 ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"comp\",\"kind\":\"tcp\",\"bind_port\":$P_COMP,\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"transport\":{\"use_compression\":true,\"bandwidth_mode\":\"server\",\"proxy_proto\":\"none\"}}" >/dev/null
+sleep 2
+python3 - "$P_COMP" <<'EOF' && ok "snappy 压缩端到端" || bad "snappy 压缩端到端"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+p = (b"compress-" * 40000)[:400000]
+s.sendall(p); s.settimeout(10)
+g = b""
+while len(g) < len(p):
+    d = s.recv(65536)
+    if not d: break
+    g += d
+sys.exit(0 if g == p else 1)
+EOF
+
+# ---------- PROXY protocol v1 ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"ppro\",\"kind\":\"tcp\",\"bind_port\":$P_PPRO,\"target_host\":\"127.0.0.1\",\"target_port\":$HDR_PORT,\"enabled\":true,\"transport\":{\"use_compression\":false,\"bandwidth_mode\":\"server\",\"proxy_proto\":\"v1\"}}" >/dev/null
+sleep 2
+python3 - "$P_PPRO" "$WORK" <<'EOF' && ok "PROXY protocol v1" || bad "PROXY protocol v1"
+import socket, sys, time, os
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=6)
+s.sendall(b"data\n"); time.sleep(0.6); s.close()
+time.sleep(0.6)
+try:
+    d = open(sys.argv[2] + "/hdr.log", "rb").read()
+    sys.exit(0 if d.startswith(b"PROXY TCP4") and d.endswith(b"data\n") else 1)
+except FileNotFoundError:
+    sys.exit(1)
+EOF
+
+# ---------- HTTP vhost ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"web\",\"kind\":\"http\",\"target_host\":\"127.0.0.1\",\"target_port\":$HTTP_ORIGIN,\"enabled\":true,\"http\":{\"custom_domains\":[\"app.e2e.test\"]}}" >/dev/null
+sleep 2
+body=$(curl -s -m 8 -H "Host: app.e2e.test" "http://127.0.0.1:$VHOST_HTTP/")
+[ "$body" = "origin-ok" ]; check $? "HTTP vhost 域名路由"
+body404=$(curl -s -m 8 -o /dev/null -w "%{http_code}" -H "Host: none.e2e.test" "http://127.0.0.1:$VHOST_HTTP/")
+[ "$body404" = "404" ]; check $? "HTTP vhost 未知域名 404"
+
+# ---------- STCP ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"sdb\",\"kind\":\"stcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"stcp\":{\"secret_key\":\"sk1\"}}" >/dev/null
+mk_vis "{\"client_id\":\"$CID\",\"name\":\"sdb-v\",\"kind\":\"stcp\",\"bind_port\":$V_STCP,\"target_proxy_name\":\"sdb\",\"secret_key\":\"sk1\",\"enabled\":true}" >/dev/null
+sleep 2
+python3 - "$V_STCP" <<'EOF' && ok "STCP visitor" || bad "STCP visitor"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+s.sendall(b"stcp\n"); s.shutdown(socket.SHUT_WR); s.settimeout(8)
+g = b""
+while True:
+    d = s.recv(4096)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"stcp\n" else 1)
+EOF
+
+# ---------- SUDP ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"udbs\",\"kind\":\"sudp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_UDP,\"enabled\":true,\"sudp\":{\"secret_key\":\"uk1\"}}" >/dev/null
+mk_vis "{\"client_id\":\"$CID\",\"name\":\"udbs-v\",\"kind\":\"sudp\",\"bind_port\":$V_SUDP,\"target_proxy_name\":\"udbs\",\"secret_key\":\"uk1\",\"enabled\":true}" >/dev/null
+sleep 2
+python3 - "$V_SUDP" <<'EOF' && ok "SUDP visitor" || bad "SUDP visitor"
+import socket, sys
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(8)
+u.sendto(b"sudp\n", ("127.0.0.1", int(sys.argv[1])))
+try:
+    d, _ = u.recvfrom(65536)
+    sys.exit(0 if d == b"sudp\n" else 1)
+except socket.timeout:
+    sys.exit(1)
+EOF
+
+# ---------- 健康检查(失败转不健康 → 目标恢复转健康) ----------
+DEAD_HC=18999
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"hsvc\",\"kind\":\"tcp\",\"bind_port\":$((P_TCP+90)),\"target_host\":\"127.0.0.1\",\"target_port\":$DEAD_HC,\"enabled\":true,\"health_check\":{\"type\":\"tcp\",\"interval_seconds\":1,\"timeout_seconds\":1,\"max_failed\":2}}" >/dev/null
+sleep 5
+st=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; print([s["status"] for s in json.load(sys.stdin)["data"] if s["name"]=="hsvc"][0])')
+[ "$st" = "unhealthy" ]; check $? "健康检查失败转 unhealthy"
+
+python3 - "$DEAD_HC" <<'EOF' &
+import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(8)
+s.settimeout(1); end = time.time() + 10
+while time.time() < end:
+    try:
+        c, _ = s.accept(); c.close()
+    except socket.timeout:
+        pass
+EOF
+HCPID=$!
+sleep 5
+st=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; print([s["status"] for s in json.load(sys.stdin)["data"] if s["name"]=="hsvc"][0])')
+[ "$st" = "running" ]; check $? "健康检查恢复转 running"
+kill "$HCPID" 2>/dev/null
+
+# ---------- XTCP ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"xsvc\",\"kind\":\"xtcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"xtcp\":{\"secret_key\":\"xk1\"}}" >/dev/null
+mk_vis "{\"client_id\":\"$CID\",\"name\":\"xsvc-v\",\"kind\":\"xtcp\",\"bind_port\":$V_XTCP,\"target_proxy_name\":\"xsvc\",\"secret_key\":\"xk1\",\"enabled\":true}" >/dev/null
+sleep 2
+python3 - "$V_XTCP" <<'EOF' && ok "XTCP 打洞直连" || bad "XTCP 打洞直连"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=20)
+s.sendall(b"xtcp\n"); s.shutdown(socket.SHUT_WR); s.settimeout(12)
+g = b""
+try:
+    while True:
+        d = s.recv(4096)
+        if not d: break
+        g += d
+except Exception: pass
+sys.exit(0 if g == b"xtcp\n" else 1)
+EOF
+
+# ---------- 端口冲突 ----------
+python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',19999)); s.listen(1); time.sleep(30)" &
+OCC=$!; PIDS+=($OCC)
+sleep 1
+conflict=$(mk_svc "{\"client_id\":\"$CID\",\"name\":\"cf\",\"kind\":\"tcp\",\"bind_port\":19999,\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')
+[ "$conflict" != "0" ]; check $? "创建时端口冲突拒绝"
+kill $OCC 2>/dev/null
+
+# 更新冲突保留原状态:把 tcp 规则改绑到被占端口
+python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',19998)); s.listen(1); time.sleep(20)" &
+OCC2=$!; PIDS+=($OCC2)
+sleep 1
+SVC_ID=$(api "http://127.0.0.1:$API_PORT/api/services" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["id"] for s in d if s["name"]=="tcp"][0])')
+ucode=$(api -X PUT "http://127.0.0.1:$API_PORT/api/services/$SVC_ID" -H 'Content-Type: application/json' \
+  -d "{\"client_id\":\"$CID\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":19998,\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')
+[ "$ucode" != "0" ]; check $? "更新时端口冲突拒绝"
+python3 - "$P_TCP" <<'EOF' && ok "冲突后原规则仍可用" || bad "冲突后原规则仍可用"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=6)
+s.sendall(b"still\n"); s.shutdown(socket.SHUT_WR); s.settimeout(6)
+g = b""
+while True:
+    d = s.recv(256)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"still\n" else 1)
+EOF
+kill $OCC2 2>/dev/null
+
+# 非端口变更(§4.3 原位发布):同端口换 target → 转发即时切换、listener 不重建
+api -X PUT "http://127.0.0.1:$API_PORT/api/services/$SVC_ID" -H 'Content-Type: application/json' \
+  -d "{\"client_id\":\"$CID\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":$P_TCP,\"target_host\":\"127.0.0.1\",\"target_port\":$HTTP_ORIGIN,\"enabled\":true}" >/dev/null
+sleep 2
+python3 - "$P_TCP" <<'EOF' && ok "非端口更新原位切换目标" || bad "非端口更新原位切换目标"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=6)
+s.sendall(b"GET / HTTP/1.0\r\n\r\n"); s.settimeout(6)
+g = b""
+while True:
+    d = s.recv(4096)
+    if not d: break
+    g += d
+sys.exit(0 if b"origin-ok" in g else 1)
+EOF
+# 恢复原 target(再次原位发布)
+api -X PUT "http://127.0.0.1:$API_PORT/api/services/$SVC_ID" -H 'Content-Type: application/json' \
+  -d "{\"client_id\":\"$CID\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":$P_TCP,\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true}" >/dev/null
+sleep 1
+
+# 外部具体地址占用 + 通配探针:规则 bind_ip=0.0.0.0,持有者 127.0.0.1:19997
+python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',19997)); s.listen(1); time.sleep(20)" &
+OCC3=$!; PIDS+=($OCC3)
+sleep 1
+ucode3=$(api -X PUT "http://127.0.0.1:$API_PORT/api/services/$SVC_ID" -H 'Content-Type: application/json' \
+  -d "{\"client_id\":\"$CID\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":19997,\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')
+[ "$ucode3" != "0" ]; check $? "通配探针拒绝外部占用端口"
+python3 - "$P_TCP" <<'EOF' && ok "探针拒绝后原规则仍可用" || bad "探针拒绝后原规则仍可用"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=6)
+s.sendall(b"still2\n"); s.shutdown(socket.SHUT_WR); s.settimeout(6)
+g = b""
+while True:
+    d = s.recv(256)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"still2\n" else 1)
+EOF
+kill $OCC3 2>/dev/null
+
+# ---------- 启停 ----------
+api -X POST "http://127.0.0.1:$API_PORT/api/services/$SVC_ID/disable" >/dev/null
+sleep 1
+python3 -c "
+import socket, sys
+try:
+    socket.create_connection(('127.0.0.1', $P_TCP), timeout=2).close()
+    sys.exit(1)
+except ConnectionRefusedError:
+    sys.exit(0)" ; check $? "停用后端口关闭"
+api -X POST "http://127.0.0.1:$API_PORT/api/services/$SVC_ID/enable" >/dev/null
+sleep 2
+python3 - "$P_TCP" <<'EOF' && ok "重新启用恢复转发" || bad "重新启用恢复转发"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=8)
+s.sendall(b"re\n"); s.shutdown(socket.SHUT_WR); s.settimeout(6)
+g = b""
+while True:
+    d = s.recv(256)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"re\n" else 1)
+EOF
+
+# ---------- TCPMux(HTTP CONNECT 复用入口) ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"mux\",\"kind\":\"tcpmux\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"tcpmux\":{\"custom_domains\":[\"mux.e2e.test\"]}}" >/dev/null
+sleep 2
+code=$(printf 'CONNECT mux.e2e.test:%s HTTP/1.1\r\nHost: mux.e2e.test\r\n\r\n' "$ECHO_TCP" | nc -w 5 127.0.0.1 "$TCPMUX_PORT" | head -1)
+echo "$code" | grep -q "200"; check $? "TCPMux CONNECT 200"
+
+# ---------- 插件:static_file ----------
+mkdir -p "$WORK/plugin_root" && echo "static-content-ok" > "$WORK/plugin_root/hello.txt"
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"sf\",\"kind\":\"tcp\",\"bind_port\":$((P_TCP+20)),\"target_host\":\"127.0.0.1\",\"target_port\":1,\"enabled\":true,\"plugin\":{\"kind\":\"static_file\",\"local_path\":\"$WORK/plugin_root\"}}" >/dev/null
+sleep 2
+body=$(curl -s -m 8 "http://127.0.0.1:$((P_TCP+20))/hello.txt")
+[ "$body" = "static-content-ok" ]; check $? "插件 static_file 服务文件"
+
+# ---------- 插件:unix_domain_socket ----------
+python3 - "$WORK/uds.sock" <<'UDSEOF' &
+import socket, sys, os, threading
+path = sys.argv[1]
+try: os.unlink(path)
+except OSError: pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path); s.listen(8)
+def e(c):
+    try:
+        while True:
+            d = c.recv(4096)
+            if not d: break
+            c.sendall(d)
+    except OSError: pass
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=e, args=(c,), daemon=True).start()
+UDSEOF
+UDSPID=$!
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"uds\",\"kind\":\"tcp\",\"bind_port\":$((P_TCP+21)),\"target_host\":\"127.0.0.1\",\"target_port\":1,\"enabled\":true,\"plugin\":{\"kind\":\"unix_domain_socket\",\"unix_path\":\"$WORK/uds.sock\"}}" >/dev/null
+sleep 2
+python3 - "$((P_TCP+21))" <<'EOF' && ok "插件 unix_domain_socket 回显" || bad "插件 unix_domain_socket 回显"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=8)
+p = b"uds-echo\n"
+s.sendall(p); s.settimeout(8)
+g = b""
+while len(g) < len(p):
+    d = s.recv(128)
+    if not d: break
+    g += d
+sys.exit(0 if g == p else 1)
+EOF
+kill "$UDSPID" 2>/dev/null
+
+# ---------- 负载均衡 group(不健康成员被摘除) ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"g1\",\"kind\":\"tcp\",\"bind_port\":$((P_TCP+22)),\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"group\":\"gg\",\"group_key\":\"gk\"}" >/dev/null
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"g2\",\"kind\":\"tcp\",\"bind_port\":$((P_TCP+23)),\"target_host\":\"127.0.0.1\",\"target_port\":18998,\"enabled\":true,\"group\":\"gg\",\"group_key\":\"gk\",\"health_check\":{\"type\":\"tcp\",\"interval_seconds\":1,\"timeout_seconds\":1,\"max_failed\":1}}" >/dev/null
+sleep 6
+okg=0
+for i in 1 2 3 4 5 6; do
+  if python3 - "$((P_TCP+22))" <<'EOF'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=6)
+p = b"g\n"; s.sendall(p); s.settimeout(6)
+g = b""
+while len(g) < len(p):
+    d = s.recv(64)
+    if not d: break
+    g += d
+sys.exit(0 if g == p else 1)
+EOF
+  then okg=$((okg+1)); fi
+done
+[ "$okg" = "6" ]; check $? "group LB 全部命中健康成员($okg/6)"
+
+# ---------- 带宽限制(server 模式 512KB/s) ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"bw\",\"kind\":\"tcp\",\"bind_port\":$((P_TCP+24)),\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"transport\":{\"bandwidth_limit\":\"512KB\",\"bandwidth_mode\":\"server\"}}" >/dev/null
+sleep 2
+t0=$(python3 -c 'import time; print(time.time())')
+python3 - "$((P_TCP+24))" <<'EOF'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=20)
+p = b"x" * (1024 * 1024)  # 1MB:512KB/s 下至少 ~2s
+s.sendall(p); s.settimeout(30)
+g = b""
+while len(g) < len(p):
+    d = s.recv(65536)
+    if not d: break
+    g += d
+sys.exit(0 if g == p else 1)
+EOF
+BW_RC=$?
+t1=$(python3 -c 'import time; print(time.time())')
+dur=$(python3 -c "print(f'{$t1-$t0:.1f}')")
+[ "$BW_RC" = "0" ] && python3 -c "import sys; sys.exit(0 if $t1-$t0 >= 1.5 else 1)"
+check $? "带宽限制 1MB@512KB/s 耗时 ${dur}s(≥1.5s)"
+
+# ---------- 自定义 DNS 解析(客户端 dns_server) ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"dnsr\",\"kind\":\"tcp\",\"bind_port\":$((P_TCP+25)),\"target_host\":\"rh-dns.test\",\"target_port\":$ECHO_TCP,\"enabled\":true}" >/dev/null
+sleep 2
+python3 - "$((P_TCP+25))" <<'EOF' && ok "自定义 DNS 解析目标域名" || bad "自定义 DNS 解析目标域名"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=8)
+p = b"dns-resolve\n"
+s.sendall(p); s.settimeout(8)
+g = b""
+while len(g) < len(p):
+    d = s.recv(128)
+    if not d: break
+    g += d
+sys.exit(0 if g == p else 1)
+EOF
+
+# ---------- SSH Tunnel Gateway(ssh -R 注册) ----------
+SSH_GW=19700
+# authorized_keys 与密钥已在服务端启动前生成(server.toml 引用)
+ssh -i "$WORK/sshkey" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o ExitOnForwardFailure=yes -o BatchMode=yes -p $SSH_GW \
+  -R 0:127.0.0.1:$ECHO_TCP "$CID@127.0.0.1" sleep 15 2>"$WORK/ssh_err" &
+SSHPID=$!
+ALLOC_PORT=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  ALLOC_PORT=$(grep -o 'Allocated port [0-9]*' "$WORK/ssh_err" | head -1 | awk '{print $3}')
+  [ -n "$ALLOC_PORT" ] && break
+  sleep 0.5
+done
+if [ -n "$ALLOC_PORT" ]; then
+  ok "ssh -R 注册(分配端口 $ALLOC_PORT)"
+else
+  bad "ssh -R 注册(未拿到分配端口)"
+fi
+sleep 1
+python3 - "$ALLOC_PORT" <<'EOF' && ok "SSH 隧道转发数据" || bad "SSH 隧道转发数据"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=8)
+p = b"ssh-tunnel\n"
+s.sendall(p); s.settimeout(8)
+g = b""
+while len(g) < len(p):
+    d = s.recv(256)
+    if not d: break
+    g += d
+sys.exit(0 if g == p else 1)
+EOF
+kill "$SSHPID" 2>/dev/null; PIDS+=("$SSHPID")
+sleep 2
+python3 - "$ALLOC_PORT" <<'EOF' && ok "ssh 断开后端口释放" || bad "ssh 断开后端口释放"
+import socket, sys
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3).close()
+    sys.exit(1)  # 还能连上 = 未释放
+except (ConnectionRefusedError, socket.timeout, OSError):
+    sys.exit(0)
+EOF
+
+
+# ---------- 密钥轮换 ----------
+NEW_SECRET=$(api -X POST "http://127.0.0.1:$API_PORT/api/clients/$CID/rotate-secret" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["secret"])')
+[ -n "$NEW_SECRET" ] && [ "$NEW_SECRET" != "$CSECRET" ]; check $? "密钥轮换返回新密钥"
+sleep 4
+# 旧密钥客户端应被踢出
+online_after=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["online"])')
+[ "$online_after" = "False" ]; check $? "轮换后旧会话下线"
+# 用新密钥重连
+sed -i '' "s/^secret = .*/secret = \"$NEW_SECRET\"/" "$WORK/client.toml"
+for pid in $(ps -eo pid,args | grep -F -- "--config $WORK/client.toml" | grep -v grep | awk '{print $1}'); do
+  kill "$pid" 2>/dev/null   # 老客户端(全部实例)
+done
+"$CLIENT" --config "$WORK/client.toml" >>"$WORK/client.log" 2>&1 &
+PIDS+=($!)
+sleep 4
+online2=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["online"])')
+[ "$online2" = "True" ]; check $? "新密钥重连上线"
+
+# ---------- 重启恢复 ----------
+SRV_PID=$(ps -eo pid,args | grep -F -- "--config $WORK/server.toml" | grep -v grep | awk '{print $1}' | head -1)
+kill "$SRV_PID"; sleep 3
+"$SERVER" --config "$WORK/server.toml" >>"$WORK/server.log" 2>&1 &
+PIDS[4]=$!
+sleep 5
+rec=$(grep -c recovered "$WORK/server.log"); [ "$rec" -ge 1 ]; check $? "服务端重启恢复规则"
+python3 - "$P_TCP" <<'EOF' && ok "重启后 TCP 恢复转发" || bad "重启后 TCP 恢复转发"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=12)
+s.sendall(b"rec\n"); s.shutdown(socket.SHUT_WR); s.settimeout(10)
+g = b""
+while True:
+    d = s.recv(256)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"rec\n" else 1)
+EOF
+python3 - "$P_UDP" <<'EOF' && ok "重启后 UDP 恢复转发" || bad "重启后 UDP 恢复转发"
+import socket, sys
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(10)
+u.sendto(b"rec\n", ("127.0.0.1", int(sys.argv[1])))
+try:
+    d, _ = u.recvfrom(65536)
+    sys.exit(0 if d == b"rec\n" else 1)
+except socket.timeout:
+    sys.exit(1)
+EOF
+
+# ---------- 统计与事件 ----------
+# 重启后 JWT 密钥更换:重新登录
+TOKEN=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["accessToken"])')
+stats=$(api "http://127.0.0.1:$API_PORT/api/stats/overview")
+echo "$stats" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; sys.exit(0 if d["clients_total"]>=1 and d["services_total"]>=6 else 1)'
+check $? "统计总览"
+events=$(api "http://127.0.0.1:$API_PORT/api/events?limit=5" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"])>0)')
+[ "$events" = "True" ]; check $? "事件查询"
+metrics=$(curl -s -m 5 "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")
+[ "$metrics" -gt 3 ]; check $? "Prometheus 指标暴露"
+
+# ---------- 首次启动引导 + 修改密码(独立短环境) ----------
+BOOT="$WORK/boot"; mkdir -p "$BOOT"
+cat > "$BOOT/s.toml" <<EOF5
+bind_addr = "127.0.0.1"
+bind_protocol = "tcp"
+bind_port = 19195
+[web]
+bind_addr = "127.0.0.1"
+port = 19196
+[vhost]
+http_port = 0
+https_port = 0
+tcpmux_port = 0
+[log]
+level = "info"
+EOF5
+"$SERVER" --config "$BOOT/s.toml" >"$BOOT/out.log" 2>&1 &
+BOOT_PID=$!; PIDS+=($BOOT_PID)
+sleep 2
+BOOT_PW=$(grep -o "password: [A-Za-z0-9]*" "$BOOT/out.log" | head -1 | awk '{print $2}')
+[ "${#BOOT_PW}" -ge 16 ]; check $? "首次启动引导:控制台一次性展示随机密码"
+BOOT_T=$(curl -s -X POST "http://127.0.0.1:19196/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"$BOOT_PW\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["accessToken"])' 2>/dev/null)
+[ -n "$BOOT_T" ]; check $? "首次启动引导:初始密码可登录"
+bad=$(curl -s -X POST "http://127.0.0.1:19196/api/auth/password" -H "Authorization: Bearer $BOOT_T" \
+  -H 'Content-Type: application/json' -d "{\"old_password\":\"WRONG\",\"new_password\":\"Boot-New-456\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["code"])')
+[ "$bad" != "0" ]; check $? "修改密码:错误旧密码被拒(code=$bad)"
+chg=$(curl -s -X POST "http://127.0.0.1:19196/api/auth/password" -H "Authorization: Bearer $BOOT_T" \
+  -H 'Content-Type: application/json' -d "{\"old_password\":\"$BOOT_PW\",\"new_password\":\"Boot-New-456\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["code"])')
+[ "$chg" = "0" ]; check $? "修改密码:正确旧密码修改成功"
+stale=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $BOOT_T" "http://127.0.0.1:19196/api/clients")
+[ "$stale" = "401" ]; check $? "修改密码:旧会话令牌立即失效($stale)"
+NEW_T=$(curl -s -X POST "http://127.0.0.1:19196/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"Boot-New-456\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["accessToken"])' 2>/dev/null)
+[ -n "$NEW_T" ]; check $? "修改密码:新密码可登录"
+oldpw=$(curl -s -X POST "http://127.0.0.1:19196/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"$BOOT_PW\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["code"])')
+[ "$oldpw" != "0" ]; check $? "修改密码:旧密码被拒绝(code=$oldpw)"
+kill $BOOT_PID 2>/dev/null
+sleep 1
+"$SERVER" --config "$BOOT/s.toml" >"$BOOT/out2.log" 2>&1 &
+BOOT_PID2=$!; PIDS+=($BOOT_PID2)
+sleep 2
+banner2=$(grep -c "password:" "$BOOT/out2.log")
+[ "$banner2" = "0" ]; check $? "重启不重复引导(无密码横幅)"
+RT=$(curl -s -X POST "http://127.0.0.1:19196/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"Boot-New-456\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["accessToken"])' 2>/dev/null)
+[ -n "$RT" ]; check $? "重启后修改过的密码持久有效"
+kill $BOOT_PID2 2>/dev/null
+
+echo
+echo "== 结果: PASS=$PASS FAIL=$FAIL =="
+[ "$FAIL" = "0" ]

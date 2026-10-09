@@ -1,0 +1,29 @@
+# rabbithole 服务端配置示例。所有键均可省略(见 config.rs 默认值)。
+bind_addr = "0.0.0.0"
+bind_protocol = "tcp"
+bind_port = 7100
+multiplex = true
+
+[web]
+bind_addr = "127.0.0.1"
+port = 8080
+# static_dir = "./web/dist"
+
+[vhost]
+http_port = 8081
+https_port = 0
+tcpmux_port = 8082
+subdomain_host = "rabbithole.test"
+
+[ports]
+auto_range = "10000-25000"
+
+[limits]
+max_pool_size = 16
+default_pool_size = 2
+
+[ssh_gateway]
+enabled = false
+
+[log]
+level = "info"

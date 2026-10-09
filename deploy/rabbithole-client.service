@@ -1,0 +1,17 @@
+[Unit]
+Description=rabbithole client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rabbithole
+Group=rabbithole
+ExecStart=/usr/local/bin/rh-client --config /etc/rabbithole/client.toml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

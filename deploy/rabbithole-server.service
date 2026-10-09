@@ -1,0 +1,22 @@
+[Unit]
+Description=rabbithole server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rabbithole
+Group=rabbithole
+ExecStart=/usr/local/bin/rh-server --config /etc/rabbithole/server.toml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+# 硬化(按需调整)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rabbithole
+StateDirectory=rabbithole
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,355 @@
+//! rh-server 入口:配置加载、迁移、启动恢复、控制面/vhost/SSH 网关/管理面监听。
+
+mod api;
+mod config;
+mod control;
+mod data;
+mod db;
+mod events;
+mod nathole;
+mod recovery;
+mod runtime;
+mod session;
+mod sshgateway;
+mod state;
+mod vhost;
+mod visitor;
+
+use clap::{Parser, Subcommand};
+use rh_transport::{Protocol, ServerTransportConfig, TlsServerOptions};
+use state::AppState;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+#[derive(Parser)]
+#[command(name = "rh-server", version)]
+struct Cli {
+    #[arg(short, long, default_value = "rh-server.toml")]
+    config: std::path::PathBuf,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// 管理员账号操作。
+    Admin {
+        #[command(subcommand)]
+        action: AdminAction,
+    },
+    /// 在目录下生成自签 TLS 证书(cert.pem / key.pem)。
+    Gencert { dir: std::path::PathBuf },
+}
+
+#[derive(Subcommand)]
+enum AdminAction {
+    /// 创建初始管理员。
+    Create { username: String, password: String },
+}
+
+fn init_tracing(cfg: &config::ServerConfig) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log.level));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// 首次启动引导:users 表为空时创建 admin 账号与随机密码。
+/// 密码仅打印到控制台(stdout,非 tracing 日志,不落盘不进事件),
+/// 与客户端一次性凭据同语义;已有任何用户则跳过(幂等)。
+async fn bootstrap_initial_admin(state: &Arc<crate::state::AppState>) {
+    match state.db.count_users().await {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "initial admin bootstrap: count users failed");
+            return;
+        }
+    }
+    // 随机密码:两个 UUID v4(OsRng)拼接取 24 位
+    let pw = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )[..24]
+        .to_string();
+    let hash = match api::hash_password(&pw) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "initial admin bootstrap: hash failed");
+            return;
+        }
+    };
+    if let Err(e) = state.db.create_user("admin", &hash).await {
+        tracing::warn!(error = %e, "initial admin bootstrap: create failed");
+        return;
+    }
+    state
+        .events
+        .emit(
+            "info",
+            "auth",
+            "initial admin account created (random password printed to server console; change it after first login)",
+        )
+        .await;
+    println!(
+        "\n============================================================\n  初始管理员账号已创建(密码仅此一次展示,请立即登录并修改):\n    username: admin\n    password: {pw}\n============================================================\n"
+    );
+}
+
+fn tls_opts_from(files: &Option<config::TlsServerFileConfig>) -> TlsServerOptions {
+    match files {
+        Some(t) if t.cert_file.is_some() && t.key_file.is_some() => TlsServerOptions {
+            cert_pem: t
+                .cert_file
+                .as_ref()
+                .map(|p| std::fs::read(p).unwrap_or_default()),
+            key_pem: t
+                .key_file
+                .as_ref()
+                .map(|p| std::fs::read(p).unwrap_or_default()),
+            persist_prefix: None,
+        },
+        _ => TlsServerOptions::default(),
+    }
+}
+
+/// 协议需要 TLS 而未配置证书时,自动生成并以 <prefix> 落盘复用。
+fn tls_opts_or_auto(
+    files: &Option<config::TlsServerFileConfig>,
+    proto: Protocol,
+    persist_prefix: std::path::PathBuf,
+) -> TlsServerOptions {
+    let mut o = tls_opts_from(files);
+    if matches!(proto, Protocol::Tls | Protocol::Wss | Protocol::Quic) && o.cert_pem.is_none() {
+        o.persist_prefix = Some(persist_prefix);
+    }
+    o
+}
+
+fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTransportConfig>> {
+    let cfg_dir = cfg
+        .config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut out = Vec::new();
+    let main_proto = Protocol::parse(&cfg.bind_protocol)
+        .ok_or_else(|| anyhow::anyhow!("bad bind_protocol {}", cfg.bind_protocol))?;
+    out.push(ServerTransportConfig {
+        protocol: main_proto,
+        bind_addr: format!("{}:{}", cfg.bind_addr, cfg.bind_port).parse()?,
+        multiplex: cfg.multiplex,
+        tls: tls_opts_or_auto(&cfg.tls, main_proto, cfg_dir.join("certs/rh-main")),
+        alpn: vec!["rhtp".into()],
+    });
+    for l in &cfg.extra_listeners {
+        let proto = Protocol::parse(&l.protocol)
+            .ok_or_else(|| anyhow::anyhow!("bad listener protocol {}", l.protocol))?;
+        let prefix = cfg_dir.join(format!("certs/rh-{}-{}", l.protocol, l.bind_port));
+        out.push(ServerTransportConfig {
+            protocol: proto,
+            bind_addr: format!(
+                "{}:{}",
+                l.bind_addr.clone().unwrap_or_else(|| cfg.bind_addr.clone()),
+                l.bind_port
+            )
+            .parse()?,
+            multiplex: l.multiplex.unwrap_or(cfg.multiplex),
+            tls: tls_opts_or_auto(&l.tls, proto, prefix),
+            alpn: vec!["rhtp".into()],
+        });
+    }
+    Ok(out)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let cfg_path = std::fs::canonicalize(&cli.config)
+        .map_err(|e| anyhow::anyhow!("config {:?}: {e}", cli.config))?;
+    let cfg = config::ServerConfig::load(&cfg_path)?;
+    init_tracing(&cfg);
+    let db_dir = cfg_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let db_path = format!("sqlite://{}/rabbithole.db", db_dir.display());
+    let db = db::Db::open(&db_path).await?;
+    match cli.cmd {
+        Some(Cmd::Admin {
+            action: AdminAction::Create { username, password },
+        }) => {
+            let hash = api::hash_password(&password)?;
+            db.create_user(&username, &hash).await?;
+            println!("admin {username} created");
+            return Ok(());
+        }
+        Some(Cmd::Gencert { dir }) => {
+            std::fs::create_dir_all(&dir)?;
+            let opts = TlsServerOptions {
+                persist_prefix: Some(dir.join("rh-server")),
+                ..Default::default()
+            };
+            let (cert, key) = rh_transport::tls::auto_cert(&opts)?;
+            std::fs::write(dir.join("cert.pem"), &cert)?;
+            std::fs::write(dir.join("key.pem"), &key)?;
+            println!("cert written to {}", dir.display());
+            return Ok(());
+        }
+        None => {}
+    }
+    let state = Arc::new(AppState::new(cfg.clone(), db));
+    // 首次启动引导:无任何用户时创建 admin + 随机密码,仅在控制台一次性展示。
+    bootstrap_initial_admin(&state).await;
+    // 启动恢复:双方 enabled 的规则重新绑定。
+    recovery::recover_all(&state).await;
+    // 控制面监听
+    for tc in load_control_cfgs(&cfg)? {
+        info!(addr = %tc.bind_addr, proto = ?tc.protocol, "control listener starting");
+        tokio::spawn(control::serve_transport(state.clone(), tc));
+    }
+    // vhost 监听
+    if cfg.vhost.http_port > 0 {
+        let l =
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.vhost.http_port)).await?;
+        info!(port = cfg.vhost.http_port, "vhost http up");
+        tokio::spawn(vhost::http_vhost_serve(state.clone(), l));
+    }
+    if cfg.vhost.https_port > 0 {
+        let l =
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.vhost.https_port)).await?;
+        info!(port = cfg.vhost.https_port, "vhost https up");
+        tokio::spawn(vhost::https_vhost_serve(state.clone(), l));
+    }
+    if cfg.vhost.tcpmux_port > 0 {
+        let l =
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.vhost.tcpmux_port)).await?;
+        info!(port = cfg.vhost.tcpmux_port, "vhost tcpmux up");
+        let pt = cfg.vhost.tcpmux_passthrough;
+        tokio::spawn(vhost::tcpmux_serve(state.clone(), l, pt));
+    }
+    // SSH Tunnel Gateway
+    if cfg.ssh_gateway.enabled {
+        let key_dir = cfg
+            .ssh_gateway
+            .auto_gen_key_dir
+            .clone()
+            .unwrap_or_else(|| db_dir.join("certs"));
+        let gw = sshgateway::SshGateway::new(state.clone(), key_dir);
+        tokio::spawn(gw.serve());
+    }
+    // 管理 API
+    let mut app = api::router(state.clone());
+    if let Some(dir) = &cfg.web.static_dir {
+        // SPA:静态文件优先;未知路径回退 index.html 并返回 200(history 路由可用)
+        let static_root = dir.clone();
+        app = app.fallback(move |req: axum::http::Request<axum::body::Body>| {
+            let serve = tower_http::services::ServeDir::new(static_root.clone());
+            let index_path = static_root.join("index.html");
+            let is_api = req.uri().path().starts_with("/api/");
+            async move {
+                use axum::response::IntoResponse;
+                use tower::ServiceExt;
+                if is_api {
+                    return crate::api::err(404, "not found");
+                }
+                let resp = match serve.oneshot(req).await {
+                    Ok(r) => r,
+                    Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                if resp.status() != axum::http::StatusCode::NOT_FOUND {
+                    return resp.map(axum::body::Body::new);
+                }
+                match tokio::fs::read(&index_path).await {
+                    Ok(body) => axum::response::Html(body).into_response(),
+                    Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        });
+    }
+    let web_addr: std::net::SocketAddr =
+        format!("{}:{}", cfg.web.bind_addr, cfg.web.port).parse()?;
+    if !web_addr.ip().is_loopback() && cfg.web.tls_cert.is_none() {
+        warn!("web api binds non-loopback without TLS; ensure a HTTPS reverse proxy is in front");
+    }
+    info!(addr = %web_addr, "web api up");
+    let listener = tokio::net::TcpListener::bind(web_addr).await?;
+    let shutdown = {
+        let state = state.clone();
+        async move {
+            shutdown_signal().await;
+            state.shutdown.cancel();
+            // 给运行时任务一点时间收尾
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    };
+    // 可选 TLS:包装 TcpListener 为 axum Listener
+    if let (Some(cert_p), Some(key_p)) = (&cfg.web.tls_cert, &cfg.web.tls_key) {
+        let rustls_cfg = rh_transport::tls::server_config(&TlsServerOptions {
+            cert_pem: Some(std::fs::read(cert_p)?),
+            key_pem: Some(std::fs::read(key_p)?),
+            persist_prefix: None,
+        })?;
+        let tls_listener = TlsListener {
+            inner: listener,
+            acceptor: tokio_rustls::TlsAcceptor::from(rustls_cfg),
+        };
+        axum::serve(tls_listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
+    } else {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
+    }
+    Ok(())
+}
+
+/// 包装 TLS 的 axum Listener(管理面 HTTPS)。
+struct TlsListener {
+    inner: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((sock, addr)) => match self.acceptor.accept(sock).await {
+                    Ok(tls) => return (tls, addr),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "web tls handshake failed");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "web accept error");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+}

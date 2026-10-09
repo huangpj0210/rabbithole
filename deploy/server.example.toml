@@ -1,0 +1,54 @@
+# rabbithole 服务端示例配置(生产部署请修改全部口令/密钥/域名)
+
+# 控制面主监听(tcp/tls/ws/wss/quic/kcp)
+bind_addr = "0.0.0.0"
+bind_protocol = "tls"          # 公网建议 tls;本机调试可用 tcp
+bind_port = 7100
+multiplex = true
+
+# 追加监听(可选;不同协议/端口)
+# [[listeners]]
+# protocol = "kcp"
+# bind_port = 7101
+# multiplex = true
+
+[web]
+bind_addr = "127.0.0.1"        # 管理面默认仅本地;对外请置反向代理 + HTTPS
+port = 8080
+# jwt_secret = "change-me-32-bytes-minimum-secret!!"
+jwt_ttl_hours = 12
+# static_dir = "../web/apps/web-antd/dist"   # 前端静态资源(SPA 回退已内置)
+
+[vhost]
+http_port = 8081
+https_port = 8443              # 0 = 关闭
+tcpmux_port = 8082
+subdomain_host = "example.com"
+# custom_404_page = "/etc/rabbithole/404.html"
+
+[ssh_gateway]
+enabled = false
+bind_port = 2222
+bind_addr = "0.0.0.0"
+# authorized_keys_file = "/etc/rabbithole/authorized_keys"
+# auto_gen_key_dir = "/var/lib/rabbithole/certs"
+
+[ports]
+auto_range = "20000-21000"
+allow_ports = ["10000-40000"]  # 空 = 不限制
+max_services_per_client = 32
+
+[limits]
+max_data_conns_per_client = 256
+pool_wait_timeout_ms = 8000
+default_pool_size = 4
+udp_packet_size = 65536
+
+[nathole]
+# stun_server = ""             # XTCP 打洞;空 = 本机地址候选
+
+[metrics]
+enabled = true
+
+[log]
+level = "info"

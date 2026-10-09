@@ -1,0 +1,30 @@
+# rabbithole 客户端示例配置
+# server_addr / client_id / secret 必填;凭据在 Web 控制台"客户端"页创建(仅展示一次)
+
+server_addr = "203.0.113.10:7100"
+protocol = "tls"               # 与服务端监听协议一致
+multiplex = true
+
+client_id = "00000000-0000-0000-0000-000000000000"
+secret = "在控制台创建客户端时获取"
+
+# TLS
+# trusted_ca_file = "/etc/rabbithole/ca.pem"
+# server_name = "rabbithole.example.com"
+tls_insecure_skip_verify = false
+# tls_pin_sha256 = ""
+
+# 经 HTTP/SOCKS5 代理连服务端(可选)
+# proxy_url = "http://user:pass@proxy:8080"
+
+
+# XTCP 打洞 STUN(可选)
+# stun_server = "1.2.3.4:3478"
+
+# 自定义 DNS(可选;解析规则目标域名时使用)
+# dns_server = "10.0.0.1:53"
+
+log_level = "info"
+
+# 规则(转发/访问器)由服务端集中下发,客户端配置文件不再声明规则;
+# 重启/重连自动恢复。

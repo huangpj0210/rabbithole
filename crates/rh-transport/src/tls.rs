@@ -1,0 +1,288 @@
+//! rustls 配置构建:服务端证书(含自动自签)、客户端 CA/pin/校验策略。
+//!
+//! pin 模式:握手采用 NoVerify 完成后立刻比对叶子证书 SHA-256 指纹,
+//! 不匹配则断开(任何应用数据发送前完成),等价于固定证书校验且无需
+//! 自定义 ServerCertVerifier。
+
+use crate::{TlsClientOptions, TlsServerOptions};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use std::io;
+use std::sync::Arc;
+
+/// 客户端校验策略(握手后需要执行的附加检查)。
+#[derive(Debug, Clone)]
+pub enum ClientVerify {
+    /// 固定叶子证书 SHA-256 指纹。
+    Pin([u8; 32]),
+    /// 无附加检查(CA 链已在握手内校验)。
+    Standard,
+    /// 无任何校验(仅测试)。
+    Insecure,
+}
+
+/// 服务端 TLS 配置。cert/key 或自动自签(可持久化)。
+pub fn server_config(opts: &TlsServerOptions) -> io::Result<Arc<rustls::ServerConfig>> {
+    server_config_with_alpn(opts, &["rhtp".to_string()])
+}
+
+pub fn server_config_with_alpn(
+    opts: &TlsServerOptions,
+    alpn: &[String],
+) -> io::Result<Arc<rustls::ServerConfig>> {
+    let (cert, key) = match (&opts.cert_pem, &opts.key_pem) {
+        (Some(c), Some(k)) => (c.clone(), k.clone()),
+        (None, None) => auto_cert(opts)?,
+        _ => {
+            return Err(io::Error::other(
+                "tls: cert_pem and key_pem must be provided together",
+            ))
+        }
+    };
+    let certs: Vec<CertificateDer> = CertificateDer::pem_slice_iter(&cert)
+        .collect::<Result<_, _>>()
+        .map_err(|e| io::Error::other(format!("tls: parse cert: {e}")))?;
+    let key = PrivateKeyDer::from_pem_slice(&key)
+        .map_err(|e| io::Error::other(format!("tls: parse key: {e}")))?;
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::other(format!("tls: build server config: {e}")))?;
+    cfg.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+    Ok(Arc::new(cfg))
+}
+
+/// 生成或复用自签证书;persist_prefix 为 Some 时落盘 `<prefix>.crt/<prefix>.key`。
+pub fn auto_cert(opts: &TlsServerOptions) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    if let Some(prefix) = &opts.persist_prefix {
+        let crt = prefix.with_extension("crt");
+        let key = prefix.with_extension("key");
+        if crt.exists() && key.exists() {
+            let c = std::fs::read(&crt)?;
+            let k = std::fs::read(&key)?;
+            return Ok((c, k));
+        }
+        let (c, k) = generate_self_signed()?;
+        // 落盘前确保证书目录存在(persist_prefix 通常指向 <配置目录>/certs/ 子目录)
+        if let Some(dir) = crt.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&crt, &c)?;
+        std::fs::write(&key, &k)?;
+        set_key_perm(&key)?;
+        return Ok((c, k));
+    }
+    generate_self_signed()
+}
+
+fn set_key_perm(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+fn generate_self_signed() -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut names = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(host) = std::env::var("RHTP_TLS_EXTRA_SAN") {
+        if !host.is_empty() {
+            names.push(host);
+        }
+    }
+    let cert = rcgen::generate_simple_self_signed(names)
+        .map_err(|e| io::Error::other(format!("tls: self-signed gen: {e}")))?;
+    Ok((
+        cert.cert.pem().into_bytes(),
+        cert.key_pair.serialize_pem().into_bytes(),
+    ))
+}
+
+/// 免校验器(配合握手后 pin 比对或显式 insecure 测试配置)。
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+        ]
+    }
+}
+
+/// 客户端 TLS 配置 + 附加校验策略。
+/// - pin_sha256:握手后比对指纹;
+/// - trusted_ca:标准链校验;
+/// - insecure_skip_verify:无校验(测试)。
+pub fn client_config(
+    opts: &TlsClientOptions,
+) -> io::Result<(Arc<rustls::ClientConfig>, ClientVerify)> {
+    client_config_with_alpn(opts, &["rhtp".to_string()])
+}
+
+pub fn client_config_with_alpn(
+    opts: &TlsClientOptions,
+    alpn: &[String],
+) -> io::Result<(Arc<rustls::ClientConfig>, ClientVerify)> {
+    if let Some(pin) = &opts.pin_sha256 {
+        let bytes = hex_to_32(pin)?;
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        return Ok((with_alpn(cfg, alpn), ClientVerify::Pin(bytes)));
+    }
+    if opts.insecure_skip_verify {
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        return Ok((with_alpn(cfg, alpn), ClientVerify::Insecure));
+    }
+    if let Some(ca) = &opts.trusted_ca {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(ca) {
+            let cert = cert.map_err(|e| io::Error::other(format!("tls: parse ca: {e}")))?;
+            roots
+                .add(cert)
+                .map_err(|e| io::Error::other(format!("tls: add ca: {e}")))?;
+        }
+        let cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        return Ok((with_alpn(cfg, alpn), ClientVerify::Standard));
+    }
+    Err(io::Error::other(
+        "tls client: need trusted_ca, pin_sha256 or insecure_skip_verify",
+    ))
+}
+
+fn with_alpn(mut cfg: rustls::ClientConfig, alpn: &[String]) -> Arc<rustls::ClientConfig> {
+    cfg.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+    Arc::new(cfg)
+}
+
+fn hex_to_32(s: &str) -> io::Result<[u8; 32]> {
+    let s = s.trim().trim_start_matches("sha256:").replace(':', "");
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(io::Error::other("pin_sha256 must be 64 hex chars"));
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|e| io::Error::other(format!("bad pin hex: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// SHA-256 指纹(sha2 crate,用于证书 pin)。
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(data);
+    let out = h.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// 对握手完成后的连接执行 pin 比对。
+pub fn verify_pin(expected: &[u8; 32], leaf_cert: &[u8]) -> io::Result<()> {
+    let digest = sha256(leaf_cert);
+    if crate::constant_time_eq(&digest, expected) {
+        Ok(())
+    } else {
+        Err(io::Error::other("tls: certificate fingerprint mismatch"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn sha256_known_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let million_a = vec![b'a'; 1_000_000];
+        assert_eq!(
+            hex(&sha256(&million_a)),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn self_signed_then_config() {
+        let (cert, key) = generate_self_signed().unwrap();
+        let opts = TlsServerOptions {
+            cert_pem: Some(cert),
+            key_pem: Some(key),
+            ..Default::default()
+        };
+        server_config(&opts).unwrap();
+    }
+
+    #[test]
+    fn pin_roundtrip() {
+        let (cert, _) = generate_self_signed().unwrap();
+        let leaf = CertificateDer::pem_slice_iter(&cert)
+            .next()
+            .unwrap()
+            .unwrap();
+        let digest = sha256(leaf.as_ref());
+        assert!(verify_pin(&digest, leaf.as_ref()).is_ok());
+        let mut bad = digest;
+        bad[0] ^= 1;
+        assert!(verify_pin(&bad, leaf.as_ref()).is_err());
+    }
+}
