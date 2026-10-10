@@ -329,3 +329,190 @@ xtcp-isolated 9/9、e2e-transports 12/12、e2e-plugins 15/15、e2e-vhost 10/10�
   生产构建全链路(见上);vitest 全量三连跑 1/1/0 例失败,第三次 **575/575 全绿**
   ——失败均为上游 form-integration.test.ts 时序偶发(文件与上游字节级一致,单文件
   5 连跑 3 次失败且每次用例不同),未屏蔽未跳过,证据见 acceptance §2。
+
+## R14(2026-10-10)前端模板残留清理(任务书 FRONTEND-CLEANUP-PROMPT.md,阶段 1+2)
+
+按用户提供的任务书执行(阶段 3 按其自身规定默认不执行,未征求确认不动 packages/**):
+
+- **P0**:`allowBuilds.lefthook` 占位符 → 显式 `false`,`pnpm install
+  --frozen-lockfile` exit 0(CI frontend 首步恢复可信)。
+- **阶段 1**:删演示页(dashboard/demos/about/profile/4 登录变体/3 兜底)、演示
+  路由与 locales、vxe-table adapter、上游 CHANGELOG;登录页显式关闭全部演示入口;
+  basic.vue 删假通知与品牌菜单;preferences 关闭 copyright/widget 四项/
+  checkUpdates、panel-center、logo 关闭并以空串覆盖 unpkg 默认;.env 换标题与
+  随机 STORE_SECURE_KEY;index.html 删百度统计/__bootErrs/品牌 meta;自有
+  favicon;vite license:false;authentication.json 覆盖登录页文案。
+- **死代码与真实缺陷**:删菜单下发链与 refreshToken 链路;**修复 logoutApi 不带
+  Bearer 导致 `logout: admin` 审计事件从不记录的真实缺陷**(任务书 1.7-5,浏览器
+  冒烟验证事件已落库)。
+- **阶段 2(保守 A + 二阶)**:adapter/form.ts 缩至 initSetupVbenForm、access.ts
+  删 pageMap/layoutMap、bootstrap 删 v-loading/v-access/tippy 注册、resetRoutes/
+  IFrameView 删除、fallback 组件名去 Demo。
+- **门禁与产物**:lint 0 / typecheck 0 / vitest 575/575(上游 flake 如实披露)/
+  build ✓;dist 4.3M→3.4M,chunk 217→147,echarts 674K 消失,演示/品牌/统计
+  残留 grep 全空;残留仅框架层默认值字符串(限制-10 如实记录)。
+- **浏览器冒烟 5/5**(dev server + 真实后端):守卫、净化后登录页、仅 rabbithole
+  菜单 + 五页真实数据、顶栏净化 + 退出弹窗 + logout 审计、404 兜底。
+- 过程如实记录:① 排查"copyright 关闭不生效"确认为 vben localStorage 偏好缓存
+  覆盖 override(框架已知行为,清缓存即恢复,已写入运维注意);② 任务书 md 本身
+  未过 oxfmt,由仓库 format 一并格式化(内容不变);③ 任务书所述根 .gitignore
+  死规则(apps/web-antd/dist)经查不存在,跳过并说明。
+
+## R15(2026-10-10)用户可见消息全面中文化(用户指出事件表「消息」列为英文)
+
+- **范围界定(如实)**:用户截图中的英文来自总览「最近事件」表——服务端审计事件
+  消息原本全部为英文;同图中的网络提示为框架已本地化的中文 toast(后端停机时
+  轮询失败提示)。首轮误判为"英文报错",经用户澄清后按正确范围实施。
+- **后端(rh-server)**:19 处 events.emit 消息与 39 处 err()/Err 元组的 message
+  全部中文化(登录/改密/登出/客户端与规则增删启停/轮换/离线/健康检查/端口重分配/
+  首启引导等);数字 code 契约不变,PORT_CONFLICT/PORT_DENIED/LIMIT_EXCEEDED/
+  OVERLAP_ADDR_UPDATE 保留符号前缀便于日志检索(如 "PORT_CONFLICT:端口已被占用")。
+  内部 anyhow/诊断日志(stdout/认证协议层)保持英文,不属控制台可见面。
+- **前端兜底**:request.ts 错误拦截器对 Network Error/timeout 的英文原文映射中文
+  (框架 $t 已覆盖主路径,此为兜底);**新增相同文案 10s 节流 + 任一请求成功即重置**
+  ——修复后端失联时轮询页每 5s 连刷 toast 的问题(实测 13s 内 9 次失败仅 2 条提示)。
+- **验证**:cargo fmt/clippy 0 警告/test 42/42、release 重建、e2e.sh **55/55**(code
+  断言不受消息文案影响);curl 实测错误密码→「用户名或密码错误」、错误旧密→「旧
+  密码错误」、事件表全中文;浏览器实测错误登录 toast 中文、事件表消息列中文。
+  附:一次失败登录仅一条 toast(曾疑重复,实为测量选择器同时匹配 notice 与其
+  content 子元素)。
+
+## R16(2026-10-10)前端内嵌进二进制(用户指令"改")
+
+- 实现:`crates/rh-server/build.rs` 检测 `web/apps/web-antd/dist/index.html`,
+  存在则置 `embed_ui` cfg(`rustc-check-cfg` 声明防 unexpected_cfgs 告警)+
+  `rerun-if-changed=dist`;`src/embedded_ui.rs` 用 rust-embed 嵌入 dist,
+  fallback 处理器语义与磁盘分支对齐(`/api/*` JSON 404、SPA 回退 index 200、
+  扩展名 MIME 表);`main.rs` 仅在未配置 `static_dir` 且内嵌可用时挂内嵌分支,
+  显式 `static_dir` 优先。依赖:rust-embed 8。
+- 关键取舍(如实):**自动检测而非强制 feature**——干净检出(未构建前端)纯
+  Rust 构建仍通过(已模拟验证:隐去 dist 后 `cargo check --release` 0 错误),
+  CI 后端 job 不受影响;代价是 dist 缺失时构建的二进制不含 UI(启动日志与
+  README 均已说明,补 UI 需构建前端后重编)。dist 内容变化经目录 mtime 触发重编。
+- 验证:tests/e2e-embed.sh **9/9**(内嵌声明/index/SPA 回退/资产 MIME/JSON 404/
+  favicon/static_dir 覆盖优先级/覆盖时不走内嵌);回归 fmt/clippy 0 警告/
+  test 42/42/e2e.sh 55/55;二进制 14.3MB→17.5MB。文档:README 快速开始改写
+  (单二进制为推荐方式)、deploy 两示例注释、design.md 补记、acceptance §14。
+
+## R17(2026-10-10)整体代码评审:四域全量审查与修复(用户指令"整体代码 review 直到没有任何问题")
+
+四路并行深度审查(rh-server 管理面/转发面、rh-protocol+transport+core、rh-client,
+后补 web 前端)共报 71 项候选;逐项人工核实后按"真实缺陷才修"口径处理,Rust 侧
+61 项全部落地,web 前端 10 项中 4 个 P1 已修后用户告知前端将重写、其余不处理。
+
+### 安全修复
+
+- **P0 static_file 路径遍历**(plugins.rs):`..` 深度以 root 为参考点(原 `pop()`
+  实现从文件系统根判定,`GET /../../etc/passwd` 可读任意文件);并加 canonicalize
+  防符号链接逃逸、剥离查询串(缓存戳 URL 不再 404)、大文件流式发送防内存放大。
+- **SSH Tunnel Gateway 端口策略绕过**:客户端指定端口现须过 allow_ports 白名单与
+  port_in_use 占用检查;绑定地址仅环回(含 localhost);每连接转发上限 16;
+  authorized_keys 行尾注释恰为客户端 ID(UUID 形态)时绑定该用户,user@host 类
+  默认注释视为全局密钥;主机私钥/自签 TLS 私钥以 0600 直接创建(消除先写后
+  chmod 的世界可读窗口);SSH 通道 EOF 向用户侧传播半关闭。
+- **/metrics 未认证暴露 + 死开关**:`enable_prometheus` 现真正生效(默认关闭),
+  开启后仍需与管理 API 相同的 Bearer 认证;e2e 相应改造(认证拉取 + 未认证拒绝)。
+- **登录面**:限速 key 改为 IP+用户名(原仅用户名,可被未认证者锁定真实管理员),
+  用户名截断 64 字符防 key 空间撑内存;用户不存在时执行等价 argon2 dummy 校验
+  消除时序侧信道。Web/API 监听挂 ConnectInfo(TLS 分支自定义 Connected 实现)。
+- **跨租户状态篡改**:APPLY_RESULT/HealthReport 增加属主校验,客户端只能影响
+  自己名下规则的状态。STUN 应答校验来源地址(共享 socket 防候选投毒);
+  DNS 查询随机 txid + connect + 应答校验(防伪造应答)。
+- **挑战表与未认证并发**:ChallengeTable 周期清扫 + 65536 容量上限(连接→收挑战
+  →断开不再累积);实现 `unauth_conns_per_ip`(原仅为死配置)。
+
+### 功能性修复(整功能不可用/损坏)
+
+- **TCPMux 标准模式挂错方向**:服务端把 yamux 终结建在到客户端的通道上而用户
+  连接被弃置,任何 CONNECT 200 后无数据流;改为在用户连接(带 CONNECT 后同批
+  字节回灌)上终结 yamux,每流独立数据通道转发(与 mux.rs 单测拓扑一致);
+  passthrough 模式补齐 COMPRESSED 与残留字节回灌。e2e 原只断言 CONNECT 200,
+  未覆盖数据流(如实记录)。
+- **group 负载均衡从未接线**:groups 表无任何写入方,组选路/共享监听全为死代码,
+  同组第二条规则必然 PORT_CONFLICT 或 BindError 死循环;且 `blocking_read()`
+  在 async 上下文调用是潜在 panic。现完成接线:spawn/teardown 维护成员表、
+  首个绑定成员启动组共享 serve loop(取消权归组,单成员退出不影响)、
+  port_in_use 同组豁免、试绑跳过、`blocking_read` 改 `.read().await`;
+  group_key 扩展支持 http/https/tcpmux(vhost 组选路)。e2e 原有
+  "group LB 全部命中健康成员"用例继续通过。
+- **COMPRESSED+残留字节三处遗漏**(forward.rs 常规路径、tcpmux passthrough、
+  visitor deliver_relay):指派帧后同批到达的压缩流首块被当明文写出且解压器缺
+  首块失步;统一为 `PrependedIo` 回灌进 compress_stream。
+- **WS 握手违反 RFC 6455**:Sec-WebSocket-Accept 误用 SHA-256(须 SHA-1),
+  标准浏览器/反代全部握手失败;并补 Upgrade/Connection/Version 头校验。
+- **xtcp 失效 mux 黑洞**:`open_stream` 失败被映射为"已消费",用户连接静默丢弃
+  且坏 mux 永久缓存;改为返还连接走中继回退,打洞 socket 缺失时同样回退重发。
+
+### 可靠性/资源修复
+
+- **QUIC 空闲误杀**:quinn 默认 idle_timeout(30s)==心跳间隔,单向抖动即断;
+  idle 提至 90s + 客户端 15s keepalive。
+- **punch_dial 任务泄漏**:超时后轮询/接收任务永久发包;abort 通知收尾。
+- **KCP**:会话锁定首见对端(防同 conv 注入);KcpIo 全句柄释放即令会话退出
+  (原空转至 90s);会话表清理以 same_channel 原子判定(防误删重建会话)——
+  该修复首版在持锁路径内二次加锁引入死锁,被 `kcp_session_streams` 测试当场
+  挂起捕获,改为调用方直传 own_tx 后全绿;Incoming.remote 修正为真实对端。
+- **TCP/QUIC 握手串行**:接受与握手解耦(后台泵 + 就绪队列),慢握手不再阻塞
+  后续接入。
+- **池等待者误删**:超时 LIFO pop 会删错等待者、新抵达通道被丢弃;等待者带
+  唯一 id 精确移除,死信通道回池。
+- **relay_tcp 无超时**:与 relay_udp 对齐 15s 超时 + 配对表清理(原任务与表项
+  永久泄漏);SUDP 常驻中继登记改先占位后签发(消竞态)。
+- **中继压缩一致性**:双端压缩开关统一由签发时决策(purpose 携带),配置不一致
+  不再产生静默流损坏;顺带消除每通道全表扫 list_visitors 的热路径查库。
+- **UDP 会话映射无界增长**:服务端 gc 移入通道存活期 select;客户端侧按源地址
+  会话 60s 空闲回收 + bind 失败不再 panic + IPv6 目标按族绑定。
+- **看门狗与退避**:客户端控制链 3×心跳无服务端帧即重连(原死链最长挂 15-30
+  分钟);重连退避在健康周期(≥30s 存活)后重置(原只增不减,长期运行断线
+  必等 60s)。
+- **阻塞 DNS 移出 worker**:自定义 DNS 与系统解析均走 spawn_blocking(原 DNS
+  不可达时每连接阻塞 tokio worker 2s+)。
+- **API 一致性**:批量 enable 绑定失败回滚 enabled(原产生 DB=启用/无 runtime
+  死态且同端口可被抢占);实体读取移入 serial_lock 内(消 TOCTOU);update 拒绝
+  bind_port=0(随机端口仅创建时支持);update_client 支持 name/remark;
+  tls_opts_from 证书读取失败显式报错(原吞成空 PEM);SQLite 内存库限单连接;
+  proxies 坏行跳过不炸全表;登录/metrics 之外补 vhost HTTP 头读超时
+  (slowloris)、locations 前缀按路径段边界匹配(/api 不再命中 /apifoo)、
+  SNI peek 扩至 16KiB、assign_forward 连接计数 RAII 守卫、udp_on_channel
+  锁不跨 await、nathole decide 读取即移除(防双发)、remove_if_current 改
+  dashmap remove_if 原子判定、encode_frame 超限拒绝编码。
+
+### 过程如实记录
+
+1. 修复过程自身引入并被测试捕获的回归:kcp 会话表清理的死锁(上见)、SSH
+   公钥注释绑定与 localhost 地址误伤 e2e(ssh-keygen 默认注释即 user@host),
+   均当场修复;全部修改均经四道门禁复核。
+2. deploy/server.example.toml 的 `[metrics] enabled` 为错误键名
+   (deny_unknown_fields 下启动即失败),改为 `enable_prometheus`。
+3. 未修复而记录的已知限制:KCP 每源 IP 并发会话上限未实现(已以对端锁定 +
+   句柄归零快速回收缓解);kcp 载体本身无加密(叠加 tls/wss 使用,文档已明示);
+   proxyproto v1 的 `PROXY UNKNOWN` 简式拒绝(仅影响第三方来源头);
+   TCPMux 标准模式端到端 e2e 仍仅到 CONNECT 200(yamux 客户端语义,单测覆盖
+   流路径);web 前端问题因"前端将重写"不处理。
+
+### 验证
+
+- `cargo fmt --check` / `cargo clippy --workspace --all-targets`(0 警告)/
+  `cargo test --workspace` 42/42;
+- release 重建后:e2e.sh **56/56**(含新增 metrics 认证/拒绝 2 项)、
+  e2e-transports 12/12、e2e-vhost 10/10、e2e-resilience 19/19、
+  e2e-plugins 15/15、e2e-embed 9/9、xtcp-isolated 9/9(数值见 acceptance §15)。
+
+## R18(2026-10-10)CUT:删除旧 web/,前端切换 console/(用户指令"移除旧web")
+
+- **删除**:`web/` 整目录(vben monorepo,1.6GB 含 node_modules;git+磁盘),
+  连同 pnpm workspace/turbo 配置;R14-R16 的 vben 内改动随目录消失(其交付
+  已由 console/ 全量承接)。
+- **内嵌接线收敛**:`build.rs` 移除旧路径与 `embed_ui_legacy`/`embed_ui_console`
+  cfg,仅检测 `console/dist`;`embedded_ui.rs` 移除 legacy 分支。注:R0 时
+  "只改 build.rs"不可行(folder 硬编码在 embedded_ui.rs),当时即两文件同改。
+- **产物瘦身**:console 生产构建剔除 sourcemap(新增 `clean-maps.js` 步骤),
+  dist 12MB→2.8MB;release rh-server 17.5MB(vben 内嵌)→**16.6MB**(console 内嵌)。
+- **文档/配置同步**:根 README(构建命令/console/结构/许可)、
+  deploy 两示例 static_dir 注释指向 console/dist、docs/design.md §8 加现状
+  说明(§8.1 vben 条款废止,§8.2 契约由 console/ 承接)、e2e-embed.sh 适配
+  console 产物特征(id="root"、根路径 /umi*.js 资产)。
+- **验证(全绿)**:cargo fmt/clippy 0 警告/test 42/42;release 重编内嵌指向
+  console/dist;e2e 全套:e2e-embed 9/9、e2e.sh 56/56、vhost 10/10、
+  transports 12/12、resilience 19/19、plugins 15/15、xtcp 9/9(计 130 项)。
+- console 侧 typecheck/build exit 0。

@@ -34,7 +34,7 @@
 |---|---|
 | `rh-server` | 单进程服务端。三合一：控制面（客户端接入/认证/规则下发）、数据面（映射端口监听与转发）、管理面（REST API + Web 静态资源托管） |
 | `rh-client` | 客户端。运行在 NAT 后的目标机器，主动连接服务端，按服务端下发的规则把本地服务暴露出去 |
-| `apps/web` | Web 控制台前端（vue-vben-admin `web-antd` 裁剪版），编译产物由 rh-server 托管 |
+| `console` | Web 控制台前端（React 19 + antd v6,Umi Max + ProComponents;2026-10-10 CUT 起替换 vben 版），编译产物由 rh-server 托管 |
 
 ### 1.2 端口规划
 
@@ -56,7 +56,7 @@
                      │                                                               │
                      ├──▶ 会话管理(client_id → Session{session_id, epoch, cancel})     │
                      ├──▶ 规则引擎(DB=期望状态, 内存=运行状态, revision 对账)           │
-                     └──▶ axum /api ◀── Web 控制台(vben)                             │
+                     └──▶ axum /api ◀── Web 控制台(console/)                             │
                  └──────────────────────────────────────────────────────────┘
                      ▲
                      │ noise/tls 加密传输, 规则由服务端下发(指派自包含)
@@ -76,7 +76,7 @@ rabbithole/
 │   │                     # 接口边界按 §10 定义（连接/流分离, datagram 可选能力）
 │   ├── rh-server/        # bin: 控制面 + 数据面 + axum API + sqlx
 │   └── rh-client/        # bin: 会话状态机 + 被动拨号器 + 本地转发
-├── apps/web/             # vue-vben-admin 裁剪版（锁定 commit, 见 §8.1）
+├── console/              # React + antd v6 控制台(Umi Max;见 §8)
 ├── migrations/           # sqlx 迁移
 └── docs/
 ```
@@ -557,6 +557,8 @@ CREATE TABLE events (
 
 - 业务成功：HTTP 200 + `{ "code": 0, "data": ..., "message": "ok" }`，前端取 `data`。
 - 业务失败：HTTP 200 + `{ "code": <非0>, "message": "..." }`，前端弹错误提示。
+  **`message` 为面向控制台的中文说明**(事件表「消息」列与 toast 均为中文,2026-10-10 起);
+  机器可读契约以数字 `code` 为准,个别错误保留符号前缀(`PORT_CONFLICT:` 等)便于日志检索。
 - **认证失效：HTTP 401 状态码**（vben 拦截器依据 HTTP status，不是业务 code）。
 
 ### 7.1 认证与用户（按 vben 默认调用路径设计，待 M4 联调验收）
@@ -564,7 +566,7 @@ CREATE TABLE events (
 | 方法 | 路径 | 请求/响应（`data` 字段内容） |
 |---|---|---|
 | POST | `/api/auth/login` | `{username,password}` → `{ accessToken }`（字段名 **accessToken**；不启用 refresh） |
-| GET | `/api/user/info` | → `{ userId, username, realName, avatar, desc, homePath:"/dashboard", roles:["admin"] }` |
+| GET | `/api/user/info` | → `{ userId, username, realName, avatar, desc, homePath:"/rabbithole/overview", roles:["admin"] }` |
 | GET | `/api/auth/codes` | → `[]`（登录链路会调用，必须存在） |
 | POST | `/api/auth/logout` | **须携带 Bearer**；校验通过记审计，回 204；无效凭据回 401。**P0 登出不撤销已签发 JWT**（自然过期 12h），已知取舍见 §13 |
 | POST | `/api/auth/password` | 须携带 Bearer；`{old_password,new_password}`。验旧密码（argon2，错则 code=1001 + warn 审计）、新密码 ≥8（code=1002）、更新落库后**轮换会话签名密钥**（所有已签发 JWT 立即失效，前端随即可强制重登），回 `{relogin:true}` |
@@ -599,9 +601,14 @@ P1 增加 `/api/stats/stream`（SSE）。
 
 ---
 
-## 8. 前端设计（vue-vben-admin）
+## 8. 前端设计
 
-### 8.1 基座锁定与裁剪边界
+> **现状（2026-10-10 CUT）**:前端已整体切换为顶层 `console/` 工程(React 19 + antd v6,
+> Umi Max + ProComponents,基于 ant-design-admin-v6 模板裁剪);`web/`(vben)已删除。
+> §8.1 的 vben 基座条款**废止**(历史存档);§8.2 对接契约语义不变,由 console/ 承接
+> (axios envelope 解包、HTTP 401、logout 显式 Bearer、改密强制重登均已在 console/ 实现)。
+
+### 8.1 基座锁定与裁剪边界（已废止,历史存档）
 
 - **锁定 commit `d27a5b8a`**（main 分支 2026-10-07）。后续换 commit 为主动行为，需重跑 §8.2 对照。工具链：Node `^22.18.0 || ^24.12.0`，pnpm 锁定 `11.16.0`（corepack）。
 - `web-antd` 依赖 `workspace:*` 与 `catalog:`，**不能单独剪出应用目录**。裁剪规则：
@@ -626,11 +633,12 @@ P1 增加 `/api/stats/stream`（SSE）。
 
 | 路由 | 页面 | 要点 |
 |---|---|---|
-| `/login` | 登录 | vben 内置页（后端按 §7.1 契约实现） |
-| `/dashboard` | 总览 | 统计卡片 + 在线客户端列表 |
-| `/clients` | 客户端管理 | 在线徽标/版本/hostname；新建抽屉展示一次性 secret；轮换（仅踢线）/禁用 |
-| `/services` | 端口映射 | `status` 徽标（offline/pending/running/apply_error/bind_error/disabled）；新建/编辑弹窗（客户端、协议、服务端口留空=自动、目标地址）；启停即时生效 |
-| `/events` | 事件 | 只读列表，级别过滤 |
+| `/auth/login` | 登录 | vben 内置页（后端按 §7.1 契约实现；演示登录变体已裁剪） |
+| `/rabbithole/overview` | 总览 | 统计卡片 + 最近事件流 |
+| `/rabbithole/clients` | 客户端管理 | 在线徽标/版本/hostname；新建抽屉展示一次性 secret；轮换（仅踢线）/禁用 |
+| `/rabbithole/services` | 转发规则 | `status` 徽标（offline/pending/running/apply_error/bind_error/disabled）；新建/编辑弹窗（客户端、协议、服务端口留空=自动、目标地址）；启停即时生效 |
+| `/rabbithole/visitors` | 访问器 | STCP/SUDP/XTCP visitor 管理 |
+| `/rabbithole/settings` | 设置 | 修改密码（成功后全量会话失效并强制重登，§7.1） |
 
 ---
 
@@ -763,8 +771,13 @@ trait DatagramCapable { fn max_datagram_size(&self) -> usize;
 - **心跳**:服务端 30s 检查、90s 无任何客户端帧判死;客户端 30s Ping。
   会话内数据通道限额按流存活期占用(QuotaIo),关闭即归还。
 - **SSH Tunnel Gateway**:russh 0.64;认证=密码(客户端密钥,常量时间)或
-  authorized_keys(按 key_data 比较);会话通道接受并对 exec/shell 空跑(仅保持);
+  authorized_keys(按 key_data 比较;行尾注释恰为客户端 ID(UUID 形态)时
+  该密钥绑定该客户端,ssh-keygen 默认的 user@host 注释视为全局密钥);
+  会话通道接受并对 exec/shell 空跑(仅保持);
   forwarded-tcpip 的 connected_address 与注册地址一致;断开级联释放全部监听。
+  安全策略(R10 收紧):绑定地址仅环回(含 localhost);客户端指定端口须过
+  allow_ports 白名单与占用检查(与常规规则同策略);每连接转发数量上限 16;
+  自动分配仍走 auto_port_ranges。
 - **健康检查**:客户端探测本地目标,TCP/HTTP 两型;失败 max_failed 次转
   unhealthy 并被 group 摘除;恢复即报。group 为同组健康成员轮询。
 - **DNS**:客户端 `dns_server` 配置 + 最小 A 查询(dnsquery.rs),失败回退系统解析。
@@ -781,3 +794,15 @@ trait DatagramCapable { fn max_datagram_size(&self) -> usize;
   pnpm 图 vue-router 双实例导致登录后空白,已以 `resolve.dedupe` 修复并按
   生产构建复跑浏览器验收(acceptance §7)。登出入口在页头(log-out 图标,
   vben 默认 logoutButtonPosition=header)。
+- **单二进制内嵌控制台(2026-10-10 补记)**:`build.rs` 检测
+  `web/apps/web-antd/dist` 存在时置 `embed_ui` cfg,`rust-embed` 将 dist
+  编译进 rh-server(约 +3.2MB);未配置 `static_dir` 时由内嵌资产托管,
+  语义与磁盘分支一致(SPA 回退/`/api` JSON 404),`static_dir` 显式配置
+  优先于内嵌。无 dist 的纯 Rust 检出仍可构建(二进制不含 UI,API 不受影响)。
+  验证:tests/e2e-embed.sh(9/9)。
+- **前端基座重写(2026-10-10 决策)**:管理面前端由 vue-vben-admin 裁剪版切换为
+  React 19 + Ant Design v6 独立工程(顶层 `console/`,Vite 产物托管方式不变:
+  `[web].static_dir` / rust-embed,登录链路与 envelope 契约逐项保留)。
+  §8.1 基座锁定与裁剪边界条款**废止**,§8.2 对接契约语义由新工程承接;
+  迁移期新旧并存,切换(CUT)后删除 `web/`。详见 docs/design-parity.md §10(F9)
+  与 R0–R3/CUT 里程碑。

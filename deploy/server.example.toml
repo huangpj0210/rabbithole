@@ -17,7 +17,9 @@ bind_addr = "127.0.0.1"        # 管理面默认仅本地;对外请置反向代�
 port = 8080
 # jwt_secret = "change-me-32-bytes-minimum-secret!!"
 jwt_ttl_hours = 12
-# static_dir = "../web/apps/web-antd/dist"   # 前端静态资源(SPA 回退已内置)
+# static_dir = "../console/dist"   # 可选:磁盘静态资源目录(SPA 回退已内置;不配置时用构建期内嵌控制台)。
+# 不配置时:若构建期内嵌了前端(build.rs 检测到 dist 则 rust-embed 嵌入二进制),
+# 直接由二进制托管控制台;配置了则以磁盘目录为准(优先级高于内嵌)。
 
 [vhost]
 http_port = 8081
@@ -48,7 +50,8 @@ udp_packet_size = 65536
 # stun_server = ""             # XTCP 打洞;空 = 本机地址候选
 
 [metrics]
-enabled = true
+# /metrics 端点(默认关闭;开启后需与管理 API 相同的 Bearer 认证)
+enable_prometheus = false
 
 [log]
 level = "info"

@@ -10,7 +10,7 @@
   },
   "scripts": {
     "dev": "cross-env REACT_APP_ENV=dev UMI_ENV=dev max dev",
-    "build": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\" && max build",
+    "build": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\" && max build && node clean-maps.js",
     "typecheck": "tsc --noEmit",
     "postinstall": "max setup",
     "preview": "max preview --port 8000"
@@ -40,11 +40,5 @@
     "cross-env": "^7.0.3",
     "typescript": "^5.6.3",
     "umi-presets-pro": "^2.0.3"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "es5-ext"
-    ]
   }
 }

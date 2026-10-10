@@ -39,14 +39,18 @@ Web 控制台默认 `http://127.0.0.1:8080`。完整配置说明见 `deploy/` �
 控制台两种运行方式:
 
 ```bash
-# A. 生产模式(推荐):构建静态产物,由 rh-server 直接托管(单进程、同源 /api)
-cd web && pnpm install
-pnpm --filter web-antd build          # 产物 web/apps/web-antd/dist/
-# 服务端配置 [web] static_dir = "web/apps/web-antd/dist" 后启动即可
+# A. 生产模式(推荐,单二进制):构建前端产物后重新编译服务端,
+#    dist 会被 rust-embed 自动嵌进 rh-server(build.rs 自动检测),无需任何配置
+cd console && pnpm install
+pnpm build                            # 产物 console/dist/(Umi Max + antd v6)
+cd .. && cargo build --release        # 二进制内嵌控制台
+./target/release/rh-server --config deploy/server.example.toml
+# 也可改用 [web] static_dir 指向磁盘目录(优先级高于内嵌,便于只更新前端不重编);
 # SPA 回退已内置:深层路由 200,未知 /api/* 返回 JSON 404
+# 未构建前端时直接 cargo build 也可编译(二进制不含控制台,API 正常,补 UI 需重建)
 
-# B. 开发模式:Vite dev server(/api 代理到 127.0.0.1:8080)
-cd web/apps/web-antd && pnpm dev
+# B. 开发模式:Umi dev server(/api 代理,端口与后端见 console/config/proxy.ts)
+cd console && pnpm dev
 ```
 
 SSH Tunnel Gateway(可选,`[ssh_gateway]` 开启):
@@ -66,6 +70,7 @@ bash tests/e2e-transports.sh target/release  # 12 项传输变体(tcp/tls/ws/wss
 bash tests/xtcp-isolated.sh target/release   # 9 项 XTCP 隔离网络(用户态 NAT 网关,打洞直连+失败回退)
 bash tests/e2e-plugins.sh target/release     # 15 项客户端插件(七插件语义全链路)
 bash tests/e2e-vhost.sh target/release       # 10 项 vhost 进阶(HTTPS SNI/头改写/Basic/自定义 404)
+bash tests/e2e-embed.sh target/release       # 9 项内嵌控制台(单二进制托管/static_dir 覆盖;需先构建前端并重编)
 bash tests/load.sh target/release 600  # 100 并发 TCP × 10 分钟持续
 ```
 
@@ -79,7 +84,7 @@ crates/rh-transport  tcp/tls/ws/quic/kcp、yamux 复用、压缩、代理拨号
 crates/rh-core       限速、PROXY protocol、STUN、网络工具
 crates/rh-server     控制面/数据面/管理 API/vhost/SSH 网关/SQLite
 crates/rh-client     会话与重连、转发、插件、健康检查、visitor、打洞
-web/                 vben(web-antd)管理控制台
+console/            管理控制台(React 19 + antd v6,Umi Max + ProComponents)
 tests/               E2E 与负载测试脚本
 docs/                设计文档、需求矩阵、验收记录、评审日志
 deploy/              部署示例配置与 systemd 单元
@@ -87,4 +92,4 @@ deploy/              部署示例配置与 systemd 单元
 
 ## 许可
 
-Apache-2.0(与基线 frp 一致)。前端 vben 基座遵循其原始许可(MIT)。
+Apache-2.0(与基线 frp 一致)。前端基于 ant-design-admin-v6 模板(MIT,LICENSE 见 console/)。

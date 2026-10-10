@@ -1,23 +1,17 @@
 //! 内嵌 Web 控制台服务。
 //!
-//! 构建期(build.rs)双路径择一:优先 `console/dist`(新 React 控制台),
-//! 兜底 `web/apps/web-antd/dist`(旧 vben UI),置 `embed_ui` + 对应来源
-//! cfg,rust-embed 将整个 dist 编译进二进制;运行期 `[web] static_dir`
-//! 配置优先(显式配置视为有意覆盖),未配置时回退内嵌资产。
+//! 构建期(build.rs)检测 `console/dist` 存在时置 `embed_ui`,rust-embed
+//! 将整个 dist 编译进二进制;运行期 `[web] static_dir` 配置优先(显式配置
+//! 视为有意覆盖),未配置时回退内嵌资产。
 //! SPA 回退语义与磁盘分支一致:未知 `/api/*` 返回 JSON 404 envelope,
 //! 其余未知路径回退 index.html 并返回 200(history 路由可用)。
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-#[cfg(all(embed_ui, embed_ui_console))]
+#[cfg(embed_ui)]
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../../console/dist"]
-struct EmbeddedUi;
-
-#[cfg(all(embed_ui, embed_ui_legacy))]
-#[derive(rust_embed::RustEmbed)]
-#[folder = "../../web/apps/web-antd/dist"]
 struct EmbeddedUi;
 
 /// 本二进制是否内嵌了 Web 控制台。

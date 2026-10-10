@@ -7,7 +7,7 @@ multiplex = true
 [web]
 bind_addr = "127.0.0.1"
 port = 8080
-# static_dir = "./web/dist"
+# static_dir = "./console/dist"   # 可选:不配置时使用构建期内嵌的控制台(console/dist 存在时已嵌入)
 
 [vhost]
 http_port = 8081
