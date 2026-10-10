@@ -44,3 +44,7 @@ Thumbs.db
 .env.local
 .env.*.local
 
+
+# Agent local config (ZCode)
+.zcode/
+.zcodeignore
