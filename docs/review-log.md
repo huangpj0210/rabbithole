@@ -516,3 +516,43 @@ xtcp-isolated 9/9、e2e-transports 12/12、e2e-plugins 15/15、e2e-vhost 10/10�
   console/dist;e2e 全套:e2e-embed 9/9、e2e.sh 56/56、vhost 10/10、
   transports 12/12、resilience 19/19、plugins 15/15、xtcp 9/9(计 130 项)。
 - console 侧 typecheck/build exit 0。
+
+## R19(2026-10-10)console 前端 + 后端管理接口专项 review(用户指令"review前端 和 后端新增接口")
+
+范围:console/ 全部页面/组件/api 层/stores/wrappers/config,与 rh-server api.rs 全部
+管理端点;前后端契约逐字段比对(ProxySpec/PluginSpec/HttpProxyConfig/HeaderOp/
+HealthCheck/BandwidthMode/ProxyProto 的 serde 名与前端拼装、envelope、401 语义)。
+契约结论:**完全对齐**(spec 各 section 字段名、plugin 内联 tag=kind、HeaderOp.set、
+skip_serializing_if 的 optional 降级、client_id skip_serializing 均一致)。
+修复 9 项(真实缺陷才修口径):
+
+后端(api.rs):
+- **update_service 缺名称校验**:PUT 可写入空名/超长/非法字符名(创建路径有校验),
+  name 是 visitor 目标解析的稳定键 → 补与创建一致的 1-64 [A-Za-z0-9_-] 校验(2001)。
+- **update_visitor 目标解析与创建语义不一致**:仅按名称匹配(创建要求名称+类型),
+  可静默改绑到同名异类型规则;且找不到目标时静默保留旧绑定 → 改为名称+类型匹配、
+  找不到即 4002 拒绝(与创建同语义)。
+- **visitor 三端点(update/toggle/delete)实体读在串行域外**:与并发删除竞态时可对
+  已删实体 bump revision 并下发迟到 ServiceUpdate(客户端侧可短暂复活)→ 首读仅定位
+  属主,锁内重读实体,不存在即 4003(对齐 R17 services 修复模式)。
+- **batch_services**:清理死码(拼了没用的假 Bearer HeaderMap);批量 enable/disable/
+  delete 现与单个操作一致落审计事件(原先批量操作无事件可查)。
+- **menu_all 未鉴权**:其余全部 /api/* 均需 Bearer,补齐(虽只返回常量 [])。
+- **list_events limit 未钉区间**:limit<=0 时 SQLite LIMIT 视为无限制 → clamp 1..500。
+
+前端(console/):
+- 密钥访问页规则表"目标代理"列实际渲染 allow_users(语义错位)→ 改名"允许访问方"。
+- VisitorsPanel 隐藏死刷新按钮(hidden 属性)删除。
+- 批量导入无在途防抖,双击重复提交 → running 状态 + 按钮 loading。
+- **dev 代理指向 18085 与 deploy 示例 web 端口 8080 不一致**(开箱即联调失败)→
+  proxy.ts 三环境统一 8080,console/README 同步。
+
+核实后不改的候选(记录):ProxySpec.client_id 虽可由 body 携带但 update_proxy 不写
+client_id 列(无跨客户端改属主风险);协议按 proxy_id/revision 关联而非名字,同名
+规则不破坏控制面(不加唯一性约束);onPageChange 在启动期网络抖动时会踢回登录页
+(token 仍在,重新登录即恢复,接受的边缘行为);Login 页/clients 页 setFieldsValue
+仅触已注册字段且均经浏览器实测无 antd v6 validateFields 挂起。
+
+验证:cargo fmt/clippy 0 警告/test 42/42;console typecheck/build exit 0;
+release 重编;e2e 全套复跑:e2e.sh 56/56、embed 9/9、resilience 19/19、
+vhost 10/10、plugins 15/15、transports 12/12、xtcp 9/9(计 130 项)。

@@ -7,7 +7,7 @@ rabbithole 管理台前端,基于 [ant-design-admin-v6](https://github.com/arvin
 
 ```bash
 pnpm install          # Node >= 20, pnpm(packageManager 已声明,corepack 可自动切换)
-pnpm dev              # http://localhost:8000,/api 代理到 127.0.0.1:18085(config/proxy.ts 可改)
+pnpm dev              # http://localhost:8000,/api 代理到 127.0.0.1:8080(deploy 示例 web 端口,config/proxy.ts 可改)
 pnpm typecheck        # tsc --noEmit
 pnpm build            # 清空 dist 后 max build(防旧 hash chunk 混载,勿跳过清理)
 pnpm preview          # 本地预览生产构建

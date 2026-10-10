@@ -59,7 +59,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     r.with_state(state)
 }
 
-async fn menu_all() -> Response {
+async fn menu_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
     ok(serde_json::json!([]))
 }
 
@@ -763,6 +766,16 @@ async fn update_service(
         return unauthorized();
     }
     spec.id = id as u64;
+    // 名称校验与创建一致(名字是 visitor 目标解析的稳定键)
+    if spec.name.is_empty()
+        || !spec
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || spec.name.len() > 64
+    {
+        return err(2001, "名称须为 1-64 位字母/数字/下划线/连字符");
+    }
     normalize_spec(&mut spec, state.cfg.limits.default_pool_size);
     // 实体读取在串行域内进行,避免与并发管理操作竞态
     let Some(client_id) = state
@@ -1112,16 +1125,8 @@ async fn batch_services(
     let mut results = Vec::new();
     for id in req.ids {
         let r = match req.action.as_str() {
-            "enable" => {
-                let st = state.clone();
-                let hm = HeaderMap::new();
-                let mut h2 = HeaderMap::new();
-                h2.insert("authorization", "Bearer batch".parse().unwrap());
-                let _ = hm;
-                // 内部调用:绕过 auth(已校验)
-                let resp = enable_service_inner(&st, id).await;
-                resp
-            }
+            // 内部直调 inner(本端点已通过 Bearer 校验)
+            "enable" => enable_service_inner(&state, id).await,
             "disable" => disable_service_inner(&state, id).await,
             "delete" => delete_service_inner(&state, id).await,
             _ => (9000, format!("未知操作:{}", req.action)),
@@ -1160,6 +1165,14 @@ async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
         .map(|c| c.enabled)
         .unwrap_or(false);
     if !client_enabled {
+        state
+            .events
+            .emit(
+                "info",
+                "service",
+                &format!("转发规则已启用(等待客户端恢复):{}", spec.name),
+            )
+            .await;
         return (0, "ok".into());
     }
     // 绑定资格失败:回滚 enabled,保持 DB 与运行态一致(与单个 enable 同语义)
@@ -1170,11 +1183,15 @@ async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
     }
     crate::runtime::teardown_runtime(state, id as u64).await;
     crate::runtime::spawn_runtime(state, &client_id, &spec, rev).await;
+    state
+        .events
+        .emit("info", "service", &format!("转发规则已启用:{}", spec.name))
+        .await;
     (0, "ok".into())
 }
 
 async fn disable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
-    let Some((_, client_id, _, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
         return (3001, "not found".into());
     };
     let lock = state.serial_lock(&client_id);
@@ -1192,11 +1209,15 @@ async fn disable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) 
             }))
             .await;
     }
+    state
+        .events
+        .emit("info", "service", &format!("转发规则已停用:{}", spec.name))
+        .await;
     (0, "ok".into())
 }
 
 async fn delete_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
-    let Some((_, client_id, _, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
         return (3001, "not found".into());
     };
     let lock = state.serial_lock(&client_id);
@@ -1214,6 +1235,10 @@ async fn delete_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
             }))
             .await;
     }
+    state
+        .events
+        .emit("warn", "service", &format!("转发规则已删除:{}", spec.name))
+        .await;
     (0, "ok".into())
 }
 
@@ -1334,32 +1359,51 @@ async fn update_visitor(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let rows = state.db.list_visitors(None).await.unwrap_or_default();
-    let Some((_, client_id, _, _)) = rows.iter().find(|(vid, ..)| *vid == id) else {
+    // 首读仅为定位属主(串行域);实体在锁内重读,消解与并发管理操作的竞态
+    let Some((_, client_id, _, _)) = state
+        .db
+        .list_visitors(None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(vid, ..)| *vid == id)
+    else {
+        return err(4003, "访问器不存在");
+    };
+    let lock = state.serial_lock(&client_id);
+    let _g = lock.lock().await;
+    let Some((_, _, _, _old)) = state
+        .db
+        .list_visitors(Some(&client_id))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(vid, ..)| *vid == id)
+    else {
         return err(4003, "访问器不存在");
     };
     spec.id = id as u64;
-    // 重新解析目标
-    let mut target_client = client_id.clone();
+    // 重新解析目标:与创建同语义(名称 + 类型都须匹配,否则拒绝)
     let clients = state.db.list_clients().await.unwrap_or_default();
+    let mut target_client = None;
     for c in &clients {
         if let Ok(list) = state.db.list_proxies(Some(&c.id)).await {
-            if list
-                .iter()
-                .any(|(_, _, p)| p.name == spec.target_proxy_name)
-            {
-                target_client = c.id.clone();
+            if list.iter().any(|(_, _, p)| {
+                p.name == spec.target_proxy_name && p.kind.as_str() == spec.kind.as_str()
+            }) {
+                target_client = Some(c.id.clone());
                 break;
             }
         }
     }
-    let lock = state.serial_lock(client_id);
-    let _g = lock.lock().await;
+    let Some(target_client) = target_client else {
+        return err(4002, "目标规则不存在(类型须匹配)");
+    };
     if let Err(e) = state.db.update_visitor(id, &target_client, &spec).await {
         return err(500, &format!("{e}"));
     }
-    let rev = state.db.bump_revision(client_id).await.unwrap_or(0);
-    if let Some(sess) = state.sessions.get(client_id) {
+    let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceUpdate, SyncEntity};
         let _ = sess
             .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
@@ -1394,12 +1438,29 @@ async fn disable_visitor(
 }
 
 async fn toggle_visitor(state: Arc<AppState>, id: i64, enabled: bool) -> Response {
-    let rows = state.db.list_visitors(None).await.unwrap_or_default();
-    let Some((_, client_id, _, mut spec)) = rows.into_iter().find(|(vid, ..)| *vid == id) else {
+    // 首读定位属主;实体在串行域内重读,防与并发删除竞态
+    let Some((_, client_id, _, _)) = state
+        .db
+        .list_visitors(None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(vid, ..)| *vid == id)
+    else {
         return err(4003, "访问器不存在");
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    let Some((_, _, _, mut spec)) = state
+        .db
+        .list_visitors(Some(&client_id))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(vid, ..)| *vid == id)
+    else {
+        return err(4003, "访问器不存在");
+    };
     state.db.set_visitor_enabled(id, enabled).await.ok();
     spec.enabled = enabled;
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
@@ -1433,12 +1494,29 @@ async fn delete_visitor(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let rows = state.db.list_visitors(None).await.unwrap_or_default();
-    let Some((_, client_id, _, _)) = rows.into_iter().find(|(vid, ..)| *vid == id) else {
+    // 首读定位属主;实体在串行域内重读,防重复删除/迟到操作复活实体
+    let Some((_, client_id, _, _)) = state
+        .db
+        .list_visitors(None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(vid, ..)| *vid == id)
+    else {
         return err(4003, "访问器不存在");
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    if !state
+        .db
+        .list_visitors(Some(&client_id))
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|(vid, ..)| *vid == id)
+    {
+        return err(4003, "访问器不存在");
+    }
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
     let _ = state.db.delete_visitor(id).await;
     if let Some(sess) = state.sessions.get(&client_id) {
@@ -1505,7 +1583,9 @@ async fn list_events(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let rows = match state.db.list_events(q.limit, q.level.as_deref()).await {
+    // 钉住合法区间:防 limit<=0(SQLite 视为无限制)或超大值拖库
+    let limit = q.limit.clamp(1, 500);
+    let rows = match state.db.list_events(limit, q.level.as_deref()).await {
         Ok(r) => r,
         Err(e) => return err(500, &format!("{e}")),
     };

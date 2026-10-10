@@ -47,6 +47,7 @@ const ProxyListPage: React.FC<{
   const [batchText, setBatchText] = useState('');
   const [batchResults, setBatchResults] = useState<null | Array<{ code: number; name: string; msg: string }>>(null);
   const [clientFilter, setClientFilter] = useState<null | string>(null);
+  const [batchRunning, setBatchRunning] = useState(false);
 
   const servicesQ = useQuery({ queryKey: ['services'], queryFn: () => listServices() });
   const clientsQ = useQuery({ queryKey: ['clients'], queryFn: listClients });
@@ -93,6 +94,7 @@ const ProxyListPage: React.FC<{
   });
 
   async function runBatch() {
+    if (batchRunning) return;
     let arr: Array<Record<string, any>>;
     try {
       arr = JSON.parse(batchText);
@@ -101,6 +103,7 @@ const ProxyListPage: React.FC<{
       message.error('不是合法的 JSON 数组');
       return;
     }
+    setBatchRunning(true);
     const results: Array<{ code: number; name: string; msg: string }> = [];
     for (const item of arr) {
       try {
@@ -111,6 +114,7 @@ const ProxyListPage: React.FC<{
       }
     }
     setBatchResults(results);
+    setBatchRunning(false);
     invalidate();
   }
 
@@ -162,9 +166,8 @@ const ProxyListPage: React.FC<{
             },
           },
           {
-            title: '目标代理',
-            dataIndex: 'name',
-            key: 'target_proxy',
+            title: '允许访问方',
+            key: 'allow_users',
             width: 110,
             render: (_: unknown, row: ServiceRow) => row.spec?.[row.kind]?.allow_users?.length
               ? (row.spec[row.kind].allow_users as string[]).join(',')
@@ -302,7 +305,7 @@ const ProxyListPage: React.FC<{
 
       <Modal
         cancelText="关闭"
-        okButtonProps={{ loading: false }}
+        okButtonProps={{ loading: batchRunning }}
         okText="开始导入"
         onCancel={() => setBatchOpen(false)}
         onOk={runBatch}

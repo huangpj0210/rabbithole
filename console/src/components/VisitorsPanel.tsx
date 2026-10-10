@@ -172,9 +172,7 @@ const VisitorsPanel: React.FC = () => {
   ];
 
   return (
-    <Card
-      extra={<Button onClick={() => invalidate()} size="small" icon={<PlusOutlined />} hidden />}
-    >
+    <Card>
       <Button icon={<PlusOutlined />} onClick={() => { setEditId(null); setModalOpen(true); }} type="primary">
         新建访问器
       </Button>
