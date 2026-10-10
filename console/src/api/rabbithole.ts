@@ -167,6 +167,39 @@ export async function disableVisitor(id: number): Promise<unknown> {
   return httpPost(`/visitors/${id}/disable`);
 }
 
+// ---------- certs(F6 契约;后端 M3 落地前 404,页面容错) ----------
+export interface CertRow {
+  id: number;
+  name: string;
+  domains: string[];
+  /** 到期时间(unix ms);命名按契约字段 not_after。 */
+  not_after: null | number;
+  /** 指纹摘要(key_pem 任何响应不回显)。 */
+  fingerprint: string;
+  created_at: number;
+}
+
+export async function listCerts(): Promise<CertRow[]> {
+  return httpGet<CertRow[]>('/certs');
+}
+export async function createCert(data: {
+  cert_pem: string;
+  domains?: string[];
+  key_pem: string;
+  name: string;
+}): Promise<unknown> {
+  return httpPost('/certs', data);
+}
+export async function updateCert(
+  id: number,
+  data: { cert_pem: string; domains?: string[]; key_pem: string; name: string },
+): Promise<unknown> {
+  return httpPut(`/certs/${id}`, data);
+}
+export async function deleteCert(id: number): Promise<unknown> {
+  return httpDelete(`/certs/${id}`);
+}
+
 // ---------- stats / events ----------
 export async function statsOverview(): Promise<StatsOverview> {
   return httpGet<StatsOverview>('/stats/overview');

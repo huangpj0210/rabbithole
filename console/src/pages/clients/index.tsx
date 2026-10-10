@@ -49,7 +49,7 @@ const ClientsPage: React.FC = () => {
   const { message } = App.useApp();
   const [modalOpen, setModalOpen] = useState(false);
   const [editId, setEditId] = useState<null | string>(null);
-  const [secretModal, setSecretModal] = useState<{ open: boolean; secret: string }>({
+  const [secretModal, setSecretModal] = useState<{ clientId?: string; open: boolean; secret: string }>({
     open: false,
     secret: '',
   });
@@ -82,7 +82,7 @@ const ClientsPage: React.FC = () => {
     onSuccess: (r) => {
       message.success('客户端已创建');
       setModalOpen(false);
-      setSecretModal({ open: true, secret: r?.secret ?? '' });
+      setSecretModal({ clientId: r?.id, open: true, secret: r?.secret ?? '' });
       invalidate();
     },
   });
@@ -113,8 +113,8 @@ const ClientsPage: React.FC = () => {
 
   const rotateMut = useMutation({
     mutationFn: (id: string) => rotateClientSecret(id),
-    onSuccess: (r) => {
-      setSecretModal({ open: true, secret: r?.secret ?? '' });
+    onSuccess: (r, id) => {
+      setSecretModal({ clientId: id, open: true, secret: r?.secret ?? '' });
       invalidate();
     },
   });
@@ -324,6 +324,7 @@ const ClientsPage: React.FC = () => {
       </Modal>
 
       <SecretModal
+        clientId={secretModal.clientId}
         onCancel={() => setSecretModal((s) => ({ ...s, open: false }))}
         open={secretModal.open}
         secret={secretModal.secret}
