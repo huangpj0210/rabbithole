@@ -16,13 +16,18 @@ pub fn server() -> Option<String> {
 }
 
 /// 向 `ns` 查询 host 的 A 记录;任何失败返回 None(调用方回退)。
+/// 阻塞式实现,必须经 [`query_spawn_blocking`] 在 blocking 线程执行。
 pub fn query(host: &str, ns: &str) -> Option<IpAddr> {
     let ns: SocketAddr = ns.parse().ok()?;
     let sock = std::net::UdpSocket::bind(if ns.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).ok()?;
     sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .ok()?;
-    // 查询报文:header + QNAME + QTYPE(A=1)/QCLASS(IN=1)
-    let id = (std::process::id() as u16).to_be_bytes();
+    // 连接后仅接收来自该服务器的应答(防伪造注入)
+    sock.connect(ns).ok()?;
+    // 查询报文:header + QNAME + QTYPE(A=1)/QCLASS(IN=1);txid 随机
+    use rand::RngCore;
+    let id = rand::rng().next_u32().to_be_bytes();
+    let id = id[..2].to_vec();
     let mut q = Vec::with_capacity(18 + host.len());
     q.extend_from_slice(&id);
     q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]); // RD=1, QD=1
@@ -32,10 +37,26 @@ pub fn query(host: &str, ns: &str) -> Option<IpAddr> {
     }
     q.push(0);
     q.extend_from_slice(&[0, 1, 0, 1]);
-    sock.send_to(&q, ns).ok()?;
+    sock.send(&q).ok()?;
     let mut buf = vec![0u8; 1500];
-    let (n, _) = sock.recv_from(&mut buf).ok()?;
-    parse_a(&buf[..n])
+    // 校验应答事务 ID 与问题数(QD=1)后解析
+    for _ in 0..3 {
+        let n = sock.recv(&mut buf).ok()?;
+        if n >= 12 && &buf[..2] == id.as_slice() && buf[4] == 0 && buf[5] == 1 {
+            return parse_a(&buf[..n]);
+        }
+    }
+    None
+}
+
+/// async 包装:阻塞查询移入 blocking 线程,避免拖住 tokio worker(最长 2s/次)。
+pub async fn query_spawn_blocking(host: &str, ns: &str) -> Option<IpAddr> {
+    let host = host.to_string();
+    let ns = ns.to_string();
+    tokio::task::spawn_blocking(move || query(&host, &ns))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// 解析应答中首个 A 记录(RFC1035;仅处理常见无压缩指针应答)。

@@ -22,6 +22,9 @@ pub struct ChallengeTable {
     inner: Mutex<HashMap<String, ChallengeEntry>>,
 }
 
+/// 表容量上限:防止 连接→HELLO→收挑战→断开 的慢速积累耗尽内存。
+const CHALLENGE_TABLE_CAP: usize = 65536;
+
 struct ChallengeEntry {
     client_id: String,
     expires: Instant,
@@ -37,8 +40,15 @@ impl ChallengeTable {
     pub async fn issue(&self, client_id: &str) -> String {
         let nonce =
             uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
-        // 64 hex
-        self.inner.lock().await.insert(
+        let mut g = self.inner.lock().await;
+        // 顺手清理过期项(定期的清扫兜底,见 sweeper)
+        let now = Instant::now();
+        g.retain(|_, e| e.expires > now);
+        if g.len() >= CHALLENGE_TABLE_CAP {
+            // 拒绝新挑战:空 nonce 使后续 consume 必然失败,连接被 AUTH_FAILED 拒绝
+            return String::new();
+        }
+        g.insert(
             nonce.clone(),
             ChallengeEntry {
                 client_id: client_id.to_string(),
@@ -56,6 +66,25 @@ impl ChallengeTable {
             return None;
         }
         Some(e.client_id)
+    }
+
+    /// 定期清扫过期 nonce(持有有效 client_id 的对端反复连接后断开
+    /// 不会触发 consume,必须靠周期清扫回收)。
+    pub async fn sweeper(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let now = Instant::now();
+            let removed = {
+                let mut g = self.inner.lock().await;
+                let before = g.len();
+                g.retain(|_, e| e.expires > now);
+                before - g.len()
+            };
+            if removed > 0 {
+                tracing::debug!(removed, "challenge table swept");
+            }
+        }
     }
 }
 
@@ -108,7 +137,15 @@ async fn handle_incoming(state: Arc<AppState>, inc: Incoming) -> anyhow::Result<
     match ty {
         FrameType::HELLO => {
             let hello: Hello = serde_json::from_slice(&payload)?;
-            auth_and_run(state, inc, stream, hello, buf).await
+            // 未认证并发上限(每 IP):认证完成或失败即释放
+            let ip = inc.remote.ip();
+            if !state.enter_unauth(&ip) {
+                let _ = send_error(&mut stream, "AUTH_FAILED", "too many pending auth").await;
+                return Ok(());
+            }
+            let r = auth_and_run(state.clone(), inc, stream, hello, buf).await;
+            state.exit_unauth(&ip);
+            r
         }
         FrameType::DATA_CHANNEL_HELLO => {
             // mux 模式下数据通道为后续流;裸模式每连接一流,此处即数据连接。
@@ -379,7 +416,7 @@ async fn run_session_loop(
         .unwrap_or_else(|| sess.client_id.clone());
     state
         .events
-        .emit("info", "client", &format!("client {name} offline"))
+        .emit("info", "client", &format!("客户端已离线:{name}"))
         .await;
     result
 }
@@ -496,6 +533,7 @@ pub async fn route_data_stream(
         RequestPurpose::VisitorRelay {
             visitor_id,
             user_conn_id,
+            compress,
         } => {
             crate::visitor::on_visitor_channel(
                 &state,
@@ -503,17 +541,19 @@ pub async fn route_data_stream(
                 hello.request_id,
                 visitor_id,
                 user_conn_id,
+                compress,
                 stream,
             )
             .await;
         }
-        RequestPurpose::RelayProxy { proxy_id } => {
+        RequestPurpose::RelayProxy { proxy_id, compress } => {
             crate::visitor::on_relay_proxy_channel(
                 &state,
                 &sess.session_id,
                 hello.request_id,
                 proxy_id,
                 "",
+                compress,
                 stream,
             )
             .await;

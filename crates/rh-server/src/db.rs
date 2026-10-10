@@ -20,8 +20,10 @@ fn now_ms() -> i64 {
 impl Db {
     pub async fn open(path: &str) -> Result<Self> {
         let path = path.strip_prefix("sqlite://").unwrap_or(path);
-        let opts = if path.ends_with(":memory:") {
-            // 内存库:解析 URL 语义(测试用)
+        let in_memory = path.ends_with(":memory:");
+        let opts = if in_memory {
+            // 内存库:解析 URL 语义(测试用)。
+            // 每个池连接是独立空库,必须限制单连接,否则迁移与查询落在不同库上
             <SqliteConnectOptions as std::str::FromStr>::from_str(&format!("sqlite:{path}"))?
         } else {
             SqliteConnectOptions::new()
@@ -31,7 +33,7 @@ impl Db {
         .foreign_keys(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
         let pool = SqlitePoolOptions::new()
-            .max_connections(8)
+            .max_connections(if in_memory { 1 } else { 8 })
             .connect_with(opts)
             .await
             .with_context(|| format!("open sqlite {path}"))?;
@@ -189,6 +191,24 @@ impl Db {
             .bind(enabled as i64)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// 更新客户端名称/备注(控制台编辑)。
+    pub async fn update_client_profile(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        remark: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE clients SET name=COALESCE(?2, name), remark=COALESCE(?3, remark) WHERE id=?1",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(remark)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -429,7 +449,12 @@ impl Db {
             let id: i64 = r.get(0);
             let client_id: String = r.get(1);
             let enabled = r.get::<i64, _>(2) != 0;
-            let mut spec: ProxySpec = serde_json::from_str(&r.get::<String, _>(3))?;
+            // 单行损坏(如手工改库/版本残留)只跳过该行,不得令整个列表失败
+            let raw: String = r.get(3);
+            let Ok(mut spec) = serde_json::from_str::<ProxySpec>(&raw) else {
+                tracing::warn!(proxy = id, "proxies row has corrupted spec json; skipping");
+                continue;
+            };
             spec.id = id as u64;
             spec.enabled = enabled;
             out.push((id, client_id, spec));

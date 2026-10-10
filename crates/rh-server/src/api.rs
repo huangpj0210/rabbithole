@@ -2,7 +2,7 @@
 
 use crate::db::normalize_spec;
 use crate::state::{AppState, ProxyState};
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -46,13 +46,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/visitors/{id}/disable", post(disable_visitor));
     let misc = Router::new()
         .route("/api/stats/overview", get(stats_overview))
-        .route("/api/events", get(list_events))
-        .route("/metrics", get(prometheus_metrics));
-    auth.merge(clients)
+        .route("/api/events", get(list_events));
+    let mut r = auth
+        .merge(clients)
         .merge(services)
         .merge(visitors)
-        .merge(misc)
-        .with_state(state)
+        .merge(misc);
+    // Prometheus 指标端点:仅在显式开启时注册,并要求与管理 API 相同的 Bearer 认证
+    if state.cfg.metrics.enable_prometheus {
+        r = r.route("/metrics", get(prometheus_metrics));
+    }
+    r.with_state(state)
 }
 
 async fn menu_all() -> Response {
@@ -85,52 +89,57 @@ struct LoginReq {
     password: String,
 }
 
-async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginReq>) -> Response {
-    // 登录限速:每 IP+用户名 5 次/分钟(governor)
+async fn login(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<crate::WebAddr>,
+    Json(req): Json<LoginReq>,
+) -> Response {
+    // 登录限速:每 IP+用户名 5 次/分钟(governor)。
+    // 用户名截断防任意长度 key 撑内存。
+    let uname: String = req.username.chars().take(64).collect();
     if state
         .login_limiter
-        .check_key(&format!("{}|{}", "api", req.username))
+        .check_key(&format!("{peer}|{uname}"))
         .is_err()
     {
         state
             .events
-            .emit(
-                "warn",
-                "auth",
-                &format!("login rate limited: {}", req.username),
-            )
+            .emit("warn", "auth", &format!("登录尝试受限:{uname}"))
             .await;
-        return err(429, "too many attempts, retry later");
+        return err(429, "尝试过于频繁,请稍后再试");
     }
     let user = match state.db.get_user(&req.username).await {
         Ok(Some(u)) => u,
         _ => {
+            // 对不存在的用户也执行一次等价 argon2 校验,消除时序侧信道枚举
+            const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$OXRoZXJlYXJlZnJwaHJvbGl0Z$5ENkQGI9XCo8uUU6eW/y6vLzRnF8YD2NO6wanjaApfE";
+            let _ = verify_password(&req.password, DUMMY_HASH);
             state
                 .events
-                .emit(
-                    "warn",
-                    "auth",
-                    &format!("login failed (unknown user): {}", req.username),
-                )
+                .emit("warn", "auth", &format!("登录失败(用户不存在):{uname}"))
                 .await;
-            return err(1001, "invalid username or password");
+            return err(1001, "用户名或密码错误");
         }
     };
     if !verify_password(&req.password, &user.1) {
         state
             .events
-            .emit("warn", "auth", &format!("login failed: {}", req.username))
+            .emit(
+                "warn",
+                "auth",
+                &format!("登录失败(密码错误):{}", req.username),
+            )
             .await;
-        return err(1001, "invalid username or password");
+        return err(1001, "用户名或密码错误");
     }
     let ttl = chrono_hours(state.cfg.web.jwt_ttl_hours);
     let token = match mint_jwt(&state, &req.username, ttl).await {
         Ok(t) => t,
-        Err(e) => return err(500, &format!("jwt: {e}")),
+        Err(e) => return err(500, &format!("内部错误(jwt):{e}")),
     };
     state
         .events
-        .emit("info", "auth", &format!("login ok: {}", req.username))
+        .emit("info", "auth", &format!("登录成功:{}", req.username))
         .await;
     ok(json!({ "accessToken": token }))
 }
@@ -153,11 +162,11 @@ async fn change_password(
         Err(resp) => return *resp,
     };
     if req.new_password.len() < 8 {
-        return err(1002, "new password must be at least 8 characters");
+        return err(1002, "新密码至少需要 8 位");
     }
     let row = match state.db.get_user(&user).await {
         Ok(Some(r)) => r,
-        _ => return err(1001, "user not found"),
+        _ => return err(1001, "用户不存在"),
     };
     if !verify_password(&req.old_password, &row.1) {
         state
@@ -165,24 +174,24 @@ async fn change_password(
             .emit(
                 "warn",
                 "auth",
-                &format!("password change rejected: {}", user),
+                &format!("修改密码被拒(旧密码错误):{}", user),
             )
             .await;
-        return err(1001, "invalid old password");
+        return err(1001, "旧密码错误");
     }
     let hash = match hash_password(&req.new_password) {
         Ok(h) => h,
-        Err(e) => return err(500, &format!("hash: {e}")),
+        Err(e) => return err(500, &format!("内部错误(hash):{e}")),
     };
     match state.db.update_user_password(&user, &hash).await {
         Ok(true) => {}
-        _ => return err(500, "update failed"),
+        _ => return err(500, "更新失败"),
     }
     // 轮换会话密钥:旧令牌(含本请求所用)全部失效
     *state.web_jwt_secret.lock().await = Some(uuid::Uuid::new_v4().simple().to_string());
     state
         .events
-        .emit("info", "auth", &format!("password changed: {}", user))
+        .emit("info", "auth", &format!("密码已修改:{}", user))
         .await;
     ok(json!({ "relogin": true }))
 }
@@ -266,7 +275,7 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         Ok(user) => {
             state
                 .events
-                .emit("info", "auth", &format!("logout: {user}"))
+                .emit("info", "auth", &format!("已登出:{user}"))
                 .await;
             StatusCode::NO_CONTENT.into_response()
         }
@@ -348,7 +357,7 @@ async fn create_client(
     }
     let name = req.name.trim();
     if name.is_empty() || name.len() > 64 {
-        return err(1002, "name must be 1-64 chars");
+        return err(1002, "名称长度须为 1-64 字符");
     }
     let id = uuid::Uuid::new_v4().to_string();
     let secret = crate::control::hmac_hex(
@@ -363,11 +372,11 @@ async fn create_client(
         .create_client(&id, name, &secret, &req.remark)
         .await
     {
-        return err(1003, &format!("create: {e}"));
+        return err(1003, &format!("创建失败:{e}"));
     }
     state
         .events
-        .emit("info", "client", &format!("client {name} created"))
+        .emit("info", "client", &format!("客户端已创建:{name}"))
         .await;
     ok(json!({
         "id": id,
@@ -380,6 +389,10 @@ async fn create_client(
 #[derive(Deserialize)]
 struct UpdateClientReq {
     enabled: Option<bool>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    remark: Option<String>,
 }
 
 async fn update_client(
@@ -391,12 +404,32 @@ async fn update_client(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
+    if let Some(name) = &req.name {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 64 {
+            return err(1002, "名称长度须为 1-64 字符");
+        }
+    }
+    let lock = state.serial_lock(&id);
+    let _g = lock.lock().await;
     let Some(_c) = state.db.get_client(&id).await.ok().flatten() else {
-        return err(1004, "client not found");
+        return err(1004, "客户端不存在");
     };
+    if req.name.is_some() || req.remark.is_some() {
+        let name = req.name.as_deref().map(str::trim);
+        if let Err(e) = state
+            .db
+            .update_client_profile(&id, name, req.remark.as_deref().map(|r| r.trim()))
+            .await
+        {
+            return err(500, &format!("{e}"));
+        }
+        state
+            .events
+            .emit("info", "client", &format!("客户端资料已更新:{}", _c.name))
+            .await;
+    }
     if let Some(enabled) = req.enabled {
-        let lock = state.serial_lock(&id);
-        let _g = lock.lock().await;
         if let Err(e) = state.db.set_client_enabled(&id, enabled).await {
             return err(500, &format!("{e}"));
         }
@@ -437,7 +470,7 @@ async fn update_client(
             }
             state
                 .events
-                .emit("warn", "client", &format!("client {} disabled", _c.name))
+                .emit("warn", "client", &format!("客户端已禁用:{}", _c.name))
                 .await;
         }
     }
@@ -467,7 +500,10 @@ async fn rotate_secret(
     if let Some(sess) = state.sessions.get(&id) {
         sess.cancel.cancel();
     }
-    state.events.emit("warn", "client", "secret rotated").await;
+    state
+        .events
+        .emit("warn", "client", "客户端密钥已轮换")
+        .await;
     ok(json!({ "secret": new_secret }))
 }
 
@@ -491,7 +527,7 @@ async fn delete_client(
     if let Err(e) = state.db.delete_client(&id).await {
         return err(500, &format!("{e}"));
     }
-    state.events.emit("warn", "client", "client deleted").await;
+    state.events.emit("warn", "client", "客户端已删除").await;
     ok(json!({"deleted": true}))
 }
 
@@ -580,21 +616,23 @@ async fn create_service_inner(
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         || spec.name.len() > 64
     {
-        return Err((2001, "name must be [a-zA-Z0-9_-]{1,64}".into()));
+        return Err((2001, "名称须为 1-64 位字母/数字/下划线/连字符".into()));
     }
     normalize_spec(spec, state.cfg.limits.default_pool_size);
     if spec.client_id.is_empty() {
-        return Err((2002, "client_id required".into()));
+        return Err((2002, "缺少 client_id".into()));
     }
     let client = state
         .db
         .get_client(&spec.client_id)
         .await
         .map_err(|e| (500, format!("{e}")))?
-        .ok_or((2002, "client not found".to_string()))?;
+        .ok_or((2002, "客户端不存在".to_string()))?;
     let client_enabled = client.enabled;
     spec.enabled = spec.enabled && client_enabled;
-    // 每客户端数量上限
+    let lock = state.serial_lock(&client.id);
+    let _g = lock.lock().await;
+    // 每客户端数量上限(串行域内计数,防并发创建突破配额)
     if state.cfg.ports.max_services_per_client > 0 {
         let count = state
             .db
@@ -603,11 +641,9 @@ async fn create_service_inner(
             .map_err(|e| (500, format!("{e}")))?
             .len();
         if count >= state.cfg.ports.max_services_per_client {
-            return Err((2003, "LIMIT_EXCEEDED".into()));
+            return Err((2003, "LIMIT_EXCEEDED:超出配额限制".into()));
         }
     }
-    let lock = state.serial_lock(&client.id);
-    let _g = lock.lock().await;
     // 资格跳步(§4.4):客户端禁用 → 仅落库为 disabled(不占端口、不推进 revision)
     if !client_enabled {
         let id = state
@@ -634,24 +670,27 @@ async fn create_service_inner(
             port_auto = true;
         } else {
             if !state.proxies.port_allowed(spec.bind_port) {
-                return Err((2005, "PORT_DENIED".into()));
+                return Err((2005, "PORT_DENIED:端口不在允许范围".into()));
             }
             let proto = spec.kind.as_str();
+            let gkey = crate::state::ProxyManager::group_key(spec);
             if state
                 .proxies
-                .port_in_use(proto, bind_ip, spec.bind_port, None)
+                .port_in_use(proto, bind_ip, spec.bind_port, None, gkey.clone())
                 .await
             {
-                return Err((2006, "PORT_CONFLICT".into()));
+                return Err((2006, "PORT_CONFLICT:端口已被占用".into()));
             }
-            // 试绑定
-            let trial_ok = if spec.kind == ProxyKind::Tcp {
-                trial_bind_tcp(bind_ip, spec.bind_port)
-            } else {
-                trial_bind_udp(bind_ip, spec.bind_port)
-            };
+            // 同组共享监听已在位时无需(也无法)再次试绑
+            let group_bound = state.proxies.group_listener_bound(&gkey);
+            let trial_ok = group_bound
+                || if spec.kind == ProxyKind::Tcp {
+                    trial_bind_tcp(bind_ip, spec.bind_port)
+                } else {
+                    trial_bind_udp(bind_ip, spec.bind_port)
+                };
             if !trial_ok {
-                return Err((2007, "bind failed: port in use".into()));
+                return Err((2007, "端口绑定失败:端口已被占用".into()));
             }
         }
     } else if matches!(
@@ -704,7 +743,7 @@ async fn create_service_inner(
     crate::runtime::spawn_runtime(state, &client.id, spec, rev).await;
     state
         .events
-        .emit("info", "service", &format!("proxy {} created", spec.name))
+        .emit("info", "service", &format!("转发规则已创建:{}", spec.name))
         .await;
     Ok(json!({
         "id": id,
@@ -723,13 +762,24 @@ async fn update_service(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let Some((_, client_id, old, port_auto)) = state.db.get_proxy(id).await.ok().flatten() else {
-        return err(3001, "service not found");
-    };
     spec.id = id as u64;
     normalize_spec(&mut spec, state.cfg.limits.default_pool_size);
+    // 实体读取在串行域内进行,避免与并发管理操作竞态
+    let Some(client_id) = state
+        .db
+        .get_proxy(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, cid, _, _)| cid)
+    else {
+        return err(3001, "转发规则不存在");
+    };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    let Some((_, client_id, old, port_auto)) = state.db.get_proxy(id).await.ok().flatten() else {
+        return err(3001, "转发规则不存在");
+    };
     let client = state.db.get_client(&client_id).await.ok().flatten();
     let client_enabled = client.as_ref().map(|c| c.enabled).unwrap_or(false);
     // 资格跳步:规则或客户端禁用 → 仅落库
@@ -738,6 +788,10 @@ async fn update_service(
             return err(500, &format!("{e}"));
         }
         return ok(json!({"updated": true, "deferred": true}));
+    }
+    // 更新路径不允许 bind_port=0(随机端口语义仅创建时支持)
+    if spec.kind.uses_bind_port() && spec.bind_port == 0 {
+        return err(3006, "bind_port 不能为 0(仅创建时支持自动分配)");
     }
     // 非端口字段变更(§4.3):listener/池不动,原位发布快照 + 入队
     let port_changed =
@@ -771,25 +825,34 @@ async fn update_service(
             old.bind_port,
         ) && (new_ip != old_ip || spec.bind_port == old.bind_port)
         {
-            return err(3002, "OVERLAP_ADDR_UPDATE");
+            return err(3002, "OVERLAP_ADDR_UPDATE:绑定地址重叠,不支持直接修改");
         }
         if !state.proxies.port_allowed(spec.bind_port) {
-            return err(3003, "PORT_DENIED");
+            return err(3003, "PORT_DENIED:端口不在允许范围");
         }
+        let gkey = crate::state::ProxyManager::group_key(&spec);
         if state
             .proxies
-            .port_in_use(spec.kind.as_str(), new_ip, spec.bind_port, Some(id as u64))
+            .port_in_use(
+                spec.kind.as_str(),
+                new_ip,
+                spec.bind_port,
+                Some(id as u64),
+                gkey.clone(),
+            )
             .await
         {
-            return err(3004, "PORT_CONFLICT");
+            return err(3004, "PORT_CONFLICT:端口已被占用");
         }
-        let trial_ok = if spec.kind == ProxyKind::Tcp {
-            trial_bind_tcp(new_ip, spec.bind_port)
-        } else {
-            trial_bind_udp(new_ip, spec.bind_port)
-        };
+        let group_bound = state.proxies.group_listener_bound(&gkey);
+        let trial_ok = group_bound
+            || if spec.kind == ProxyKind::Tcp {
+                trial_bind_tcp(new_ip, spec.bind_port)
+            } else {
+                trial_bind_udp(new_ip, spec.bind_port)
+            };
         if !trial_ok {
-            return err(3005, "bind failed");
+            return err(3005, "端口绑定失败");
         }
     }
     let rev = match state
@@ -814,12 +877,22 @@ async fn enable_service(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
+    let Some(client_id) = state
+        .db
+        .get_proxy(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, cid, _, _)| cid)
     else {
-        return err(3001, "service not found");
+        return err(3001, "转发规则不存在");
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
+    else {
+        return err(3001, "转发规则不存在");
+    };
     let client_enabled = state
         .db
         .get_client(&client_id)
@@ -905,22 +978,31 @@ async fn create_bind_checked(
     let bind_ip =
         rh_core::net::parse_bind_ip(&spec.bind_ip).ok_or((2004, "invalid bind_ip".to_string()))?;
     if !state.proxies.port_allowed(spec.bind_port) {
-        return Err((2005, "PORT_DENIED".into()));
+        return Err((2005, "PORT_DENIED:端口不在允许范围".into()));
     }
+    let gkey = crate::state::ProxyManager::group_key(spec);
     if state
         .proxies
-        .port_in_use(spec.kind.as_str(), bind_ip, spec.bind_port, Some(id as u64))
+        .port_in_use(
+            spec.kind.as_str(),
+            bind_ip,
+            spec.bind_port,
+            Some(id as u64),
+            gkey.clone(),
+        )
         .await
     {
-        return Err((2006, "PORT_CONFLICT".into()));
+        return Err((2006, "PORT_CONFLICT:端口已被占用".into()));
     }
-    let trial_ok = if spec.kind == ProxyKind::Tcp {
-        trial_bind_tcp(bind_ip, spec.bind_port)
-    } else {
-        trial_bind_udp(bind_ip, spec.bind_port)
-    };
+    let group_bound = state.proxies.group_listener_bound(&gkey);
+    let trial_ok = group_bound
+        || if spec.kind == ProxyKind::Tcp {
+            trial_bind_tcp(bind_ip, spec.bind_port)
+        } else {
+            trial_bind_udp(bind_ip, spec.bind_port)
+        };
     if !trial_ok {
-        return Err((2007, "bind failed".into()));
+        return Err((2007, "端口绑定失败".into()));
     }
     Ok(())
 }
@@ -933,11 +1015,21 @@ async fn disable_service(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
-        return err(3001, "service not found");
+    let Some(client_id) = state
+        .db
+        .get_proxy(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, cid, _, _)| cid)
+    else {
+        return err(3001, "转发规则不存在");
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+        return err(3001, "转发规则不存在");
+    };
     state.db.set_proxy_enabled(id, false).await.ok();
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
     crate::runtime::teardown_runtime(&state, id as u64).await;
@@ -953,7 +1045,7 @@ async fn disable_service(
     }
     state
         .events
-        .emit("info", "service", &format!("proxy {} disabled", spec.name))
+        .emit("info", "service", &format!("转发规则已停用:{}", spec.name))
         .await;
     ok(json!({"disabled": true, "revision": rev}))
 }
@@ -966,11 +1058,21 @@ async fn delete_service(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
-        return err(3001, "service not found");
+    let Some(client_id) = state
+        .db
+        .get_proxy(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, cid, _, _)| cid)
+    else {
+        return err(3001, "转发规则不存在");
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+        return err(3001, "转发规则不存在");
+    };
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
     crate::runtime::teardown_runtime(&state, id as u64).await;
     if let Err(e) = state.db.delete_proxy(id).await {
@@ -988,7 +1090,7 @@ async fn delete_service(
     }
     state
         .events
-        .emit("warn", "service", &format!("proxy {} deleted", spec.name))
+        .emit("warn", "service", &format!("转发规则已删除:{}", spec.name))
         .await;
     ok(json!({"deleted": true}))
 }
@@ -1022,7 +1124,7 @@ async fn batch_services(
             }
             "disable" => disable_service_inner(&state, id).await,
             "delete" => delete_service_inner(&state, id).await,
-            _ => (9000, format!("unknown action {}", req.action)),
+            _ => (9000, format!("未知操作:{}", req.action)),
         };
         results.push(json!({"id": id, "code": r.0, "message": r.1}));
     }
@@ -1030,12 +1132,22 @@ async fn batch_services(
 }
 
 async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
-    let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
+    let Some(client_id) = state
+        .db
+        .get_proxy(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, cid, _, _)| cid)
     else {
         return (3001, "not found".into());
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
+    else {
+        return (3001, "not found".into());
+    };
     state.db.set_proxy_enabled(id, true).await.ok();
     spec.enabled = true;
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
@@ -1047,14 +1159,17 @@ async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
         .flatten()
         .map(|c| c.enabled)
         .unwrap_or(false);
-    if client_enabled
-        && create_bind_checked(state, &client_id, &mut spec, port_auto, id)
-            .await
-            .is_ok()
-    {
-        crate::runtime::teardown_runtime(state, id as u64).await;
-        crate::runtime::spawn_runtime(state, &client_id, &spec, rev).await;
+    if !client_enabled {
+        return (0, "ok".into());
     }
+    // 绑定资格失败:回滚 enabled,保持 DB 与运行态一致(与单个 enable 同语义)
+    if let Err((code, msg)) = create_bind_checked(state, &client_id, &mut spec, port_auto, id).await
+    {
+        state.db.set_proxy_enabled(id, false).await.ok();
+        return (code, msg);
+    }
+    crate::runtime::teardown_runtime(state, id as u64).await;
+    crate::runtime::spawn_runtime(state, &client_id, &spec, rev).await;
     (0, "ok".into())
 }
 
@@ -1153,7 +1268,7 @@ async fn create_visitor(
     }
     let mut spec = req.spec;
     if spec.name.is_empty() || spec.bind_port == 0 {
-        return err(4001, "name and bind_port required");
+        return err(4001, "缺少 name 或 bind_port");
     }
     spec.id = 0;
     // 解析目标代理归属(同名规则可能存在于多个客户端:优先当前在线的客户端,
@@ -1183,7 +1298,7 @@ async fn create_visitor(
         .cloned();
     let target_proxy_found = target_client.is_some();
     if !target_proxy_found {
-        return err(4002, "target proxy not found (kind must match)");
+        return err(4002, "目标规则不存在(类型须匹配)");
     }
     let lock = state.serial_lock(&req.client_id);
     let _g = lock.lock().await;
@@ -1221,7 +1336,7 @@ async fn update_visitor(
     }
     let rows = state.db.list_visitors(None).await.unwrap_or_default();
     let Some((_, client_id, _, _)) = rows.iter().find(|(vid, ..)| *vid == id) else {
-        return err(4003, "visitor not found");
+        return err(4003, "访问器不存在");
     };
     spec.id = id as u64;
     // 重新解析目标
@@ -1281,7 +1396,7 @@ async fn disable_visitor(
 async fn toggle_visitor(state: Arc<AppState>, id: i64, enabled: bool) -> Response {
     let rows = state.db.list_visitors(None).await.unwrap_or_default();
     let Some((_, client_id, _, mut spec)) = rows.into_iter().find(|(vid, ..)| *vid == id) else {
-        return err(4003, "visitor not found");
+        return err(4003, "访问器不存在");
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
@@ -1320,7 +1435,7 @@ async fn delete_visitor(
     }
     let rows = state.db.list_visitors(None).await.unwrap_or_default();
     let Some((_, client_id, _, _)) = rows.into_iter().find(|(vid, ..)| *vid == id) else {
-        return err(4003, "visitor not found");
+        return err(4003, "访问器不存在");
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
@@ -1397,7 +1512,10 @@ async fn list_events(
     ok(rows)
 }
 
-async fn prometheus_metrics(State(state): State<Arc<AppState>>, _headers: HeaderMap) -> Response {
+async fn prometheus_metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
     use prometheus::TextEncoder;
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();

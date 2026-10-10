@@ -221,11 +221,16 @@ async fn run_loop(
     let mut hb = tokio::time::interval(Duration::from_secs(sess.heartbeat_s as u64));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = hb.tick().await;
+    // 活性看门狗:死链(NAT 老化/黑洞路由)下 TCP 写要 15-20 分钟才报错,
+    // 3× 心跳周期无任何服务端帧即主动断开触发重连(与服务端 90s 看门狗对称)
+    let mut last_rx = std::time::Instant::now();
+    let watchdog = Duration::from_secs(sess.heartbeat_s as u64 * 3);
     loop {
         tokio::select! {
             r = frame::read_frame(&mut control, &mut buf) => {
                 match r {
                     Ok((ty, payload)) => {
+                        last_rx = std::time::Instant::now();
                         if let Err(e) = dispatch_frame(&sess, &mut control, &mut buf, ty, &payload, &shutdown).await {
                             if e.to_string().starts_with("session rejected") {
                                 sess.cancel.cancel();
@@ -251,6 +256,10 @@ async fn run_loop(
                 }
             }
             _ = hb.tick() => {
+                if last_rx.elapsed() > watchdog {
+                    warn!("control link watchdog: no server frames; reconnecting");
+                    break;
+                }
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)

@@ -29,6 +29,14 @@ oxfmt.config.ts / oxlint.config.ts / .stylelintignore);element-plus 以精确版
 清理 16 项裁剪后无消费者的 catalog 条目;eslint/oxfmt 自动修复覆盖全仓库格式。
 `check:circular` 仍报上游包既有类型循环警告(上游原样,未修改)。
 
+**2026-10-10 模板残留清理复跑**(任务书 web/FRONTEND-CLEANUP-PROMPT.md,阶段 1+2,
+详见 FRONTEND-NOTES「模板残留清理」节):lint **exit 0**、typecheck **0 错误**、
+vitest **575/575**、build 通过;产物 dist 4.3M→**3.4M**(js chunk 217→147,
+674K echarts chunk 与全部演示页/品牌/统计残留 grep 为空)。已知残留(阶段 3
+未执行):框架层默认值字符串(unpkg static-source URL、'Vben Admin' 默认版权名,
+运行时未启用)与 common-ui 的 3 个 profile chunk;`pnpm install
+--frozen-lockfile` 修复(allowBuilds.lefthook 占位符→false)后 exit 0。
+
 ## 3. 测试-1(单元/集成测试要点)
 
 - rh-transport:帧协议 roundtrip、yamux 开流/回显/多流、**tcpmux 全链路集成测试**
@@ -173,7 +181,8 @@ UI 开关停用(端口实测 Connection refused,状态 disabled)→ 重新启用
 新密钥重启后在线恢复且转发可用)→ 总览统计复核(客户端 1/在线 1/运行中 1,
 真实数字)→ 登出(header 退出按钮 → 确认弹窗 → 回登录页,刷新无自动登录)。
 
-负向检查:错误密码停留登录页并提示 "invalid username or password";
+负向检查:错误密码停留登录页并提示「用户名或密码错误」(2026-10-10 R15 起后端
+API 消息全面中文化,此前为英文 "invalid username or password");
 未登录直访 `#/rabbithole/overview` 被守卫重定向回登录页;空表单提交被校验拦截。
 
 历史注记:dev server 链路曾于 2026-10-08 通过(review-log R6);当时生产构建
@@ -186,6 +195,19 @@ UI 开关停用(端口实测 Connection refused,状态 disabled)→ 重新启用
 回跳设置页。表单校验:空表单无误显提示(曾误显灰色"两次输入不一致",antd FormItem
 `help` 恒渲染所致,改为条件渲染后修复)、新/确认不一致时红色错误文案+红框、一致后
 消失、新密码 ≥8 位由前后端双侧校验。自动化侧另有 e2e.sh boot 环境 9 例(见 §5)。
+
+第四轮(2026-10-10,模板残留清理冒烟,dev server 5666 + 真实 rh-server 8080,
+首启引导环境):① 未登录访问深层路由被守卫重定向回登录页;登录页**仅有**
+账号/密码/记住账号/登录按钮(无忘记密码/注册/扫码/手机号/第三方图标/页脚 Vben
+版权与 ICP 备案/营销插画,panel-center),标题与文案为 Rabbithole 自有覆盖;
+② 登录后侧边栏仅「rabbithole」一组 5 项(总览/客户端/转发规则/访问器/设置),
+五个页面全部可开,总览统计与事件表为真实后端数据(bootstrap/login 事件可见);
+③ 顶栏无通知铃铛/全站搜索/时区切换/锁屏,用户菜单无个人中心/文档/GitHub/
+ann.vben/Pro;④ 顶栏退出按钮 → 确认弹窗「是否退出登录?」→ 回登录页,**后端
+事件流出现 `logout: admin` 审计**(logoutApi 显式 Bearer 修复的真实效果,
+此前该事件从不记录);⑤ 登录后访问未知路径渲染 404 兜底页(哎呀!未找到页面/
+返回首页)。附注:vben 偏好持久化于 localStorage 且旧缓存覆盖新 override,
+旧浏览器升级后需清一次站点数据(框架已知行为,已记入 FRONTEND-NOTES)。
 
 ## 13. 已知限制(未验证或带条件交付)
 
@@ -212,3 +234,38 @@ UI 开关停用(端口实测 Connection refused,状态 disabled)→ 重新启用
    "server error (unparsable)"(应为 AUTH_FAILED 文案):拒绝行为正确,展示待优化。
 9. vben 自带 `check:circular` 在上游包(form-ui 等)存在既有类型循环警告,
    属上游状态,未修改;`typecheck` 为 0 错误。
+10. 前端产物仍含框架层(packages/**)默认值字符串:`@core/preferences/src/config.ts`
+    的 unpkg static-source 默认 logo/avatar URL、`copyright.vue` 默认
+    `companyName:'Vben Admin'`,以及 common-ui 导出的 3 个 `profile-*.js` chunk。
+    运行时均未启用(logo/copyright 已关),彻底移除属清理任务书阶段 3(需用户确认,
+    默认不执行);升级部署后旧浏览器 localStorage 偏好缓存需清理一次(§12 第四轮附注)。
+
+## 14. 内嵌 Web 控制台(单二进制,`tests/e2e-embed.sh`,9/9 PASS,2026-10-10)
+
+构建期 `build.rs` 检测 `web/apps/web-antd/dist` 存在 → `rust-embed` 嵌入
+rh-server(release 二进制 14.3MB→17.5MB,+3.2MB);无 dist 的纯 Rust 检出
+`cargo check --release` 通过(CI 后端 job 不依赖前端产物)。用例:
+
+- 启动日志声明 `embedded ui(files=156)`;根路径返回内嵌 index(html 200);
+- 深层路由 SPA 回退 index(200);hashed JS 资产可取(200+MIME+体积);
+- 未知 `/api/*` 返回 JSON 404 envelope(不混 HTML);favicon 可取;
+- 配置 `static_dir` 时不启用内嵌分支,磁盘内容覆盖内嵌(优先级正确)。
+
+## 15. 整体代码评审轮(R17,2026-10-10)
+
+四域全量审查后的修复回归(fmt/clippy 0 警告/单测 42/42,release 重建):
+
+| 套件 | 结果 |
+| --- | --- |
+| e2e.sh(主链路 + 新增 metrics 认证/未认证拒绝 2 项) | 56/56 |
+| e2e-transports.sh(tcp/tls/ws/wss/quic/kcp 全链路) | 12/12 |
+| e2e-vhost.sh | 10/10 |
+| e2e-resilience.sh | 19/19 |
+| e2e-plugins.sh | 15/15 |
+| e2e-embed.sh | 9/9 |
+| xtcp-isolated.sh | 9/9 |
+
+本轮新增已知限制(详见 review-log R17"过程如实记录"):KCP 每源 IP 并发会话
+上限未实现(以对端锁定 + 句柄归零快速回收缓解);TCPMux 标准模式端到端 e2e
+仍仅到 CONNECT 200(yamux 客户端语义,流路径由 mux.rs 单测覆盖);web 前端
+问题因"前端将重写"决策不处理。

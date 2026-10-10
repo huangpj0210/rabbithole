@@ -20,7 +20,7 @@ pub struct YamuxMultiplexer {
 
 impl YamuxMultiplexer {
     /// 在给定字节流上创建 yamux;mode:客户端(开流)/服务端(收流)。
-    /// keepalive 30s:同时用于维持 KCP 会话活跃与死连接探测。
+    /// 注:yamux 0.14 无内建 keepalive,会话存活依赖协议层心跳(< 会话空闲超时)。
     pub fn new(io: BoxedIo, mode: yamux::Mode) -> Self {
         let mut cfg = yamux::Config::default();
         cfg.set_max_num_streams(256);

@@ -119,20 +119,31 @@ pub async fn tcp_on_channel(
     if owner != 0 && owner != sess.epoch {
         return;
     }
-    // 有等待者直接交付
-    let waiter = {
+    // 有等待者直接交付;等待者已放弃(超时)则通道入池,不得丢弃
+    let deliver = {
         let mut w = pool.waiters.lock().await;
         w.pop()
     };
-    if let Some(tx) = waiter {
-        let _ = tx.send(stream);
-    } else {
-        let mut ready = pool.ready.lock().await;
-        if ready.len() < pool.size {
-            ready.push((sess.epoch, request_id, stream));
-        } else {
-            // 超额:关闭
-            drop(stream);
+    match deliver {
+        Some((_, tx)) => {
+            if let Err(stream) = tx.send(stream) {
+                // 接收端已放弃:通道回到池或关闭
+                let mut ready = pool.ready.lock().await;
+                if ready.len() < pool.size {
+                    ready.push((sess.epoch, request_id, stream));
+                } else {
+                    drop(stream);
+                }
+            }
+        }
+        None => {
+            let mut ready = pool.ready.lock().await;
+            if ready.len() < pool.size {
+                ready.push((sess.epoch, request_id, stream));
+            } else {
+                // 超额:关闭
+                drop(stream);
+            }
         }
     }
     // 取一补一
@@ -160,7 +171,8 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
     }
     // 等待新通道(签发后到达即交付)
     let (tx, rx) = tokio::sync::oneshot::channel::<BoxedIo>();
-    pool.waiters.lock().await.push(tx);
+    let waiter_id = pool.waiter_seq.fetch_add(1, Ordering::Relaxed);
+    pool.waiters.lock().await.push((waiter_id, tx));
     // 签发
     pool.inflight.fetch_add(1, Ordering::Relaxed);
     let issued = state
@@ -173,7 +185,7 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
         .is_some();
     if !issued {
         pool.inflight.fetch_sub(1, Ordering::Relaxed);
-        pool.waiters.lock().await.pop();
+        pool.remove_waiter(waiter_id).await;
         return None;
     }
     match tokio::time::timeout(
@@ -184,7 +196,7 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
     {
         Ok(Ok(s)) => Some(s),
         _ => {
-            pool.waiters.lock().await.pop();
+            pool.remove_waiter(waiter_id).await;
             None
         }
     }
@@ -193,7 +205,7 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
 /// START_FORWARD 指派(数据连接最后一帧)+ 桥接到用户连接。
 /// 半关闭:双向独立复制。
 pub async fn assign_forward(
-    state: &Arc<AppState>,
+    _state: &Arc<AppState>,
     rt: &Arc<ProxyRuntime>,
     mut channel: BoxedIo,
     user: BoxedIo,
@@ -266,7 +278,6 @@ pub async fn assign_forward(
         let _ = u_w.shutdown().await;
     });
     let _ = tokio::join!(t1, t2);
-    state.metrics.totals.lock().unwrap().conns_current -= 1;
 }
 
 async fn copy_limited<R, W>(r: &mut R, w: &mut W, bucket: Option<Arc<TokenBucket>>)
@@ -313,6 +324,16 @@ pub async fn tcp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, listene
     }
 }
 
+/// 连接计数守卫:转发结束(含指派失败的早退路径)即递减,
+/// 避免 conns_current 在死通道场景下单调漂移。
+struct ConnGuard(Arc<crate::state::Metrics>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.totals.lock().unwrap().conns_current -= 1;
+    }
+}
+
 async fn serve_tcp_user(
     state: Arc<AppState>,
     rt: Arc<ProxyRuntime>,
@@ -333,6 +354,7 @@ async fn serve_tcp_user(
         return; // 池空超时:快速失败
     };
     state.metrics.totals.lock().unwrap().conns_current += 1;
+    let _conn_guard = ConnGuard(state.metrics.clone());
     state
         .metrics
         .connections
@@ -368,22 +390,16 @@ async fn group_pick(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Option<Arc
         let spec = rt.spec.read().await;
         crate::state::ProxyManager::group_key(&spec)?
     };
-    let members: Vec<u64> = state
-        .proxies
-        .groups
-        .get(&key)
-        .map(|g| g.members.blocking_read().clone())
-        .unwrap_or_default();
+    let (members, start) = {
+        let g = state.proxies.groups.get(&key)?;
+        let members = g.members.read().await.clone();
+        let start = g.rr.fetch_add(1, Ordering::Relaxed) as usize;
+        (members, start)
+    };
     if members.len() <= 1 {
         return Some(rt.clone());
     }
     // 轮询健康且在线的成员
-    let start = state
-        .proxies
-        .groups
-        .get(&key)
-        .map(|g| g.rr.fetch_add(1, Ordering::Relaxed))
-        .unwrap_or(0) as usize;
     for idx in (start..).take(members.len()) {
         let id = members[idx % members.len()];
         if let Some(m) = state.proxies.get(id) {
@@ -432,8 +448,10 @@ pub async fn udp_on_channel(
     let Some(rt) = state.proxies.get(proxy_id) else {
         return;
     };
-    let tx = rt.udp_new_channel_tx.lock().await;
-    if let Some(tx) = tx.as_ref() {
+    // 克隆 sender 后立即放锁:send 可能因 pump 忙而阻塞,
+    // 不得让锁跨 await(close_proxy_channels 会被卡死)
+    let tx = rt.udp_new_channel_tx.lock().await.clone();
+    if let Some(tx) = tx {
         let _ = tx.send(stream).await;
     }
 }
@@ -493,6 +511,12 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                         Err(_) => break true, // EOF/错误:通道死亡
                     }
                 }
+                _ = gc.tick() => {
+                    // 会话表淘汰必须在通道存活期间执行(不能只等通道死亡),
+                    // 否则源地址轮换的 UDP 对端会无界积累
+                    let now = Instant::now();
+                    sessions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
+                }
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
                     let now = Instant::now();
                     if now.duration_since(last_ping_sent) >= Duration::from_secs(30) {
@@ -520,9 +544,6 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
             // 清用户会话映射(代次隔离)
             sessions.clear();
         }
-        gc.tick().await;
-        let now = Instant::now();
-        sessions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
     }
 }
 

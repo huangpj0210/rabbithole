@@ -34,7 +34,13 @@ async fn serve_http(state: Arc<AppState>, sock: TcpStream, peer: SocketAddr) -> 
     use hyper::service::service_fn;
 
     let st = state.clone();
-    let conn = http1::Builder::new()
+    let mut builder = http1::Builder::new();
+    // 头部读取超时(防 slowloris 未认证挂连接);0 = 不启用
+    let header_to = st.cfg.vhost.http_timeout_s;
+    if header_to > 0 {
+        builder.header_read_timeout(Some(std::time::Duration::from_secs(header_to)));
+    }
+    let conn = builder
         .timer(hyper_util::rt::TokioTimer::new())
         .serve_connection(
             hyper_util::rt::TokioIo::new(sock),
@@ -91,8 +97,8 @@ async fn handle_http_request(
         }
         for loc in &r.locations {
             let l = loc.trim_end_matches('/');
-            if path == *loc || path.starts_with(&format!("{l}/")) || path.starts_with(loc.as_str())
-            {
+            // 前缀匹配须以路径段为边界:/api 不得命中 /apifoo
+            if path == *loc || path.starts_with(&format!("{l}/")) {
                 let len = loc.len();
                 if best.map(|(_, bl)| len > bl).unwrap_or(true) {
                     best = Some((r, len));
@@ -121,20 +127,19 @@ async fn handle_http_request(
             return Ok(resp);
         }
     }
-    // 上游通道
+    // 上游通道(先组选路再取通道:通道属主须与 START_FORWARD 目标一致)
     let Some(rt) = state.proxies.get(route.proxy_id) else {
         return Ok(not_found_response(&state));
     };
+    let rt = crate::data::group_pick_public(&state, &rt)
+        .await
+        .unwrap_or(rt);
     if !rt.healthy.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(service_unavailable());
     }
     let Some(channel) = crate::data::get_channel(&state, &rt).await else {
         return Ok(service_unavailable());
     };
-    // 组选路
-    let rt = crate::data::group_pick_public(&state, &rt)
-        .await
-        .unwrap_or(rt);
     let spec = rt.spec.read().await.clone();
 
     // 头改写 + Host 改写
@@ -339,7 +344,8 @@ async fn serve_https(
 
 /// 从 ClientHello 提取 SNI(不解密)。
 async fn peek_sni(sock: &TcpStream) -> anyhow::Result<Option<String>> {
-    let mut buf = vec![0u8; 4096];
+    // 16KiB:后量子/多扩展的 ClientHello 可超 4KiB,截断会静默断连
+    let mut buf = vec![0u8; 16 * 1024];
     // 循环直到能解析完整 ClientHello 头;必须用 peek(不消费),
     // 后续 copy_bidirectional 需要完整 ClientHello 交给客户端侧 TLS 终结。
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -458,22 +464,22 @@ async fn serve_tcpmux(
     peer: SocketAddr,
     passthrough: bool,
 ) -> anyhow::Result<()> {
-    // 读 CONNECT 请求
+    // 读 CONNECT 请求(终止符之后同批到达的字节须回灌,如 yamux 首帧/TLS ClientHello)
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
-    loop {
+    let tail = loop {
         let n = sock.read(&mut chunk).await?;
         if n == 0 {
             return Ok(());
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break buf.split_off(pos + 4);
         }
         if buf.len() > 4096 {
             return Ok(());
         }
-    }
+    };
     let head = String::from_utf8_lossy(&buf).into_owned();
     let mut lines = head.split("\r\n");
     let first = lines.next().unwrap_or_default().to_string();
@@ -523,12 +529,12 @@ async fn serve_tcpmux(
         .await
         .unwrap_or(rt);
     let spec = rt.spec.read().await.clone();
-    let Some(mut channel) = crate::data::get_channel(&state, &rt).await else {
-        sock.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
-            .await?;
-        return Ok(());
-    };
     if passthrough {
+        let Some(mut channel) = crate::data::get_channel(&state, &rt).await else {
+            sock.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                .await?;
+            return Ok(());
+        };
         // 透传模式:CONNECT 200 后整条流直通客户端,由客户端处理多路复用
         sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await?;
@@ -558,22 +564,18 @@ async fn serve_tcpmux(
             channel
         };
         let mut channel = channel;
+        // CONNECT 后已读入的用户数据(如 yamux 首帧)前转进通道
+        if !tail.is_empty() && channel.write_all(&tail).await.is_err() {
+            return Ok(());
+        }
         let _ = tokio::io::copy_bidirectional(&mut sock, &mut channel).await;
         return Ok(());
     }
-    // 标准模式:服务端终结 yamux,每个流一次转发
+    // 标准模式:服务端在用户连接上终结 yamux,每个入站流 = 一次独立数据通道转发
     sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
         .await?;
-    if !send_start_forward(&mut channel, &rt, &spec, &peer.to_string()).await {
-        return Ok(());
-    }
-    let channel = if spec.transport.use_compression {
-        rh_transport::compress_stream(channel).await
-    } else {
-        channel
-    };
-    // 客户端侧运行 yamux 服务端:每个入站流 = 一次用户连接
-    let mux = rh_transport::mux::tcpmux_server_mux(channel);
+    let mux =
+        rh_transport::mux::tcpmux_server_mux(rh_transport::PrependedIo::wrap(Box::new(sock), tail));
     loop {
         let stream = match mux.accept().await {
             Ok(s) => s,

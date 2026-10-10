@@ -9,6 +9,7 @@ use rh_protocol::message::{
 use rh_protocol::{ProxyKind, ProxySpec};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// 会话建立:重置确认、状态推进、预热。
@@ -78,10 +79,15 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
     if !r.ok {
         if let Some(err) = &r.error {
             warn!(reason = %err.reason, "apply error from client");
-            // 定位规则
+            // 定位规则(属主校验:客户端只能上报自己名下规则的状态)
             if let Some(pid) = err.service_id {
                 if let Some(rt) = state.proxies.get(pid) {
-                    rt.set_state(ProxyState::ApplyError, &err.reason).await;
+                    if rt.client_id == sess.client_id {
+                        rt.set_state(ProxyState::ApplyError, &err.reason).await;
+                    } else {
+                        warn!(proxy = pid, client = %sess.client_id, owner = %rt.client_id,
+                            "apply error reported for foreign proxy; ignored");
+                    }
                 }
             }
         }
@@ -157,10 +163,16 @@ pub async fn warm_proxy(
 }
 
 /// 健康上报。
-pub async fn on_health_report(state: &Arc<AppState>, _sess: &Arc<Session>, h: HealthReport) {
+pub async fn on_health_report(state: &Arc<AppState>, sess: &Arc<Session>, h: HealthReport) {
     let Some(rt) = state.proxies.get(h.proxy_id) else {
         return;
     };
+    // 属主校验:客户端只能影响自己名下规则的健康状态
+    if rt.client_id != sess.client_id {
+        warn!(proxy = h.proxy_id, client = %sess.client_id, owner = %rt.client_id,
+            "health report for foreign proxy; ignored");
+        return;
+    }
     rt.healthy.store(h.healthy, Ordering::Relaxed);
     let (st, _) = rt.snapshot_state().await;
     let new_state = if h.healthy {
@@ -190,9 +202,9 @@ pub async fn on_health_report(state: &Arc<AppState>, _sess: &Arc<Session>, h: He
                 if h.healthy { "info" } else { "warn" },
                 "service",
                 &format!(
-                    "proxy {} health {}",
+                    "规则 {} 健康检查{}",
                     h.proxy_id,
-                    if h.healthy { "ok" } else { "failed" }
+                    if h.healthy { "正常" } else { "失败" }
                 ),
             )
             .await;
@@ -251,28 +263,17 @@ pub async fn spawn_runtime(
         tokio::spawn(bind_error_retry(st, rt2));
     }
     match spec.kind {
-        ProxyKind::Tcp => {
-            match crate::data::bind_tcp_listener(state, spec, bind_ip).await {
-                Ok(l) => {
-                    // serve loop 独占 listener;运行时仅记录"已绑定"
-                    rt.bound.store(true, Ordering::Relaxed);
-                    *rt.tcp_listener.lock().await = marker_listener();
-                    let rt2 = rt.clone();
-                    let st2 = state.clone();
-                    tokio::spawn(async move {
-                        crate::data::tcp_serve_loop(st2, rt2, l).await;
-                    });
-                }
-                Err(e) => {
-                    bind_error = true;
-                    rt.set_state(ProxyState::BindError, &format!("bind: {e}"))
-                        .await;
-                    let st = state.clone();
-                    let rt2 = rt.clone();
-                    tokio::spawn(bind_error_retry(st, rt2));
-                }
+        ProxyKind::Tcp => match tcp_bind_and_serve(state, &rt, spec, bind_ip).await {
+            Ok(()) => {}
+            Err(e) => {
+                bind_error = true;
+                rt.set_state(ProxyState::BindError, &format!("bind: {e}"))
+                    .await;
+                let st = state.clone();
+                let rt2 = rt.clone();
+                tokio::spawn(bind_error_retry(st, rt2));
             }
-        }
+        },
         ProxyKind::Udp => match crate::data::bind_udp_socket(state, spec, bind_ip).await {
             Ok(sock) => {
                 rt.bound.store(true, Ordering::Relaxed);
@@ -292,6 +293,13 @@ pub async fn spawn_runtime(
         },
         // http/https/tcpmux/stcp/sudp/xtcp:无独享端口,绑定条件恒真
         _ => rt.bound.store(true, Ordering::Relaxed),
+    }
+    // 组成员登记(tcp/vhost;同组成员共享监听与轮询选路)
+    if let Some(key) = crate::state::ProxyManager::group_key(spec) {
+        let g = state.proxies.group_entry(&key);
+        let mut m = g.members.write().await;
+        m.retain(|id| *id != spec.id);
+        m.push(spec.id);
     }
     // 初始池
     if matches!(
@@ -323,6 +331,56 @@ pub async fn spawn_runtime(
     rt
 }
 
+/// TCP 绑定 + serve loop 启动(组感知)。
+/// 组成员:共享监听已在本组绑定时直接标记 bound;否则由本成员绑定并启动
+/// 组共享 serve loop(取消权归组,单个成员退出不影响监听)。
+async fn tcp_bind_and_serve(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    spec: &ProxySpec,
+    bind_ip: std::net::IpAddr,
+) -> std::io::Result<()> {
+    let key = crate::state::ProxyManager::group_key(spec);
+    if let Some(k) = key {
+        let g = state.proxies.group_entry(&k);
+        if g.listener_bound
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            // 共享监听已在位(同组其他成员持有)
+            rt.bound.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        // 本成员负责绑定:换新取消令牌(组曾清空时旧令牌已取消)
+        let token = {
+            let fresh = CancellationToken::new();
+            let mut c = g.serve_cancel.write().await;
+            *c = fresh.clone();
+            fresh
+        };
+        let l = crate::data::bind_tcp_listener(state, spec, bind_ip).await?;
+        rt.bound.store(true, Ordering::Relaxed);
+        let st2 = state.clone();
+        let rt2 = rt.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = crate::data::tcp_serve_loop(st2, rt2, l) => {}
+                _ = token.cancelled() => {}
+            }
+        });
+        return Ok(());
+    }
+    // 独享端口
+    let l = crate::data::bind_tcp_listener(state, spec, bind_ip).await?;
+    rt.bound.store(true, Ordering::Relaxed);
+    *rt.tcp_listener.lock().await = marker_listener();
+    let rt2 = rt.clone();
+    let st2 = state.clone();
+    tokio::spawn(async move {
+        crate::data::tcp_serve_loop(st2, rt2, l).await;
+    });
+    Ok(())
+}
+
 /// bind_error 周期重试(60s);port_auto 立即重分配由调用方处理。
 async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
     loop {
@@ -336,19 +394,11 @@ async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
         }
         let bind_ip: std::net::IpAddr = rh_core::net::parse_bind_ip(&spec.bind_ip)
             .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
-        // 拉起 serve loop(首次绑定失败时从未启动)
+        // 拉起 serve loop(首次绑定失败时从未启动);组感知
         let bound = if spec.kind == ProxyKind::Tcp {
-            match crate::data::bind_tcp_listener(&state, &spec, bind_ip).await {
-                Ok(l) => {
-                    let st2 = state.clone();
-                    let rt2 = rt.clone();
-                    tokio::spawn(async move {
-                        crate::data::tcp_serve_loop(st2, rt2, l).await;
-                    });
-                    true
-                }
-                Err(_) => false,
-            }
+            tcp_bind_and_serve(&state, &rt, &spec, bind_ip)
+                .await
+                .is_ok()
         } else {
             match crate::data::bind_udp_socket(&state, &spec, bind_ip).await {
                 Ok(sock) => {
@@ -391,7 +441,7 @@ async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
             .emit(
                 "info",
                 "service",
-                &format!("proxy {} bind recovered", spec.name),
+                &format!("规则 {} 端口绑定已恢复", spec.name),
             )
             .await;
         return;
@@ -401,6 +451,11 @@ async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
 /// 移除运行态(取消域级联)。
 pub async fn teardown_runtime(state: &Arc<AppState>, proxy_id: u64) {
     if let Some((_, rt)) = state.proxies.runtimes.remove(&proxy_id) {
+        // 组成员退出(组清空时取消共享监听)
+        let key = crate::state::ProxyManager::group_key(&*rt.spec.read().await);
+        if let Some(k) = key {
+            state.proxies.leave_group(&k, proxy_id).await;
+        }
         rt.rule_cancel.cancel();
         crate::data::close_proxy_channels(&rt).await;
         // 失效该规则在途 CREATE 请求:迟到回显不得进入新运行时(§4.5 代次隔离)

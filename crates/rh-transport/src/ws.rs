@@ -44,6 +44,26 @@ pub async fn upgrade_server(mut io: BoxedIo, expect_path: &str) -> io::Result<Bo
             .await;
         return Err(io::Error::other("ws: unexpected path"));
     }
+    // 校验升级头部(RFC 6455 §4.2.1)
+    let header = |name: &str| {
+        req.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_ascii_lowercase())
+        })
+    };
+    let upgrade_ws =
+        header("upgrade").is_some_and(|v| v.split(',').any(|t| t.trim() == "websocket"));
+    let connection_upgrade =
+        header("connection").is_some_and(|v| v.split(',').any(|t| t.trim() == "upgrade"));
+    let version_ok = header("sec-websocket-version").as_deref() == Some("13");
+    if !(upgrade_ws && connection_upgrade && version_ok) {
+        let _ = io
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return Err(io::Error::other("ws: not a websocket upgrade request"));
+    }
     // 生成 Sec-WebSocket-Accept
     let key = req
         .lines()
@@ -121,10 +141,11 @@ pub async fn client_handshake(mut io: BoxedIo, host: &str, path: &str) -> io::Re
     Ok(Box::new(WsIo::new(ws)))
 }
 
+// RFC 6455:Sec-WebSocket-Accept = base64(SHA-1(key + GUID))
 fn ws_accept(key: &str) -> String {
-    use sha2::Digest;
+    use sha1::Digest;
     const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    let mut h = sha2::Sha256::new();
+    let mut h = sha1::Sha1::new();
     h.update(key.as_bytes());
     h.update(GUID.as_bytes());
     base64_encode(&h.finalize())

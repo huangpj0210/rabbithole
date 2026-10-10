@@ -132,6 +132,8 @@ async fn relay_tcp(
     user_conn_id: u64,
     src_addr: String,
 ) {
+    // 压缩必须两端一致(服务端裸 splice):任一侧未开启则整体不压缩
+    let compress = vspec.use_compression && pspec.transport.use_compression;
     let Some((_visitor_rid, _proxy_rid, vr, pr)) = state
         .issue_relay_pair(
             sess,
@@ -143,9 +145,13 @@ async fn relay_tcp(
             RequestPurpose::VisitorRelay {
                 visitor_id: vspec.id,
                 user_conn_id,
+                compress,
             },
             ChannelEntity::Proxy { proxy_id: pspec.id },
-            RequestPurpose::RelayProxy { proxy_id: pspec.id },
+            RequestPurpose::RelayProxy {
+                proxy_id: pspec.id,
+                compress,
+            },
         )
         .await
     else {
@@ -153,17 +159,39 @@ async fn relay_tcp(
     };
     let st = state.clone();
     let pspec2 = pspec.clone();
+    let vid_sess = sess.session_id.clone();
+    let pid_sess = target_sess.session_id.clone();
     tokio::spawn(async move {
-        let visitor_stream = match vr.await {
-            Ok(s) => s,
-            Err(_) => return,
+        // 通道签发后 ≤15s 内必须两侧都到达;超时清理配对槽位,防任务与表项泄漏
+        let visitor_stream = match tokio::time::timeout(Duration::from_secs(15), vr).await {
+            Ok(Ok(s)) => s,
+            _ => {
+                cleanup_pair(&st, &vid_sess, _visitor_rid, &pid_sess, _proxy_rid).await;
+                return;
+            }
         };
-        let proxy_stream = match pr.await {
-            Ok(s) => s,
-            Err(_) => return,
+        let proxy_stream = match tokio::time::timeout(Duration::from_secs(15), pr).await {
+            Ok(Ok(s)) => s,
+            _ => {
+                cleanup_pair(&st, &vid_sess, _visitor_rid, &pid_sess, _proxy_rid).await;
+                return;
+            }
         };
         splice_relay(st, pspec2, src_addr, proxy_stream, visitor_stream).await;
     });
+}
+
+/// 超时/失败路径:移除两条配对表登记(deliver_pair 只处理"抵达"路径)。
+async fn cleanup_pair(
+    state: &Arc<AppState>,
+    vid_sess: &str,
+    visitor_rid: u64,
+    pid_sess: &str,
+    proxy_rid: u64,
+) {
+    let mut pairs = state.relay_pairs.lock().await;
+    pairs.remove(&(vid_sess.to_string(), visitor_rid));
+    pairs.remove(&(pid_sess.to_string(), proxy_rid));
 }
 
 /// SUDP 帧中继(两侧常驻通道)。
@@ -174,10 +202,17 @@ async fn relay_udp(
     pspec: &ProxySpec,
     target_sess: &Arc<Session>,
 ) {
-    // 已有常驻中继则复用(每 visitor 一条)
-    if state.udp_relays.lock().await.contains(&vspec.id) {
-        return;
+    // 已有常驻中继则复用(每 visitor 一条)。
+    // 先占位后签发:登记与检查之间不得隔 await,否则并发首包可建出第二条
+    {
+        let mut relays = state.udp_relays.lock().await;
+        if relays.contains(&vspec.id) {
+            return;
+        }
+        relays.insert(vspec.id);
     }
+    // 压缩两端一致(同 relay_tcp)
+    let compress = vspec.use_compression && pspec.transport.use_compression;
     let Some((_visitor_rid, _proxy_rid, vr, pr)) = state
         .issue_relay_pair(
             sess,
@@ -189,15 +224,19 @@ async fn relay_udp(
             RequestPurpose::VisitorRelay {
                 visitor_id: vspec.id,
                 user_conn_id: 0,
+                compress,
             },
             ChannelEntity::Proxy { proxy_id: pspec.id },
-            RequestPurpose::RelayProxy { proxy_id: pspec.id },
+            RequestPurpose::RelayProxy {
+                proxy_id: pspec.id,
+                compress,
+            },
         )
         .await
     else {
+        state.udp_relays.lock().await.remove(&vspec.id);
         return;
     };
-    state.udp_relays.lock().await.insert(vspec.id);
     let st = state.clone();
     let vid = vspec.id;
     tokio::spawn(async move {
@@ -225,21 +264,17 @@ async fn relay_udp(
 
 /// visitor 侧通道抵达(route_data_stream 调用):
 /// TCP 写 START_VISITOR_RELAY(最后一帧)→ 交付配对;UDP(user_conn_id=0)直接交付。
+/// compress 来自签发时的两端一致性决策(purpose 携带,免再查库)。
 pub async fn on_visitor_channel(
     state: &Arc<AppState>,
     session_id: &str,
     request_id: u64,
     visitor_id: u64,
     user_conn_id: u64,
+    compress: bool,
     mut stream: BoxedIo,
 ) {
     if user_conn_id != 0 {
-        let visitors = state.db.list_visitors(None).await.unwrap_or_default();
-        let compress = visitors
-            .into_iter()
-            .find(|(id, ..)| *id as u64 == visitor_id)
-            .map(|(_, _, _, s)| s.use_compression)
-            .unwrap_or(false);
         let mut flags = 0u8;
         if compress {
             flags |= forward_flags::COMPRESSED;
@@ -267,6 +302,7 @@ pub async fn on_relay_proxy_channel(
     request_id: u64,
     proxy_id: u64,
     src_hint: &str,
+    compress: bool,
     mut stream: BoxedIo,
 ) {
     let Some(rt) = state.proxies.get(proxy_id) else {
@@ -280,7 +316,7 @@ pub async fn on_relay_proxy_channel(
         return;
     }
     let mut flags = 0u8;
-    if pspec.transport.use_compression {
+    if compress {
         flags |= forward_flags::COMPRESSED;
     }
     let fwd = StartForward {

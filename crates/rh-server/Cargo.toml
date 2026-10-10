@@ -37,6 +37,7 @@ dashmap = { workspace = true }
 socket2 = { workspace = true }
 argon2 = { workspace = true }
 jsonwebtoken = "9"
+rust-embed = "8"
 governor = { workspace = true }
 prometheus = { workspace = true }
 hyper = { workspace = true }

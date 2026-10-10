@@ -25,10 +25,14 @@ pub enum RequestPurpose {
     TcpPool { proxy_id: u64 },
     /// UDP 通道(该规则当前唯一通道)。
     UdpChannel { proxy_id: u64 },
-    /// visitor 侧中继通道。
-    VisitorRelay { visitor_id: u64, user_conn_id: u64 },
+    /// visitor 侧中继通道。compress 为签发时两端一致的中继压缩决策。
+    VisitorRelay {
+        visitor_id: u64,
+        user_conn_id: u64,
+        compress: bool,
+    },
     /// stcp/sudp 中继的代理侧通道(到达即指派/直通并交付配对)。
-    RelayProxy { proxy_id: u64 },
+    RelayProxy { proxy_id: u64, compress: bool },
 }
 
 pub struct Session {
@@ -95,7 +99,7 @@ impl Session {
             !matches!(
                 p.purpose,
                 crate::session::RequestPurpose::UdpChannel { proxy_id: id }
-                    | crate::session::RequestPurpose::RelayProxy { proxy_id: id }
+                    | crate::session::RequestPurpose::RelayProxy { proxy_id: id, .. }
                     | crate::session::RequestPurpose::TcpPool { proxy_id: id }
                 if id == proxy_id
             )
@@ -173,13 +177,10 @@ impl SessionRegistry {
     }
 
     /// 移除会话,仅当当前注册的就是该会话(指针比对,防旧清理误删新会话)。
+    /// remove_if 原子完成比对+删除,避免比对后、删除前新会话插入被误删。
     pub fn remove_if_current(&self, client_id: &str, sess: &Arc<Session>) {
-        if let Some(e) = self.map.get_mut(client_id) {
-            if Arc::ptr_eq(&e.value().0, sess) {
-                drop(e);
-                self.map.remove(client_id);
-            }
-        }
+        self.map
+            .remove_if(client_id, |_k, (cur, _)| Arc::ptr_eq(cur, sess));
     }
 
     pub fn online_clients(&self) -> Vec<String> {

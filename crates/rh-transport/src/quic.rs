@@ -13,43 +13,88 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 空闲超时须显著大于 30s 协议心跳(quinn 默认 30s 恰等于心跳间隔,
+/// 单向抖动即误杀);客户端同时以 keepalive 主动保活。
+const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const QUIC_KEEPALIVE: Duration = Duration::from_secs(15);
 
-pub fn listen(cfg: &ServerTransportConfig) -> io::Result<quinn::Endpoint> {
+fn transport_config(keepalive: bool) -> quinn::TransportConfig {
+    let mut tc = quinn::TransportConfig::default();
+    tc.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
+        QUIC_IDLE_TIMEOUT.as_millis() as u32,
+    ))));
+    if keepalive {
+        tc.keep_alive_interval(Some(QUIC_KEEPALIVE));
+    }
+    tc
+}
+
+/// 服务端 QUIC 监听器:接受与握手解耦(慢握手不阻塞后续接入)。
+pub struct QuicListener {
+    pub(crate) local: std::net::SocketAddr,
+    ready: tokio::sync::mpsc::Receiver<Incoming>,
+}
+
+pub fn listen(cfg: &ServerTransportConfig) -> io::Result<QuicListener> {
     let tls = crate::tls::server_config_with_alpn(&cfg.tls, &cfg.alpn)?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .map_err(|e| other_err(format!("quic server config: {e}")))?,
     ));
+    server_config.transport_config(Arc::new(transport_config(false)));
     let endpoint = quinn::Endpoint::server(server_config, cfg.bind_addr)
         .map_err(|e| other_err(format!("quic bind: {e}")))?;
-    Ok(endpoint)
+    let local = endpoint
+        .local_addr()
+        .map_err(|e| other_err(format!("quic local addr: {e}")))?;
+    let (tx, ready) = tokio::sync::mpsc::channel::<Incoming>(64);
+    tokio::spawn(async move {
+        loop {
+            let incoming = match endpoint.accept().await {
+                Some(i) => i,
+                None => return, // endpoint 关闭
+            };
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+                    Ok(Ok(conn)) => {
+                        let remote = conn.remote_address();
+                        let inc = Incoming {
+                            mux: Arc::new(Multiplexer {
+                                inner: MultiplexerInner::Quic(QuicConnection::new(conn)),
+                            }),
+                            remote,
+                            protocol: crate::Protocol::Quic,
+                        };
+                        let _ = tx2.send(inc).await;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(error = %e, "quic handshake failed");
+                    }
+                    Err(_) => tracing::debug!("quic handshake timeout"),
+                }
+            });
+        }
+    });
+    // 持有 endpoint 供运行期关闭语义:pump 任务已独占
+    Ok(QuicListener { local, ready })
 }
 
-pub async fn accept(endpoint: &quinn::Endpoint) -> io::Result<Incoming> {
-    let incoming = endpoint
-        .accept()
+pub async fn accept(listener: &mut QuicListener) -> io::Result<Incoming> {
+    listener
+        .ready
+        .recv()
         .await
-        .ok_or_else(|| other_err("quic listener closed"))?;
-    let conn = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming)
-        .await
-        .map_err(|_| other_err("quic handshake timeout"))?
-        .map_err(|e| other_err(format!("quic handshake: {e}")))?;
-    let remote = conn.remote_address();
-    Ok(Incoming {
-        mux: Arc::new(Multiplexer {
-            inner: MultiplexerInner::Quic(QuicConnection::new(conn)),
-        }),
-        remote,
-        protocol: crate::Protocol::Quic,
-    })
+        .ok_or_else(|| other_err("quic listener closed"))
 }
 
 pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>> {
     let (tls, verify) = crate::tls::client_config_with_alpn(&cfg.tls, &cfg.alpn)?;
-    let qcfg = quinn::ClientConfig::new(Arc::new(
+    let mut qcfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|e| other_err(format!("quic client config: {e}")))?,
     ));
+    qcfg.transport_config(Arc::new(transport_config(true)));
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .map_err(|e| other_err(format!("quic client bind: {e}")))?;
     endpoint.set_default_client_config(qcfg);

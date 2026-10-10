@@ -97,12 +97,16 @@ pub async fn on_connect(sess: Arc<ClientSession>, m: NatHoleConnect, shutdown: C
             None => None,
         }
     };
-    let Some(sock) = sock else {
-        // 无准备 socket(超时清理/竞态):dial 侧直接回退
-        if m.relay_mode || m.role == "fallback" {
+    let sock = match sock {
+        Some(s) => s,
+        None => {
+            // 无准备 socket(超时清理/竞态):需要走中继的路径直接重发 USER_CONNECT,
+            // 否则等待中的用户连接只能在 TTL 超时后被静默丢弃
+            if m.role == "fallback" || (m.role == "dial" && m.fallback_relay) {
+                reissue_user_connect(&sess, &m).await;
+            }
             return;
         }
-        return;
     };
     let punch_secs = m.punch_seconds.max(3);
     match m.role.as_str() {

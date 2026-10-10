@@ -248,6 +248,10 @@ async fn serve_static_file(
         let mut lines = head.split("\r\n");
         let req_line = lines.next().unwrap_or("");
         let mut path = req_line.split(' ').nth(1).unwrap_or("/").to_string();
+        // 剥离查询串与 fragment(缓存戳 URL 如 /app.js?v=1 不应 404)
+        if let Some(p) = path.split_once(['?', '#']) {
+            path = p.0.to_string();
+        }
         let mut headers = Vec::new();
         for l in lines {
             if let Some((k, v)) = l.split_once(':') {
@@ -286,20 +290,30 @@ async fn serve_static_file(
         if path.is_empty() {
             path = "/".into();
         }
-        // 安全路径解析
+        // 安全路径解析:以 root 为参考点做深度计数,`..` 不允许越出 root;
+        // 再以 canonicalize 校验最终落点(同时防符号链接逃逸)
+        let root_canon = tokio::fs::canonicalize(&root)
+            .await
+            .unwrap_or_else(|_| root.clone());
         let rel = path.trim_start_matches('/');
         let decoded = percent_decode(rel);
         let mut full = root.clone();
+        let mut depth = 0usize;
         for seg in decoded.split('/') {
             match seg {
                 "" | "." => {}
                 ".." => {
-                    if !full.pop() {
+                    if depth == 0 {
                         let _ = write_simple(&mut io, 403, "Forbidden", b"").await;
                         return;
                     }
+                    depth -= 1;
+                    full.pop();
                 }
-                s => full.push(s),
+                s => {
+                    full.push(s);
+                    depth += 1;
+                }
             }
         }
         if full.is_dir() {
@@ -314,16 +328,29 @@ async fn serve_static_file(
                 continue;
             }
         }
-        match tokio::fs::read(&full).await {
-            Ok(data) => {
+        match tokio::fs::canonicalize(&full).await {
+            Ok(c) if c == root_canon || c.starts_with(&root_canon) => full = c,
+            _ => {
+                let _ = write_simple(&mut io, 404, "Not Found", b"").await;
+                if !keep {
+                    return;
+                }
+                continue;
+            }
+        }
+        match tokio::fs::File::open(&full).await {
+            Ok(mut f) => {
+                let len = match f.metadata().await {
+                    Ok(m) if m.is_file() => m.len() as usize,
+                    _ => 0,
+                };
                 let mime = mime_of(full.extension().and_then(|e| e.to_str()));
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
-                    data.len(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nConnection: {}\r\n\r\n",
                     if keep { "keep-alive" } else { "close" }
                 );
                 if io.write_all(resp.as_bytes()).await.is_err()
-                    || io.write_all(&data).await.is_err()
+                    || tokio::io::copy(&mut f, &mut io).await.is_err()
                 {
                     return;
                 }

@@ -68,20 +68,31 @@ pub fn auto_cert(opts: &TlsServerOptions) -> io::Result<(Vec<u8>, Vec<u8>)> {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&crt, &c)?;
-        std::fs::write(&key, &k)?;
-        set_key_perm(&key)?;
+        // 私钥以 0600 直接创建(先写后 chmod 存在世界可读窗口)
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&key)?;
+            f.write_all(&k)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&key, &k)?;
+            set_key_perm(&key)?;
+        }
         return Ok((c, k));
     }
     generate_self_signed()
 }
 
-fn set_key_perm(path: &std::path::Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    let _ = path;
+/// 非 unix 平台的私钥权限收紧(unix 上直接以 0600 创建,不走此函数)。
+#[cfg(not(unix))]
+fn set_key_perm(_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 

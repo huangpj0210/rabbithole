@@ -102,15 +102,17 @@ pub async fn start(
 }
 
 /// 双端候选齐备(或超时)→ 下发打洞指令或回退。
+/// 读取即原子移除:齐备触发的 decide 与超时守护的 decide 只有一个能拿到事务,
+/// 避免双端各收到两条重复的打洞指令。
 async fn decide(state: &Arc<AppState>, txid: &str) {
     let (vr, pr, v_client, p_client, uc) = {
-        let txs = state.nathole.txs.lock().await;
-        let Some(ns) = txs.get(txid) else { return };
+        let mut txs = state.nathole.txs.lock().await;
+        let Some(ns) = txs.remove(txid) else { return };
         (
-            ns.visitor_report.clone(),
-            ns.proxy_report.clone(),
-            ns.visitor_client.clone(),
-            ns.proxy_client.clone(),
+            ns.visitor_report,
+            ns.proxy_report,
+            ns.visitor_client,
+            ns.proxy_client,
             ns.user_conn_id,
         )
     };
@@ -145,7 +147,6 @@ async fn decide(state: &Arc<AppState>, txid: &str) {
             let _ = v_sess.send(connect_v).await;
             let _ = p_sess.send(connect_p).await;
             info!(tx = txid, "nathole connect instructions sent");
-            state.nathole.txs.lock().await.remove(txid);
         }
         _ => {
             // 超时未齐:双端回退通知(visitor 侧转中继)
@@ -159,7 +160,6 @@ async fn decide(state: &Arc<AppState>, txid: &str) {
                 relay_mode: true,
             });
             let _ = v_sess.send(fb).await;
-            state.nathole.txs.lock().await.remove(txid);
         }
     }
 }

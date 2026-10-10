@@ -131,6 +131,8 @@ bind_port = 19700
 authorized_keys_file = "$WORK/authorized_keys"
 [ports]
 auto_range = "20000-21000"
+[metrics]
+enable_prometheus = true
 [log]
 level = "info"
 EOF
@@ -667,8 +669,10 @@ echo "$stats" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; sys
 check $? "统计总览"
 events=$(api "http://127.0.0.1:$API_PORT/api/events?limit=5" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"])>0)')
 [ "$events" = "True" ]; check $? "事件查询"
-metrics=$(curl -s -m 5 "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")
-[ "$metrics" -gt 3 ]; check $? "Prometheus 指标暴露"
+metrics=$(curl -s -m 5 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")
+[ "$metrics" -gt 3 ]; check $? "Prometheus 指标暴露(认证)"
+noauth_metrics=$(curl -s -m 5 "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")
+[ "$noauth_metrics" -eq 0 ]; check $? "metrics 未认证拒绝"
 
 # ---------- 首次启动引导 + 修改密码(独立短环境) ----------
 BOOT="$WORK/boot"; mkdir -p "$BOOT"

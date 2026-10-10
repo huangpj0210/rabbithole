@@ -112,12 +112,30 @@ fn load_or_gen_host_key(dir: &PathBuf) -> anyhow::Result<PrivateKey> {
     let key = PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
         .map_err(|e| anyhow::anyhow!("ssh host key gen: {e}"))?;
     let pem = key.to_openssh(LineEnding::LF)?;
-    std::fs::write(&path, pem.as_bytes())?;
+    // 私钥文件直接以 0600 创建(先写后 chmod 存在世界可读窗口)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        use std::io::Write as _;
+        f.write_all(pem.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, pem.as_bytes())?;
+    }
     tracing::info!(path = %path.display(), "ssh gateway: host key generated");
     Ok(key)
 }
 
 type ForwardMap = Arc<tokio::sync::Mutex<HashMap<u16, CancellationToken>>>;
+
+/// 每条 SSH 连接可注册的转发监听上限。
+const MAX_FORWARDS_PER_SESSION: usize = 16;
 
 struct SshSession {
     state: Arc<AppState>,
@@ -152,11 +170,17 @@ impl Handler for SshSession {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        // PublicKey 的派生相等含注释字段; authorized_keys 行注释与线上无关,只比密钥本体
-        let listed = self
-            .authorized_keys
-            .iter()
-            .any(|k| k.key_data() == public_key.key_data());
+        // PublicKey 的派生相等含注释字段; authorized_keys 行注释与线上无关,只比密钥本体。
+        // 绑定约定:行尾注释恰为客户端 ID(UUID 形态)时,该密钥只能登录该客户端;
+        // 其余注释(如 ssh-keygen 默认的 user@host)或无注释视为全局密钥。
+        let listed = self.authorized_keys.iter().any(|k| {
+            if k.key_data() != public_key.key_data() {
+                return false;
+            }
+            let cmt: &str = k.comment().as_ref();
+            let cmt = cmt.trim();
+            cmt.is_empty() || cmt == user || uuid::Uuid::parse_str(cmt).is_err()
+        });
         let client_ok = match self.state.db.get_client(user).await {
             Ok(Some(c)) => c.enabled,
             _ => false,
@@ -209,13 +233,31 @@ impl Handler for SshSession {
         if self.client_id.is_empty() {
             return Ok(false);
         }
-        let bind_ip: std::net::IpAddr = if address.is_empty() {
-            "127.0.0.1".parse().unwrap()
-        } else {
-            address
-                .parse()
-                .unwrap_or_else(|_| "127.0.0.1".parse().unwrap())
-        };
+        // 每连接转发数量上限(防单连接注册大量监听)
+        {
+            let fw = self.forwards.lock().await;
+            if fw.len() >= MAX_FORWARDS_PER_SESSION {
+                tracing::warn!(client = %self.client_id, "ssh gateway: forward limit reached");
+                return Ok(false);
+            }
+        }
+        // 仅允许环回/显式配置地址:客户端不得在服务器上任意网卡开洞
+        let bind_ip: std::net::IpAddr =
+            if address.is_empty() || address.eq_ignore_ascii_case("localhost") {
+                "127.0.0.1".parse().unwrap()
+            } else {
+                match address.parse::<std::net::IpAddr>() {
+                    Ok(ip) if ip.is_loopback() => ip,
+                    _ => {
+                        tracing::warn!(
+                            client = %self.client_id,
+                            addr = address,
+                            "ssh gateway: non-loopback bind rejected"
+                        );
+                        return Ok(false);
+                    }
+                }
+            };
         let requested = *port as u16;
         let bind_port = if requested == 0 {
             match self.state.proxies.allocate_port("tcp", bind_ip).await {
@@ -223,6 +265,29 @@ impl Handler for SshSession {
                 None => return Ok(false),
             }
         } else {
+            // 客户端指定端口必须过白名单与占用检查(与常规规则同策略,
+            // 不得绕过 allow_ports 在服务器上抢占任意端口)
+            if !self.state.proxies.port_allowed(requested) {
+                tracing::warn!(
+                    client = %self.client_id,
+                    port = requested,
+                    "ssh gateway: port not in allow_ports"
+                );
+                return Ok(false);
+            }
+            if self
+                .state
+                .proxies
+                .port_in_use("tcp", bind_ip, requested, None, None)
+                .await
+            {
+                tracing::warn!(
+                    client = %self.client_id,
+                    port = requested,
+                    "ssh gateway: port in use"
+                );
+                return Ok(false);
+            }
             requested
         };
         let l = match tokio::net::TcpListener::bind((bind_ip, bind_port)).await {
@@ -343,6 +408,8 @@ async fn pump(sock: tokio::net::TcpStream, mut channel: russh::Channel<russh::se
             }
         }
     }
+    // 对端结束发送:向用户侧传播半关闭,否则 t1 会一直等用户主动断开
+    let _ = sw.shutdown().await;
     let _ = t1.await;
     let _ = channel.close().await;
 }

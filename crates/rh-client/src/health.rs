@@ -81,7 +81,7 @@ async fn probe(spec: &ProxySpec, hc: &HealthCheckSpec) -> bool {
     let timeout = std::time::Duration::from_secs(hc.timeout_seconds.max(1));
     match hc.kind {
         HealthCheckKind::Tcp => {
-            let Ok(addr) = crate::forward::resolve(&host, port) else {
+            let Ok(addr) = crate::forward::resolve(&host, port).await else {
                 return false;
             };
             matches!(
@@ -90,7 +90,7 @@ async fn probe(spec: &ProxySpec, hc: &HealthCheckSpec) -> bool {
             )
         }
         HealthCheckKind::Http => {
-            let Ok(addr) = crate::forward::resolve(&host, port) else {
+            let Ok(addr) = crate::forward::resolve(&host, port).await else {
                 return false;
             };
             let Ok(s) = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await

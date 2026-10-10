@@ -59,7 +59,7 @@ pub async fn recover_all(state: &Arc<AppState>) {
                         .emit(
                             "warn",
                             "service",
-                            &format!("proxy {} port reallocated to {}", spec.name, p),
+                            &format!("规则 {} 端口重新分配为 {}", spec.name, p),
                         )
                         .await;
                 }

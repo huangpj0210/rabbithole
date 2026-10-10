@@ -26,9 +26,20 @@ pub async fn stun_binding(
     sock.send_to(&req, server).await?;
 
     let mut buf = vec![0u8; 1024];
-    let deadline = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf)).await;
-    let (n, from) = deadline.map_err(|_| std::io::Error::other("stun timeout"))??;
-    let _ = from;
+    // 只接受来自 STUN 服务器的应答:共享 socket 场景(打洞)下,
+    // 任意先到的 UDP 包不得被当作应答解析(候选投毒)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let n = loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::other("stun timeout"));
+        }
+        match tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) if from == server => break n,
+            Ok(Ok(_)) => continue, // 非服务器来源:丢弃继续等
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(std::io::Error::other("stun timeout")),
+        }
+    };
     parse_binding_response(&buf[..n], &tx_id)
 }
 

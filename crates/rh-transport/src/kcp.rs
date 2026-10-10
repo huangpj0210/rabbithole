@@ -3,7 +3,7 @@
 //! - 服务端:单 UDP 端口,kcp 头部的 conv 字段做会话分离;未知 conv 的
 //!   合法 kcp 报文触发建会话并交给 accept 队列。
 //! - 客户端:随机 conv,直接开始发送(首包即隐式握手)。
-//! - 会话驱动:10ms tick 调用 kcp.update;yamux 层 keepalive 维持活跃,
+//! - 会话驱动:10ms tick 调用 kcp.update;协议层心跳(PING)维持活跃,
 //!   SESSION_IDLE_TIMEOUT 内无任何入站报文则回收。
 
 use crate::mux::{wrap_stream_as_client, wrap_stream_as_server};
@@ -59,14 +59,25 @@ impl Guarded {
 }
 
 /// 会话共享状态:notify 独立于锁,避免借用临时 guard。
+/// handles 记录在世的 KcpIo 用户句柄数,归零即令会话任务退出
+/// (避免服务端丢弃连接后会话空转至 90s 空闲超时)。
 struct Shared {
     guarded: Mutex<Guarded>,
     notify: Notify,
+    handles: std::sync::atomic::AtomicUsize,
 }
 
 /// KCP 会话的字节流句柄。
 pub struct KcpIo {
     shared: Arc<Shared>,
+}
+
+impl Drop for KcpIo {
+    fn drop(&mut self) {
+        if self.shared.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.notify.notify_one();
+        }
+    }
 }
 
 impl AsyncRead for KcpIo {
@@ -174,6 +185,10 @@ async fn run_session<O: std::io::Write>(
             }
             _ = shared.notify.notified() => {}
         }
+        // 用户句柄已全部释放:会话无消费者,尽早退出
+        if shared.handles.load(Ordering::Acquire) == 0 {
+            break;
+        }
         // 用户写队列 → kcp
         {
             let mut s = shared.guarded.lock().unwrap();
@@ -219,7 +234,7 @@ async fn run_session<O: std::io::Write>(
 
 pub struct KcpListener {
     local: SocketAddr,
-    accept_rx: mpsc::Receiver<Arc<Multiplexer>>,
+    accept_rx: mpsc::Receiver<(Arc<Multiplexer>, SocketAddr)>,
 }
 
 impl KcpListener {
@@ -228,14 +243,14 @@ impl KcpListener {
     }
 
     pub async fn accept(&mut self) -> std::io::Result<Incoming> {
-        let mux = self
+        let (mux, remote) = self
             .accept_rx
             .recv()
             .await
             .ok_or_else(|| other_err("kcp listener closed"))?;
         Ok(Incoming {
             mux,
-            remote: self.local,
+            remote,
             protocol: Protocol::Kcp,
         })
     }
@@ -244,14 +259,14 @@ impl KcpListener {
 pub async fn listen(cfg: &ServerTransportConfig) -> std::io::Result<KcpListener> {
     let udp = Arc::new(UdpSocket::bind(cfg.bind_addr).await?);
     let local = udp.local_addr()?;
-    let (accept_tx, accept_rx) = mpsc::channel::<Arc<Multiplexer>>(64);
+    let (accept_tx, accept_rx) = mpsc::channel::<(Arc<Multiplexer>, SocketAddr)>(64);
     tokio::spawn(demux_loop(udp, accept_tx));
     Ok(KcpListener { local, accept_rx })
 }
 
-type SessionMap = Arc<Mutex<HashMap<u32, mpsc::Sender<SessionCmd>>>>;
+type SessionMap = Arc<Mutex<HashMap<u32, (mpsc::Sender<SessionCmd>, SocketAddr)>>>;
 
-async fn demux_loop(udp: Arc<UdpSocket>, accept_tx: mpsc::Sender<Arc<Multiplexer>>) {
+async fn demux_loop(udp: Arc<UdpSocket>, accept_tx: mpsc::Sender<(Arc<Multiplexer>, SocketAddr)>) {
     let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
     let mut buf = vec![0u8; 65536];
     loop {
@@ -274,11 +289,21 @@ async fn demux_loop(udp: Arc<UdpSocket>, accept_tx: mpsc::Sender<Arc<Multiplexer
         let route = {
             let mut g = sessions.lock().unwrap();
             match g.get(&conv) {
-                Some(tx) if !tx.is_closed() => tx.clone(),
-                _ => {
+                // 会话锁定首见对端:第三方伪造同 conv 报文不得注入既有会话
+                Some((tx, pinned)) if !tx.is_closed() && *pinned == peer => tx.clone(),
+                Some(_) => continue,
+                None => {
                     let (tx, rx) = mpsc::channel::<SessionCmd>(256);
-                    g.insert(conv, tx.clone());
-                    spawn_server_session(conv, rx, sessions.clone(), udp.clone(), peer, &accept_tx);
+                    g.insert(conv, (tx.clone(), peer));
+                    spawn_server_session(
+                        conv,
+                        tx.clone(),
+                        rx,
+                        sessions.clone(),
+                        udp.clone(),
+                        peer,
+                        &accept_tx,
+                    );
                     tx
                 }
             }
@@ -289,11 +314,12 @@ async fn demux_loop(udp: Arc<UdpSocket>, accept_tx: mpsc::Sender<Arc<Multiplexer
 
 fn spawn_server_session(
     conv: u32,
+    own_tx: mpsc::Sender<SessionCmd>,
     rx: mpsc::Receiver<SessionCmd>,
     sessions: SessionMap,
     udp: Arc<UdpSocket>,
     peer: SocketAddr,
-    accept_tx: &mpsc::Sender<Arc<Multiplexer>>,
+    accept_tx: &mpsc::Sender<(Arc<Multiplexer>, SocketAddr)>,
 ) {
     let (io, shared) = new_io();
     let output = UdpOutput {
@@ -307,17 +333,28 @@ fn spawn_server_session(
     kcp.set_nodelay(true, 10, 2, true);
     kcp.set_maximum_resend_times(30);
     let cleanup_sessions = sessions.clone();
+    let own_tx2 = own_tx.clone();
     tokio::spawn(async move {
         run_session(kcp, rx, shared).await;
+        // 仅当表内仍是本会话时移除,避免误删同 conv 重建的新会话
         let mut g = cleanup_sessions.lock().unwrap();
-        g.remove(&conv);
+        if let Some((cur, _)) = g.get(&conv) {
+            if cur.same_channel(&own_tx2) {
+                g.remove(&conv);
+            }
+        }
     });
-    // yamux 服务端在会话字节流上收流(keepalive 保持 kcp 活跃)
+    // yamux 服务端在会话字节流上收流(协议层心跳保持 kcp 活跃)
     let mux = wrap_stream_as_server(Box::new(io), true);
-    if accept_tx.try_send(mux).is_err() {
+    if accept_tx.try_send((mux, peer)).is_err() {
         // accept 队列满:撤销注册,客户端 kcp 重传将触发重建
         tracing::warn!("kcp accept queue full, dropping new session");
-        sessions.lock().unwrap().remove(&conv);
+        let mut g = sessions.lock().unwrap();
+        if let Some((cur, _)) = g.get(&conv) {
+            if cur.same_channel(&own_tx) {
+                g.remove(&conv);
+            }
+        }
     }
 }
 
@@ -331,6 +368,7 @@ fn new_io() -> (KcpIo, Arc<Shared>) {
             closed: false,
         }),
         notify: Notify::new(),
+        handles: std::sync::atomic::AtomicUsize::new(1),
     });
     (
         KcpIo {
@@ -503,49 +541,61 @@ pub async fn punch_dial(
     kcp.set_nodelay(true, 10, 2, true);
     kcp.set_maximum_resend_times(30);
     let (pkt_tx, pkt_rx) = mpsc::channel::<SessionCmd>(256);
-    // 入站:合法 kcp 包 learn 对端并喂会话
+    // 入站:合法 kcp 包 learn 对端并喂会话;abort = 打洞失败,收尾退出
     let inbound = Arc::new(tokio::sync::Notify::new());
     let learned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let abort = Arc::new(tokio::sync::Notify::new());
     {
         let pkt_tx = pkt_tx.clone();
         let udp = udp.clone();
         let peer = peer.clone();
         let inbound = inbound.clone();
         let learned = learned.clone();
+        let abort = abort.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
-                let Ok((n, from)) = udp.recv_from(&mut buf).await else {
-                    break;
-                };
-                let pkt = &buf[..n];
-                if n >= KCP_OVERHEAD && (81..=84).contains(&pkt[4]) {
-                    if !learned.swap(true, Ordering::Relaxed) {
-                        *peer.lock().unwrap() = from;
-                        inbound.notify_one();
+                tokio::select! {
+                    r = udp.recv_from(&mut buf) => {
+                        let Ok((n, from)) = r else { break };
+                        let pkt = &buf[..n];
+                        if n >= KCP_OVERHEAD && (81..=84).contains(&pkt[4]) {
+                            if !learned.swap(true, Ordering::Relaxed) {
+                                *peer.lock().unwrap() = from;
+                                inbound.notify_one();
+                            }
+                            if pkt_tx.try_send(SessionCmd::Packet(pkt.to_vec())).is_err() {
+                                break;
+                            }
+                        }
                     }
-                    if pkt_tx.try_send(SessionCmd::Packet(pkt.to_vec())).is_err() {
-                        break;
-                    }
+                    _ = abort.notified() => break,
                 }
             }
         });
     }
-    // 原始打洞包 + 候选轮询(learn 前)
+    // 原始打洞包 + 候选轮询(learn 前;失败时经 abort 停止,避免永久发包)
     {
         let udp = udp.clone();
         let peer = peer.clone();
         let learned = learned.clone();
+        let abort = abort.clone();
         let candidates = candidates.to_vec();
         tokio::spawn(async move {
             let mut i = 0usize;
-            while !learned.load(Ordering::Relaxed) {
+            loop {
+                if learned.load(Ordering::Relaxed) {
+                    break;
+                }
                 for c in &candidates {
                     let _ = udp.try_send_to(b"RHPUNCH", *c);
                 }
                 *peer.lock().unwrap() = candidates[i % candidates.len()];
                 i += 1;
-                tokio::time::sleep(Duration::from_millis(800)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(800)) => {}
+                    _ = abort.notified() => break,
+                }
             }
         });
     }
@@ -564,6 +614,8 @@ pub async fn punch_dial(
             return Ok(wrap_stream_as_client(Box::new(io), true));
         }
         if tokio::time::Instant::now() >= deadline {
+            // 失败收尾:停掉打洞辅助任务(返回后 io 被 drop,会话任务随之退出)
+            abort.notify_waiters();
             return Err(other_err("punch timeout"));
         }
         tokio::select! {

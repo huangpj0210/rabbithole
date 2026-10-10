@@ -20,8 +20,18 @@ pub async fn handle_start_forward(
     tracing::debug!(proxy = %fwd.proxy_name, target = %fwd.target_host, port = fwd.target_port, "forward assigned");
     // 指派帧后已抵达的用户数据:前转到本地目标(先于其他写入)
     let prefix = (!prefix.is_empty()).then_some(prefix);
-    // tcpmux passthrough:通道本体是 yamux 服务端,接受多路流,每流独立转发
+    // tcpmux passthrough:通道本体是 yamux 服务端,接受多路流,每流独立转发。
+    // 残留字节属于 yamux 线路字节(或压缩流首块),必须回灌进通道,而非写进任何一条流
     if fwd.flags & forward_flags::TCPMUX_PASSTHROUGH != 0 {
+        let channel = match prefix {
+            Some(p) => rh_transport::PrependedIo::wrap(channel, p),
+            None => channel,
+        };
+        let channel = if fwd.flags & forward_flags::COMPRESSED != 0 {
+            rh_transport::compress_stream(channel).await
+        } else {
+            channel
+        };
         let mux = rh_transport::wrap_stream_as_server(channel, true);
         let spec = spec.clone();
         let fwd = fwd.clone();
@@ -31,12 +41,8 @@ pub async fn handle_start_forward(
                 let spec2 = spec.clone();
                 let fwd2 = fwd.clone();
                 let s2 = sess.clone();
-                let pfx = prefix.clone().unwrap_or_default();
                 tokio::spawn(async move {
-                    if let Ok(mut local) = dial_target(&s2, &spec2, &fwd2).await {
-                        if !pfx.is_empty() {
-                            let _ = tokio::io::AsyncWriteExt::write_all(&mut local, &pfx).await;
-                        }
+                    if let Ok(local) = dial_target(&s2, &spec2, &fwd2).await {
                         splice(stream, local, None).await;
                     }
                 });
@@ -66,18 +72,21 @@ pub async fn handle_start_forward(
         }
     }
 
-    // 帧后残留字节(与 PROXY 头同向:通道 → 本地)
-    if let Some(p) = &prefix {
-        use tokio::io::AsyncWriteExt as _;
-        if local.write_all(p).await.is_err() {
-            return Ok(());
-        }
-    }
-
-    // 压缩:端到端 snappy,两端各自 compress_stream
+    // 压缩:端到端 snappy,两端各自 compress_stream。
+    // 残留字节:未压缩时直接前转到本地;压缩时是压缩流首块,须喂给解压器
     let peer = if fwd.flags & forward_flags::COMPRESSED != 0 {
+        let channel = match prefix {
+            Some(p) => rh_transport::PrependedIo::wrap(channel, p),
+            None => channel,
+        };
         rh_transport::compress_stream(channel).await
     } else {
+        if let Some(p) = &prefix {
+            use tokio::io::AsyncWriteExt as _;
+            if local.write_all(p).await.is_err() {
+                return Ok(());
+            }
+        }
         channel
     };
 
@@ -109,7 +118,7 @@ pub async fn dial_target(
     if let Some(plugin) = &spec.plugin {
         return crate::plugins::dial_plugin(plugin, fwd).await;
     }
-    let addr = resolve(&fwd.target_host, fwd.target_port)?;
+    let addr = resolve(&fwd.target_host, fwd.target_port).await?;
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::net::TcpStream::connect(addr),
@@ -120,21 +129,29 @@ pub async fn dial_target(
     Ok(Box::new(stream))
 }
 
-pub fn resolve(host: &str, port: u16) -> anyhow::Result<std::net::SocketAddr> {
+/// 目标解析:IP 直返;自定义 DNS 走 blocking 线程;系统解析(getaddrinfo)
+/// 同样移出 async 线程池(DNS 不可达时每连接可阻塞 2s+,拖垮 runtime 调度)。
+pub async fn resolve(host: &str, port: u16) -> anyhow::Result<std::net::SocketAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(std::net::SocketAddr::new(ip, port));
     }
     // 自定义 DNS(配置了 dns_server 时):直接向该服务器发 A/AAAA 查询
     if let Some(ns) = crate::session::dns_server() {
-        if let Some(ip) = crate::dnsquery::query(host, &ns) {
+        if let Some(ip) = crate::dnsquery::query_spawn_blocking(host, &ns).await {
             return Ok(std::net::SocketAddr::new(ip, port));
         }
     }
-    use std::net::ToSocketAddrs;
-    let mut addrs = (host, port).to_socket_addrs()?;
-    addrs
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("resolve {host}:{port} failed"))
+    let host_owned = host.to_string();
+    let resolved = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        (host_owned.as_str(), port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("resolve task: {e}"))?;
+    resolved.ok_or_else(|| anyhow::anyhow!("resolve {host}:{port} failed"))
 }
 
 /// 双向搬运(保持半关闭:一边 EOF 只关闭另一边的写方向)。

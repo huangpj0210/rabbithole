@@ -5,6 +5,7 @@ mod config;
 mod control;
 mod data;
 mod db;
+mod embedded_ui;
 mod events;
 mod nathole;
 mod recovery;
@@ -88,7 +89,7 @@ async fn bootstrap_initial_admin(state: &Arc<crate::state::AppState>) {
         .emit(
             "info",
             "auth",
-            "initial admin account created (random password printed to server console; change it after first login)",
+            "初始管理员账号已创建(随机密码仅在服务端控制台一次性展示,请登录后立即修改)",
         )
         .await;
     println!(
@@ -96,20 +97,22 @@ async fn bootstrap_initial_admin(state: &Arc<crate::state::AppState>) {
     );
 }
 
-fn tls_opts_from(files: &Option<config::TlsServerFileConfig>) -> TlsServerOptions {
+fn tls_opts_from(files: &Option<config::TlsServerFileConfig>) -> anyhow::Result<TlsServerOptions> {
     match files {
-        Some(t) if t.cert_file.is_some() && t.key_file.is_some() => TlsServerOptions {
-            cert_pem: t
-                .cert_file
-                .as_ref()
-                .map(|p| std::fs::read(p).unwrap_or_default()),
-            key_pem: t
-                .key_file
-                .as_ref()
-                .map(|p| std::fs::read(p).unwrap_or_default()),
-            persist_prefix: None,
-        },
-        _ => TlsServerOptions::default(),
+        Some(t) if t.cert_file.is_some() && t.key_file.is_some() => {
+            let cert_file = t.cert_file.as_ref().unwrap();
+            let key_file = t.key_file.as_ref().unwrap();
+            let cert_pem = std::fs::read(cert_file)
+                .map_err(|e| anyhow::anyhow!("read cert_file {cert_file:?}: {e}"))?;
+            let key_pem = std::fs::read(key_file)
+                .map_err(|e| anyhow::anyhow!("read key_file {key_file:?}: {e}"))?;
+            Ok(TlsServerOptions {
+                cert_pem: Some(cert_pem),
+                key_pem: Some(key_pem),
+                persist_prefix: None,
+            })
+        }
+        _ => Ok(TlsServerOptions::default()),
     }
 }
 
@@ -118,12 +121,12 @@ fn tls_opts_or_auto(
     files: &Option<config::TlsServerFileConfig>,
     proto: Protocol,
     persist_prefix: std::path::PathBuf,
-) -> TlsServerOptions {
-    let mut o = tls_opts_from(files);
+) -> anyhow::Result<TlsServerOptions> {
+    let mut o = tls_opts_from(files)?;
     if matches!(proto, Protocol::Tls | Protocol::Wss | Protocol::Quic) && o.cert_pem.is_none() {
         o.persist_prefix = Some(persist_prefix);
     }
-    o
+    Ok(o)
 }
 
 fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTransportConfig>> {
@@ -139,7 +142,7 @@ fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTra
         protocol: main_proto,
         bind_addr: format!("{}:{}", cfg.bind_addr, cfg.bind_port).parse()?,
         multiplex: cfg.multiplex,
-        tls: tls_opts_or_auto(&cfg.tls, main_proto, cfg_dir.join("certs/rh-main")),
+        tls: tls_opts_or_auto(&cfg.tls, main_proto, cfg_dir.join("certs/rh-main"))?,
         alpn: vec!["rhtp".into()],
     });
     for l in &cfg.extra_listeners {
@@ -155,7 +158,7 @@ fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTra
             )
             .parse()?,
             multiplex: l.multiplex.unwrap_or(cfg.multiplex),
-            tls: tls_opts_or_auto(&l.tls, proto, prefix),
+            tls: tls_opts_or_auto(&l.tls, proto, prefix)?,
             alpn: vec!["rhtp".into()],
         });
     }
@@ -199,6 +202,8 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
     let state = Arc::new(AppState::new(cfg.clone(), db));
+    // 挑战表周期清扫(回收未被消费的过期 nonce)
+    tokio::spawn(state.challenge.clone().sweeper());
     // 首次启动引导:无任何用户时创建 admin + 随机密码,仅在控制台一次性展示。
     bootstrap_initial_admin(&state).await;
     // 启动恢复:双方 enabled 的规则重新绑定。
@@ -266,6 +271,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    } else if embedded_ui::available() {
+        // 未配置 static_dir 但构建期内嵌了前端:单二进制直接托管控制台
+        info!(
+            files = embedded_ui::file_count(),
+            "web api up with embedded ui (static_dir not configured)"
+        );
+        app = app.fallback(
+            move |req: axum::http::Request<axum::body::Body>| async move {
+                embedded_ui::handle(req.uri().path()).await
+            },
+        );
     }
     let web_addr: std::net::SocketAddr =
         format!("{}:{}", cfg.web.bind_addr, cfg.web.port).parse()?;
@@ -294,13 +310,19 @@ async fn main() -> anyhow::Result<()> {
             inner: listener,
             acceptor: tokio_rustls::TlsAcceptor::from(rustls_cfg),
         };
-        axum::serve(tls_listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        axum::serve(
+            tls_listener,
+            app.into_make_service_with_connect_info::<crate::WebAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await?;
     } else {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<crate::WebAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await?;
     }
     Ok(())
 }
@@ -309,6 +331,33 @@ async fn main() -> anyhow::Result<()> {
 struct TlsListener {
     inner: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
+}
+
+/// 管理 API 对端地址:为 TCP 与 TLS 两种 Listener 提供统一的 connect_info 类型。
+#[derive(Clone, Copy)]
+pub struct WebAddr(pub std::net::SocketAddr);
+
+impl std::fmt::Display for WebAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for WebAddr
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
+    for WebAddr
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
 }
 
 impl axum::serve::Listener for TlsListener {

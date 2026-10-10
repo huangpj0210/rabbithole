@@ -27,6 +27,7 @@ fn ping_bytes() -> Vec<u8> {
 
 /// 代理侧:通道 ↔ 本地目标 UDP。按用户源地址各开一个本地 socket,
 /// 回写任务经共享写半部写帧;主循环读帧 + 探活。
+/// 每 60s 清理 60s 无活动的用户会话(源端口轮换的客户端会持续产生新条目)。
 pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) {
     let target = format!("{}:{}", spec.target_host, spec.target_port);
     let Ok(target) = target.parse::<std::net::SocketAddr>() else {
@@ -35,11 +36,14 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
     };
     let (mut r, w) = tokio::io::split(channel);
     let w: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(Some(w)));
-    let mut sessions: HashMap<std::net::SocketAddr, Arc<UdpSocket>> = HashMap::new();
+    let mut sessions: HashMap<std::net::SocketAddr, (Arc<UdpSocket>, Instant)> = HashMap::new();
     // hello 后已抵达的帧数据预置进缓冲
     let mut fbuf = bytes::BytesMut::from(&prefix[..]);
     let mut last_alive = Instant::now();
     let mut last_ping = Instant::now();
+    let mut gc = tokio::time::interval(Duration::from_secs(60));
+    gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let _ = gc.tick().await;
     loop {
         tokio::select! {
             rr = frame::read_frame(&mut r, &mut fbuf) => {
@@ -47,8 +51,9 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
                     Ok((FrameType::UDP_PACKET, p)) => {
                         if let Some((src, data)) = udp_packet::decode(&p) {
                             if let Ok(user) = src.parse::<std::net::SocketAddr>() {
-                                let s = get_session(&mut sessions, user, target, w.clone()).await;
-                                let _ = s.send_to(data, target).await;
+                                if let Some(s) = get_session(&mut sessions, user, target, w.clone()).await {
+                                    let _ = s.send_to(data, target).await;
+                                }
                             }
                             last_alive = Instant::now();
                         }
@@ -72,6 +77,10 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
                     Ok(_) => { last_alive = Instant::now(); }
                     Err(_) => break,
                 }
+            }
+            _ = gc.tick() => {
+                let now = Instant::now();
+                sessions.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(60));
             }
             _ = tokio::time::sleep(Duration::from_secs(15)) => {
                 if last_ping.elapsed() >= Duration::from_secs(30) {
@@ -99,27 +108,27 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
 }
 
 async fn get_session<W>(
-    sessions: &mut HashMap<std::net::SocketAddr, Arc<UdpSocket>>,
+    sessions: &mut HashMap<std::net::SocketAddr, (Arc<UdpSocket>, Instant)>,
     user: std::net::SocketAddr,
     target: std::net::SocketAddr,
     w: Arc<Mutex<Option<W>>>,
-) -> Arc<UdpSocket>
+) -> Option<Arc<UdpSocket>>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    if let Some(s) = sessions.get(&user) {
-        return s.clone();
+    if let Some((s, t)) = sessions.get_mut(&user) {
+        *t = Instant::now();
+        return Some(s.clone());
     }
+    // 按目标地址族选择本地绑定(目标为 IPv6 时回退 IPv4 socket 必然发不出去)
     let bind_local = if target.is_ipv4() {
         "0.0.0.0:0"
     } else {
         "[::]:0"
     };
-    let Ok(sock) = UdpSocket::bind(bind_local).await else {
-        return Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("udp bind"));
-    };
+    let sock = UdpSocket::bind(bind_local).await.ok()?;
     let sock = Arc::new(sock);
-    sessions.insert(user, sock.clone());
+    sessions.insert(user, (sock.clone(), Instant::now()));
     // 回写任务:本地目标响应 → 通道帧(src = 该用户源地址)
     let sock2 = sock.clone();
     tokio::spawn(async move {
@@ -143,7 +152,7 @@ where
             }
         }
     });
-    sock
+    Some(sock)
 }
 
 /// visitor 侧 sudp:本地 UDP 监听 ↔ 通道(src 字段承载本地用户源)。

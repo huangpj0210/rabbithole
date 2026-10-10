@@ -126,12 +126,19 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     }
 }
 
-/// 异步写入一帧。
+/// 异步写入一帧。超限载荷直接报错:对端会以 TooLarge 关闭整条连接,
+/// 不如在本端拒绝编码(长度字段截断会产生腐化帧)。
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     ty: FrameType,
     payload: &[u8],
 ) -> io::Result<()> {
+    if payload.len() > MAX_FRAME_LEN {
+        return Err(io::Error::other(format!(
+            "frame payload {} exceeds limit {MAX_FRAME_LEN}",
+            payload.len()
+        )));
+    }
     let frame = encode_frame_bytes(ty, payload);
     w.write_all(&frame).await
 }

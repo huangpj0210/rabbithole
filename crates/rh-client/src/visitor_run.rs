@@ -126,7 +126,11 @@ async fn xtcp_direct_stream(
     _user_conn_id: u64,
     conn: tokio::net::TcpStream,
 ) -> Option<tokio::net::TcpStream> {
-    let mut stream = mux.open_stream().await.ok()?;
+    let mut stream = match mux.open_stream().await {
+        Ok(s) => s,
+        // 开流失败(mux 已死):返还连接,由调用方移除失效 mux 并走常规路径
+        Err(_) => return Some(conn),
+    };
     let fwd = StartForward {
         proxy_id: 0,
         user_src: String::new(),
@@ -136,7 +140,9 @@ async fn xtcp_direct_stream(
         proxy_proto: rh_protocol::message::ProxyProto::None,
         proxy_name: spec.target_proxy_name.clone(),
     };
-    let payload = serde_json::to_vec(&fwd).ok()?;
+    let Ok(payload) = serde_json::to_vec(&fwd) else {
+        return Some(conn);
+    };
     if rh_protocol::write_frame(&mut stream, rh_protocol::FrameType::START_FORWARD, &payload)
         .await
         .is_err()
@@ -167,11 +173,6 @@ pub async fn deliver_relay(
     _vspec: VisitorSpec,
     prefix: Vec<u8>,
 ) {
-    let channel = if relay.flags & forward_flags::COMPRESSED != 0 {
-        rh_transport::compress_stream(channel).await
-    } else {
-        channel
-    };
     let Some((mut conn, _)) = sess.waiting.lock().await.remove(&relay.user_conn_id) else {
         tracing::warn!(
             conn = relay.user_conn_id,
@@ -179,11 +180,21 @@ pub async fn deliver_relay(
         );
         return; // 本地连接已超时:丢弃通道
     };
-    // 指派帧后已抵达的对端数据先写入本地连接
-    if !prefix.is_empty() {
-        use tokio::io::AsyncWriteExt as _;
-        let _ = conn.write_all(&prefix).await;
-    }
+    // 压缩时残留字节是压缩流首块,须回灌给解压器;未压缩时直接写给本地连接
+    let channel = if relay.flags & forward_flags::COMPRESSED != 0 {
+        let inner = if prefix.is_empty() {
+            channel
+        } else {
+            rh_transport::PrependedIo::wrap(channel, prefix)
+        };
+        rh_transport::compress_stream(inner).await
+    } else {
+        if !prefix.is_empty() {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = conn.write_all(&prefix).await;
+        }
+        channel
+    };
     crate::forward::splice(channel, Box::new(conn), None).await;
 }
 

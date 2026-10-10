@@ -229,7 +229,7 @@ pub struct Incoming {
 
 enum ListenerInner {
     Tcp(tcp::TcpListenerShim),
-    Quic(quinn::Endpoint),
+    Quic(quic::QuicListener),
     Kcp(kcp::KcpListener),
 }
 
@@ -354,7 +354,7 @@ pub async fn listen(cfg: &ServerTransportConfig) -> std::io::Result<TransportLis
         }
         Protocol::Quic => {
             let e = quic::listen(cfg)?;
-            local_addr = e.local_addr()?;
+            local_addr = e.local;
             ListenerInner::Quic(e)
         }
         Protocol::Kcp => {

@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         if shutdown.is_cancelled() {
             return Ok(());
         }
+        let started = std::time::Instant::now();
         match session::connect_and_run(cfg.clone(), shutdown.clone()).await {
             Ok(()) => {
                 info!("session ended");
@@ -88,6 +89,11 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => {
                 warn!(error = %e, "session error");
             }
+        }
+        // 会话存活超过 30s 视为健康周期:退避重置,避免长期运行后
+        // 任意一次断线都要等满 60s 才重连
+        if started.elapsed() >= std::time::Duration::from_secs(30) {
+            backoff_secs = 1;
         }
         if shutdown.is_cancelled() {
             return Ok(());

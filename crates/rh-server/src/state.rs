@@ -39,10 +39,12 @@ pub struct AppState {
     pub udp_relays: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// XTCP 打洞协调器。
     pub nathole: Arc<crate::nathole::NatCoordinator>,
-    /// 登录限速(每分钟 5 次/用户)。
+    /// 登录限速(每分钟 5 次/IP+用户)。
     pub login_limiter: Arc<governor::DefaultKeyedRateLimiter<String>>,
     /// JWT 密钥(启动时定;空则启动生成随机值)。
     pub web_jwt_secret: Arc<Mutex<Option<String>>>,
+    /// 每 IP 认证中并发连接数(控制面未认证窗口)。
+    unauth_conns: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
 }
 
 impl Clone for AppState {
@@ -62,6 +64,7 @@ impl Clone for AppState {
             nathole: self.nathole.clone(),
             login_limiter: self.login_limiter.clone(),
             web_jwt_secret: self.web_jwt_secret.clone(),
+            unauth_conns: self.unauth_conns.clone(),
         }
     }
 }
@@ -96,6 +99,30 @@ impl AppState {
                 std::num::NonZeroU32::new(5).unwrap(),
             ))),
             web_jwt_secret: Arc::new(Mutex::new(Some(jwt_secret))),
+            unauth_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// 认证窗口进入:超过每 IP 上限返回 false。
+    pub fn enter_unauth(&self, ip: &IpAddr) -> bool {
+        let limit = self.cfg.limits.unauth_conns_per_ip;
+        let mut g = self.unauth_conns.lock().unwrap();
+        let c = g.entry(*ip).or_insert(0);
+        if *c >= limit {
+            return false;
+        }
+        *c += 1;
+        true
+    }
+
+    /// 认证窗口退出。
+    pub fn exit_unauth(&self, ip: &IpAddr) {
+        let mut g = self.unauth_conns.lock().unwrap();
+        if let Some(c) = g.get_mut(ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                g.remove(ip);
+            }
         }
     }
 
@@ -179,8 +206,9 @@ pub struct TcpPool {
     /// 就绪通道(已完成 DATA_CHANNEL_HELLO,等待 START_FORWARD)。
     /// 元组:(建立该通道的会话 epoch, request_id, io)
     pub ready: Mutex<Vec<(u64, u64, BoxedIo)>>,
-    /// 等待用户连接的等待者(用户连接先到)。
-    pub waiters: Mutex<Vec<tokio::sync::oneshot::Sender<BoxedIo>>>,
+    /// 等待用户连接的等待者(用户连接先到)。带唯一 id:超时按 id 精确移除,
+    /// 不得误删其他等待者(LIFO pop 会删错对象)。
+    pub waiters: Mutex<Vec<(u64, tokio::sync::oneshot::Sender<BoxedIo>)>>,
     /// 池容量(池中+在途 ≤ pool_size)。
     pub size: usize,
     /// 在途请求数。
@@ -188,6 +216,8 @@ pub struct TcpPool {
     /// 池当前归属会话的 epoch(全局单调递增;0 = 尚未认领)。
     /// 会话重连/替换后旧条目全部失效,由认领方驱逐。
     pub epoch: AtomicU64,
+    /// 等待者 id 发号器。
+    pub waiter_seq: AtomicU64,
 }
 
 impl TcpPool {
@@ -198,7 +228,13 @@ impl TcpPool {
             size,
             inflight: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
+            waiter_seq: AtomicU64::new(1),
         }
+    }
+
+    /// 移除指定 id 的等待者(超时/签发失败路径)。
+    pub async fn remove_waiter(&self, id: u64) {
+        self.waiters.lock().await.retain(|(wid, _)| *wid != id);
     }
 }
 
@@ -259,9 +295,26 @@ impl ProxyRuntime {
 }
 
 /// 组负载均衡:同 (kind, bind_ip, bind_port, group) 的成员共享监听。
+/// TCP 组:首个绑定成功的成员启动共享 serve loop(取消权归组,不随单个成员退出);
+/// vhost 组(http/https/tcpmux):仅登记成员供 group_pick 轮询。
 pub struct GroupRuntime {
     pub members: RwLock<Vec<u64>>,
     pub rr: AtomicU64,
+    /// 共享监听是否已在位(TCP 组)。
+    pub listener_bound: AtomicBool,
+    /// 共享 serve loop 的取消令牌(组清空时取消;重新绑定时更换新令牌)。
+    pub serve_cancel: RwLock<CancellationToken>,
+}
+
+impl GroupRuntime {
+    fn new() -> Self {
+        Self {
+            members: RwLock::new(Vec::new()),
+            rr: AtomicU64::new(0),
+            listener_bound: AtomicBool::new(false),
+            serve_cancel: RwLock::new(CancellationToken::new()),
+        }
+    }
 }
 
 // ---------------- ProxyManager ----------------
@@ -305,13 +358,32 @@ impl ProxyManager {
         self.runtimes.get(&id).map(|e| e.value().clone())
     }
 
+    /// 取(或创建)组运行时。
+    pub fn group_entry(&self, key: &str) -> Arc<GroupRuntime> {
+        self.groups
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(GroupRuntime::new()))
+            .clone()
+    }
+
+    /// 组共享监听是否已在位(TCP 组,判定创建/更新时是否可跳过试绑)。
+    pub fn group_listener_bound(&self, key: &Option<String>) -> bool {
+        key.as_ref().is_some_and(|k| {
+            self.groups
+                .get(k)
+                .is_some_and(|g| g.listener_bound.load(std::sync::atomic::Ordering::Relaxed))
+        })
+    }
+
     /// 端口占用冲突判定(运行中的独享监听 + 组监听 + DB 其他启用行)。
+    /// new_group_key:新建/更新规则的组键;同组成员共享监听,不构成冲突。
     pub async fn port_in_use(
         &self,
         proto: &str,
         ip: IpAddr,
         port: u16,
         except_proxy: Option<u64>,
+        new_group_key: Option<String>,
     ) -> bool {
         for e in self.runtimes.iter() {
             let rt = e.value();
@@ -319,6 +391,12 @@ impl ProxyManager {
                 continue;
             }
             let spec = rt.spec.read().await;
+            if Some(rt.id) != except_proxy
+                && new_group_key.is_some()
+                && Self::group_key(&spec) == new_group_key
+            {
+                continue; // 同组:共享监听
+            }
             if spec.kind.uses_bind_port()
                 && spec.enabled
                 && bind_conflicts(
@@ -360,7 +438,7 @@ impl ProxyManager {
                 if !allow.allows(p) {
                     continue;
                 }
-                if self.port_in_use(proto, bind_ip, p, None).await {
+                if self.port_in_use(proto, bind_ip, p, None, None).await {
                     continue;
                 }
                 let addr = SocketAddr::new(bind_ip, p);
@@ -377,10 +455,20 @@ impl ProxyManager {
         None
     }
 
-    /// 组键。
+    /// 组键:group 负载均衡支持 tcp 与 vhost(http/https/tcpmux);
+    /// 键含 kind/bind_ip/bind_port,同组成员共享同一监听/路由选路池。
     pub fn group_key(spec: &ProxySpec) -> Option<String> {
         let group = spec.group.as_deref().unwrap_or("");
-        if group.is_empty() || !spec.kind.uses_bind_port() {
+        if group.is_empty() {
+            return None;
+        }
+        if !matches!(
+            spec.kind,
+            rh_protocol::ProxyKind::Tcp
+                | rh_protocol::ProxyKind::Http
+                | rh_protocol::ProxyKind::Https
+                | rh_protocol::ProxyKind::TcpMux
+        ) {
             return None;
         }
         Some(format!(
@@ -390,6 +478,23 @@ impl ProxyManager {
             spec.bind_port,
             group
         ))
+    }
+
+    /// 组退出:移除成员;组清空则取消共享 serve loop 并复位绑定标记。
+    pub async fn leave_group(&self, key: &str, proxy_id: u64) {
+        let Some(g) = self.groups.get(key).map(|e| e.value().clone()) else {
+            return;
+        };
+        let empty = {
+            let mut m = g.members.write().await;
+            m.retain(|id| *id != proxy_id);
+            m.is_empty()
+        };
+        if empty {
+            g.serve_cancel.read().await.cancel();
+            g.listener_bound
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// vhost 路由重建(简单起见:全量刷新)。

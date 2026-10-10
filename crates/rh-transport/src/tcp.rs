@@ -18,70 +18,78 @@ use tokio_rustls::TlsConnector;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 服务端 TCP/TLS/WS/WSS 监听器。
+/// 接受与握手解耦:后台泵逐个 accept TCP,每连接的握手(TLS/WS/peek)
+/// 在独立任务完成,慢握手不得阻塞后续接入(DoS 缓解);就绪连接入队供消费。
 pub struct TcpListenerShim {
-    listener: TcpListener,
-    tls: Option<tokio_rustls::TlsAcceptor>,
-    ws_upgrade: bool,
-    multiplex: bool,
-    protocol: crate::Protocol,
+    local: SocketAddr,
+    ready: tokio::sync::mpsc::Receiver<Incoming>,
 }
 
 impl TcpListenerShim {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        Ok(self.local)
     }
 
-    pub async fn accept(&self) -> io::Result<Incoming> {
-        let (stream, remote) = self.listener.accept().await?;
-        stream.set_nodelay(true).ok();
-        set_tcp_keepalive(&stream);
-        let mux = match &self.tls {
-            Some(acceptor) => {
-                let tls_stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
-                    .await
-                    .map_err(|_| other_err("tls handshake timeout"))??;
-                self.post_tls(Box::new(tls_stream), remote).await?
-            }
-            None => self.post_tls(Box::new(stream), remote).await?,
-        };
-        Ok(Incoming {
-            mux,
-            remote,
-            protocol: self.protocol,
-        })
+    pub async fn accept(&mut self) -> io::Result<Incoming> {
+        self.ready
+            .recv()
+            .await
+            .ok_or_else(|| other_err("tcp listener closed"))
     }
+}
 
-    async fn post_tls(
-        &self,
-        io: crate::BoxedIo,
-        _remote: SocketAddr,
-    ) -> io::Result<Arc<Multiplexer>> {
-        let io = if self.ws_upgrade {
-            let io = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws::upgrade_server(io, ws::WS_PATH))
+/// 单连接握手管线:TLS → WS 升级 → 首字节窥探 → mux 包装。
+async fn handshake(
+    stream: tokio::net::TcpStream,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    ws_upgrade: bool,
+    multiplex: bool,
+) -> io::Result<Arc<Multiplexer>> {
+    stream.set_nodelay(true).ok();
+    set_tcp_keepalive(&stream);
+    let io: crate::BoxedIo = match tls {
+        Some(acceptor) => {
+            let tls_stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                 .await
-                .map_err(|_| other_err("ws handshake timeout"))??;
-            io
-        } else {
-            io
-        };
-        if !self.multiplex {
-            return Ok(crate::mux::wrap_stream_as_server(io, false));
+                .map_err(|_| other_err("tls handshake timeout"))??;
+            Box::new(tls_stream)
         }
-        // 混合接入:multiplex 监听允许裸模式客户端。
-        // 窥探首 4 字节:RHTP 魔数 = 裸连接(每连接一流);否则按 yamux 处理。
-        // 窥探字节必须前传(两种包装都需要)。
-        let (prefix, io) = peek_prefix(io).await?;
-        if prefix == *b"RHTP" {
-            Ok(crate::mux::wrap_stream_as_server(
-                crate::PrependedIo::wrap(io, prefix.to_vec()),
-                false,
-            ))
-        } else {
-            Ok(crate::mux::wrap_stream_as_server(
-                crate::PrependedIo::wrap(io, prefix.to_vec()),
-                true,
-            ))
-        }
+        None => Box::new(stream),
+    };
+    post_tls(io, ws_upgrade, multiplex).await
+}
+
+async fn post_tls(
+    io: crate::BoxedIo,
+    ws_upgrade: bool,
+    multiplex: bool,
+) -> io::Result<Arc<Multiplexer>> {
+    let io = if ws_upgrade {
+        let io = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws::upgrade_server(io, ws::WS_PATH))
+            .await
+            .map_err(|_| other_err("ws handshake timeout"))??;
+        io
+    } else {
+        io
+    };
+    if !multiplex {
+        return Ok(crate::mux::wrap_stream_as_server(io, false));
+    }
+    // 混合接入:multiplex 监听允许裸模式客户端。
+    // 窥探首 4 字节:RHTP 魔数 = 裸连接(每连接一流);否则按 yamux 处理。
+    // 窥探字节必须前传(两种包装都需要)。
+    let (prefix, io) = peek_prefix(io).await?;
+    if prefix == *b"RHTP" {
+        Ok(crate::mux::wrap_stream_as_server(
+            crate::PrependedIo::wrap(io, prefix.to_vec()),
+            false,
+        ))
+    } else {
+        Ok(crate::mux::wrap_stream_as_server(
+            crate::PrependedIo::wrap(io, prefix.to_vec()),
+            true,
+        ))
     }
 }
 
@@ -105,6 +113,7 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
 
 pub async fn listen_stream(cfg: &ServerTransportConfig) -> io::Result<TcpListenerShim> {
     let listener = TcpListener::bind(cfg.bind_addr).await?;
+    let local = listener.local_addr()?;
     let tls = if matches!(cfg.protocol, crate::Protocol::Tls | crate::Protocol::Wss) {
         Some(tokio_rustls::TlsAcceptor::from(crate::tls::server_config(
             &cfg.tls,
@@ -115,13 +124,41 @@ pub async fn listen_stream(cfg: &ServerTransportConfig) -> io::Result<TcpListene
     if !cfg.protocol.is_encrypted() {
         tracing::warn!(protocol = %cfg.protocol, "plaintext transport (dev/debug only)");
     }
-    Ok(TcpListenerShim {
-        listener,
-        tls,
-        ws_upgrade: matches!(cfg.protocol, crate::Protocol::Ws | crate::Protocol::Wss),
-        multiplex: cfg.multiplex,
-        protocol: cfg.protocol,
-    })
+    let ws_upgrade = matches!(cfg.protocol, crate::Protocol::Ws | crate::Protocol::Wss);
+    let multiplex = cfg.multiplex;
+    let protocol = cfg.protocol;
+    // 握手泵:accept 与握手解耦,慢握手不阻塞后续接入
+    let (tx, ready) = tokio::sync::mpsc::channel::<Incoming>(64);
+    tokio::spawn(async move {
+        loop {
+            let (stream, remote) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tcp accept error");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            let tx2 = tx.clone();
+            let tls2 = tls.clone();
+            tokio::spawn(async move {
+                match handshake(stream, tls2, ws_upgrade, multiplex).await {
+                    Ok(mux) => {
+                        let inc = Incoming {
+                            mux,
+                            remote,
+                            protocol,
+                        };
+                        let _ = tx2.send(inc).await;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, %remote, "tcp handshake failed");
+                    }
+                }
+            });
+        }
+    });
+    Ok(TcpListenerShim { local, ready })
 }
 
 /// 客户端:建立一条物理连接并握手。多路复用时返回 yamux mux;
