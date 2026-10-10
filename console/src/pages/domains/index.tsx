@@ -1,13 +1,13 @@
-import { PageContainer, ProCard } from '@ant-design/pro-components';
+import ProxyListPage from '@/components/ProxyListPage';
 import React from 'react';
 
-/** 域名服务(R0 占位,R1/R2/R3 填充真实实现)。 */
-const DomainsPage: React.FC = () => {
-  return (
-    <PageContainer>
-      <ProCard title="域名服务">HTTP / HTTPS / TCPMux 域名规则 —— 本页建设中。</ProCard>
-    </PageContainer>
-  );
-};
+const DomainsPage: React.FC = () => (
+  <ProxyListPage
+    defaultKind='http'
+    description="HTTP / HTTPS / TCPMux 域名规则"
+    kinds={['http', 'https', 'tcpmux'] as const}
+    title="域名服务"
+  />
+);
 
 export default DomainsPage;
