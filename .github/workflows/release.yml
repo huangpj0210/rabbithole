@@ -1,0 +1,180 @@
+# 发布流水线:推送 v* 标签触发。
+# 1) console/ 构建前端产物(供 rust-embed 内嵌,一次构建全矩阵复用)
+# 2) 6 目标矩阵编译 rh-server + rh-client(Windows zip,其余 tar.gz)
+# 3) linux musl 静态二进制打包多架构 Docker 镜像(免 QEMU:每架构单平台构建 + manifest 合并),推 ghcr.io
+# 4) 全部归档 + sha256 发布到 GitHub Release
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  console:
+    name: 控制台前端(console/dist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: console/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+      - name: pnpm install + build
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+        working-directory: console
+      - uses: actions/upload-artifact@v4
+        with:
+          name: console-dist
+          path: console/dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.target }}
+    needs: console
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 注入前端产物(rust-embed 构建期内嵌)
+        uses: actions/download-artifact@v4
+        with:
+          name: console-dist
+          path: console/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: 安装 cross(musl 交叉编译)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build(Linux musl / cross)
+        if: runner.os == 'Linux'
+        run: cross build --release --target ${{ matrix.target }} -p rh-server -p rh-client
+      - name: Build(native)
+        if: runner.os != 'Linux'
+        run: cargo build --release --target ${{ matrix.target }} -p rh-server -p rh-client
+
+      - name: 打包 tar.gz
+        if: runner.os != 'Windows'
+        run: |
+          STAGE="rabbithole-${TAG}-${{ matrix.target }}"
+          mkdir -p "stage/$STAGE"
+          cp "target/${{ matrix.target }}/release/rh-server" "stage/$STAGE/"
+          cp "target/${{ matrix.target }}/release/rh-client" "stage/$STAGE/"
+          cp deploy/server.example.toml deploy/client.example.toml "stage/$STAGE/"
+          tar -czf "$STAGE.tar.gz" -C stage "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+      - name: 打包 zip(Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "rabbithole-$env:TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "stage/$stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rh-server.exe" "stage/$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/rh-client.exe" "stage/$stage/"
+          Copy-Item deploy/server.example.toml, deploy/client.example.toml "stage/$stage/"
+          Compress-Archive -Path "stage/$stage" -DestinationPath "$stage.zip"
+          "$((Get-FileHash -Algorithm SHA256 "$stage.zip").Hash.ToLower())  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
+      - name: 上传发布归档
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            rabbithole-*-${{ matrix.target }}.tar.gz
+            rabbithole-*-${{ matrix.target }}.tar.gz.sha256
+            rabbithole-*-${{ matrix.target }}.zip
+            rabbithole-*-${{ matrix.target }}.zip.sha256
+          retention-days: 3
+          if-no-files-found: error
+      # linux 静态二进制另存一份供 Docker 镜像打包
+      - name: 上传裸二进制(Docker 用)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/rh-server
+            target/${{ matrix.target }}/release/rh-client
+          retention-days: 3
+          if-no-files-found: error
+
+  docker:
+    name: Docker 镜像(ghcr.io 多架构)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x86_64-unknown-linux-musl
+          path: bin/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-aarch64-unknown-linux-musl
+          path: bin/arm64
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # 每架构单平台构建(Dockerfile 无 RUN 步骤,免 QEMU),再 manifest 合并
+      - name: Build & push 多架构镜像
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          TAG="$GITHUB_REF_NAME"
+          docker build --platform linux/amd64 -f deploy/Dockerfile --build-arg BIN_DIR=bin/amd64 -t "$IMAGE:tmp-amd64" .
+          docker push "$IMAGE:tmp-amd64"
+          docker build --platform linux/arm64 -f deploy/Dockerfile --build-arg BIN_DIR=bin/arm64 -t "$IMAGE:tmp-arm64" .
+          docker push "$IMAGE:tmp-arm64"
+          for T in "$TAG" latest; do
+            docker manifest create "$IMAGE:$T" "$IMAGE:tmp-amd64" "$IMAGE:tmp-arm64"
+            docker manifest annotate "$IMAGE:$T" "$IMAGE:tmp-amd64" --os linux --arch amd64
+            docker manifest annotate "$IMAGE:$T" "$IMAGE:tmp-arm64" --os linux --arch arm64
+            docker manifest push "$IMAGE:$T"
+          done
+
+  release:
+    name: 发布 GitHub Release
+    needs: [build, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

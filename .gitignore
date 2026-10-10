@@ -48,3 +48,6 @@ Thumbs.db
 # Agent local config (ZCode)
 .zcode/
 .zcodeignore
+
+# Docker image staging bin/ (deploy/Dockerfile)
+/bin/

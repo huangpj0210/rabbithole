@@ -1,0 +1,21 @@
+# rabbithole 服务端镜像(基于 CI 预编译的 musl 静态二进制)。
+# Dockerfile 内没有任何 RUN 步骤:多架构(amd64/arm64)在 CI 里逐架构单平台构建
+# 再以 manifest 合并,全程不需要 QEMU 模拟。
+#
+# CI 用法(自动):release 工作流下载静态二进制到 bin/<arch>/ 后按架构构建。
+# 本地用法(先准备静态二进制):
+#   cross build --release --target x86_64-unknown-linux-musl -p rh-server -p rh-client
+#   mkdir -p bin/amd64 && cp target/x86_64-unknown-linux-musl/release/rh-{server,client} bin/amd64/
+#   docker build -f deploy/Dockerfile --build-arg BIN_DIR=bin/amd64 -t rabbithole:local .
+FROM debian:bookworm-slim
+ARG BIN_DIR=bin/amd64
+COPY ${BIN_DIR}/rh-server ${BIN_DIR}/rh-client /usr/local/bin/
+COPY deploy/docker-server.toml /etc/rabbithole/server.toml
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# 控制面 TLS 7100 / Web 控制台 8080 / vhost HTTP 8081 / TCPMux 8082 / HTTPS 8443;
+# 转发端口段(默认 20000-21000)按需映射
+EXPOSE 7100 8080 8081 8082 8443
+VOLUME /var/lib/rabbithole
+
+ENTRYPOINT ["docker-entrypoint.sh"]

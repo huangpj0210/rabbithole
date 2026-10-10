@@ -1,6 +1,6 @@
 # rabbithole
 
-自托管的端口转发与远程服务接入平台:Rust 服务端 + 客户端 + Web 管理控制台(vue-vben-admin)。
+自托管的端口转发与远程服务接入平台:Rust 服务端 + 客户端 + Web 管理控制台(Umi Max + antd v6)。
 功能基线对齐 frp v0.71.0 的稳定能力(对照矩阵见 `docs/requirements-matrix.md`),
 协议为全新自有设计(RHTP),不兼容 frp。
 
@@ -60,6 +60,39 @@ ssh -R 0:内网目标:端口 <client-id>@<server> -p <ssh_gateway.bind_port>   #
 # 或公钥:authorized_keys_file 中列入公钥,用户名=客户端 ID
 ```
 
+## Docker
+
+官方镜像(多架构 linux/amd64 + linux/arm64,随版本标签发布):
+
+```bash
+docker run -d --name rabbithole \
+  -p 7100:7100 -p 8080:8080 -p 8081:8081 -p 8082:8082 -p 8443:8443 \
+  -v rabbithole-data:/var/lib/rabbithole \
+  ghcr.io/xbclub/rabbithole:latest
+# 首次启动:admin 随机密码与自签 TLS 证书一次性打印在容器日志,
+# 配置落在数据卷 /var/lib/rabbithole/server.toml,可挂载修改
+docker logs rabbithole        # 查看初始密码
+```
+
+转发端口段(默认 20000-21000)按需追加 `-p` 映射;生产请置于反向代理 + HTTPS 之后。
+也可自行构建:`deploy/Dockerfile`(打包 musl 静态二进制,无 RUN 步骤,本地构建方式见文件头注释)。
+
+## 发布(Release)
+
+推送 `v*` 标签即触发 [release 工作流](.github/workflows/release.yml):
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+一次发布产出:
+
+- **二进制归档**:Windows(zip)/ Linux / macOS(tar.gz)× x86_64 / arm64 共 6 目标,
+  每个含 rh-server、rh-client、示例配置与 sha256,发布到 GitHub Release
+  (Linux 为 musl 静态链接,任意发行版可直接运行)
+- **Docker 镜像**:`ghcr.io/xbclub/rabbithole:<tag>` 与 `:latest`(amd64 + arm64)
+
+
 ## 测试与验证
 
 ```bash
@@ -92,4 +125,14 @@ deploy/              部署示例配置与 systemd 单元
 
 ## 许可
 
-Apache-2.0(与基线 frp 一致)。前端基于 ant-design-admin-v6 模板(MIT,LICENSE 见 console/)。
+Apache-2.0(与基线 frp 一致)。
+
+## 鸣谢
+
+- **[frp](https://github.com/fatedier/frp)**(Apache-2.0)—— 功能基线与转发语义的对标项目,
+  多处模块设计(插件、visitor、打洞、vhost)参考了其成熟实现
+- **[ant-design-admin-v6](https://github.com/arvinaij/ant-design-admin-v6)**(MIT,
+  LICENSE 见 `console/`)—— 管理控制台前端基座(Umi Max + React 19 + antd v6 + ProComponents)
+- **[vue-vben-admin](https://github.com/vbenjs/vue-vben-admin)**(MIT)—— 早期控制台基座,
+  已于 2026-10 移除,其交互惯例影响了首版控制台设计
+

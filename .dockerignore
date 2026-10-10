@@ -1,0 +1,8 @@
+# Docker 构建上下文瘦身:镜像只 COPY deploy/* 与 bin/<arch>/(CI 注入的静态二进制)
+.git
+target
+console
+docs
+tests
+*.md
+.zcode

@@ -1,0 +1,41 @@
+# rabbithole 容器默认配置。首次启动由 docker-entrypoint.sh 复制到
+# /var/lib/rabbithole/server.toml(数据卷),之后修改请直接编辑该文件或挂载覆盖。
+# 首次启动会在数据卷生成初始 admin 随机密码(容器日志一次性打印)与自签 TLS 证书。
+
+bind_addr = "0.0.0.0"
+bind_protocol = "tls"          # 容器内自动生成自签证书;公网生产建议替换为正式证书
+bind_port = 7100
+multiplex = true
+
+[web]
+bind_addr = "0.0.0.0"          # 容器内必须 0.0.0.0 才能端口映射;生产请置反代 + HTTPS
+port = 8080
+jwt_ttl_hours = 12
+
+[vhost]
+http_port = 8081
+https_port = 8443
+tcpmux_port = 8082
+subdomain_host = "example.com"   # 按域名访问必改
+
+[ssh_gateway]
+enabled = false
+bind_port = 2222
+bind_addr = "0.0.0.0"
+
+[ports]
+auto_range = "20000-21000"
+allow_ports = ["10000-40000"]
+max_services_per_client = 32
+
+[limits]
+max_data_conns_per_client = 256
+pool_wait_timeout_ms = 8000
+default_pool_size = 4
+udp_packet_size = 65536
+
+[metrics]
+enable_prometheus = false
+
+[log]
+level = "info"
