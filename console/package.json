@@ -10,7 +10,7 @@
   },
   "scripts": {
     "dev": "cross-env REACT_APP_ENV=dev UMI_ENV=dev max dev",
-    "build": "max build",
+    "build": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\" && max build",
     "typecheck": "tsc --noEmit",
     "postinstall": "max setup",
     "preview": "max preview --port 8000"
