@@ -68,6 +68,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # runner 预装 stable 时,toolchain action 可能不落地交叉目标的标准库,显式补装
+      - name: 确保目标标准库就位
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
