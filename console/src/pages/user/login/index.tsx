@@ -67,7 +67,9 @@ const useStyles = createStyles(({ token }) => ({
     alignItems: 'center',
     padding: '32px 24px',
     background: '#fff',
-    minWidth: 320,
+    // 不小于 LoginForm 固有最小宽(.ant-pro-form-login-main min 328 + 容器 padding 64),
+    // 窄窗口时压缩品牌区而不是压碎表单
+    minWidth: 400,
   },
   mobileBrand: {
     display: 'none',
@@ -80,8 +82,9 @@ const useStyles = createStyles(({ token }) => ({
     },
   },
   loginBox: {
+    // 流式宽度:伸缩交给组件自带的 328~580 自适应区间(margin auto 居中)。
+    // 不要用小于组件 min-width 的固定框钳制,否则右侧图标必然溢出裁切
     width: '100%',
-    maxWidth: 320,
   },
   loginFooter: {
     marginTop: 24,

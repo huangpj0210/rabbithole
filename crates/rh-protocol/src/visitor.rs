@@ -42,7 +42,8 @@ pub struct VisitorSpec {
     pub bind_port: u16,
     /// 目标代理名(全局唯一目标代理,由服务端解析归属客户端)。
     pub target_proxy_name: String,
-    /// 访问密钥;与目标代理 secret_key 匹配才允许中继。
+    /// 访问密钥;留空 = 继承目标代理当前密钥(推荐,单一事实源,规则轮换不失效);
+    /// 非空则须与目标代理一致(兼容旧部署显式双写)。
     #[serde(default)]
     pub secret_key: String,
     /// visitor 侧通道选项(压缩与代理级传输一致语义)。

@@ -1,7 +1,8 @@
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import HeaderPairsInput from '@/components/HeaderPairsInput';
 import type { HeaderPairValue } from '@/components/HeaderPairsInput';
-import { Checkbox, Collapse, Divider, Form, Input, InputNumber, Modal, Select } from 'antd';
+import { App, Button, Checkbox, Collapse, Divider, Form, Input, InputNumber, Modal, Select, Space } from 'antd';
+import { CopyOutlined, SyncOutlined } from '@ant-design/icons';
 import React, { useMemo, useState } from 'react';
 
 export type ProxyKind = 'http' | 'https' | 'sudp' | 'stcp' | 'tcp' | 'tcpmux' | 'udp' | 'xtcp';
@@ -120,6 +121,37 @@ function csv(v: unknown): string {
   return Array.isArray(v) ? (v as string[]).join(',') : '';
 }
 
+/** 密钥访问规则的凭据是随机值,不是人编的口令:默认预填 16 字节强随机(32 hex)。 */
+function genSecret(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** 复制到剪贴板;非安全上下文(纯 HTTP 部署)降级 execCommand。 */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fallthrough 到降级路径
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 /** 由编辑行/默认值推导整表 initialValues(每次打开重挂载,不依赖 setFieldsValue)。 */
 function initialValuesOf(
   clients: ClientRow[],
@@ -139,7 +171,8 @@ function initialValuesOf(
       target_port: 80,
       custom_domains: '',
       subdomain: '',
-      secret_key: '',
+      // 密钥访问规则默认预填强随机值;用户动作从"想一个密钥"变成"复制/换一个"
+      secret_key: defaultKind === 'stcp' || defaultKind === 'sudp' || defaultKind === 'xtcp' ? genSecret() : '',
       allow_users: '',
       use_compression: false,
       pool_size: 0,
@@ -257,6 +290,7 @@ const ProxyFormModal: React.FC<{
   open: boolean;
   submitting: boolean;
 }> = ({ open, editing, clients, kinds, defaultKind, onCancel, onFinish, submitting }) => {
+  const { message } = App.useApp();
   const [form] = Form.useForm<FormValues>();
   const [kind, setKind] = useState<ProxyKind>(defaultKind);
   const [pluginKind, setPluginKind] = useState<PluginKindOpt>('none');
@@ -696,8 +730,45 @@ const ProxyFormModal: React.FC<{
         )}
         {usesSecret && (
           <>
-            <Form.Item label="访问密钥" name="secret_key">
-              <Input placeholder="与访问器一致才允许中继" />
+            <Form.Item noStyle shouldUpdate={(prev, cur) => prev.secret_key !== cur.secret_key}>
+              {({ getFieldValue }) => {
+                const empty = !getFieldValue('secret_key');
+                return (
+                  <Form.Item
+                    extra={
+                      empty ? (
+                        <span style={{ color: '#cf1322' }}>
+                          留空 = 不校验密钥,任何客户端的访问器都能中继此规则(不推荐)
+                        </span>
+                      ) : (
+                        '已自动生成;「创建访问器」会自动继承,无需在访问器侧重复填写'
+                      )
+                    }
+                    label="访问密钥"
+                  >
+                    <Space.Compact style={{ width: '100%' }}>
+                      <Form.Item name="secret_key" noStyle>
+                        <Input autoComplete="off" placeholder="自动生成" />
+                      </Form.Item>
+                      <Button
+                        icon={<CopyOutlined />}
+                        onClick={async () => {
+                          const ok = await copyText(String(getFieldValue('secret_key') ?? ''));
+                          message[ok ? 'success' : 'error'](ok ? '密钥已复制' : '复制失败,请手动选择复制');
+                        }}
+                      >
+                        复制
+                      </Button>
+                      <Button
+                        icon={<SyncOutlined />}
+                        onClick={() => form.setFieldValue('secret_key', genSecret())}
+                      >
+                        换一个
+                      </Button>
+                    </Space.Compact>
+                  </Form.Item>
+                );
+              }}
             </Form.Item>
             <Form.Item extra="逗号分隔的客户端名;空 = 任意" label="允许访问方" name="allow_users">
               <Input placeholder="visitor-a,visitor-b" />

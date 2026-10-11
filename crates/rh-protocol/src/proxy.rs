@@ -318,6 +318,8 @@ pub struct HttpsProxyConfig {
 /// STCP/SUDP/XTCP 通用密钥访问配置。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretProxyConfig {
+    /// 访问密钥(密钥访问的唯一事实源,访问器留空即继承此值);
+    /// 空 = 不校验密钥,任何访问器都可中继(控制台会警示)。
     #[serde(default)]
     pub secret_key: String,
     /// 允许持有 visitor 的客户端名列表;空 = 任意。

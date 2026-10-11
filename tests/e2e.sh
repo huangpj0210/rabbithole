@@ -30,7 +30,7 @@ ECHO_TCP=18091; ECHO_UDP=18092; HTTP_ORIGIN=18093; HDR_PORT=18094
 P_TCP=18301; P_UDP=18302; P_COMP=18303; P_PPRO=18304; P_REFUSED=18305
 DEAD_PORT=18999  # 无监听端口(目标拒连测试)
 MM_PORT=18401; P_MM=18411   # 中间人端口 / multiplex=false 规则端口
-V_STCP=18310; V_SUDP=18311; V_XTCP=18312
+V_STCP=18310; V_SUDP=18311; V_XTCP=18312; V_STCP2=18313
 ADMIN_USER="admin"; ADMIN_PASS="E2e-pass-123"
 
 echo "== rabbithole E2E($WORK)=="
@@ -305,6 +305,22 @@ while True:
     if not d: break
     g += d
 sys.exit(0 if g == b"stcp\n" else 1)
+EOF
+
+# 访问器密钥留空 = 继承目标规则当前密钥(单一事实源,不再要求两侧手工同步)
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"sdb2\",\"kind\":\"stcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"stcp\":{\"secret_key\":\"sk2\"}}" >/dev/null
+mk_vis "{\"client_id\":\"$CID\",\"name\":\"sdb2-v\",\"kind\":\"stcp\",\"bind_port\":$V_STCP2,\"target_proxy_name\":\"sdb2\",\"enabled\":true}" >/dev/null
+sleep 2
+python3 - "$V_STCP2" <<'EOF' && ok "STCP 访问器密钥留空继承规则密钥" || bad "STCP 访问器密钥留空继承规则密钥"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+s.sendall(b"stcp-inherit\n"); s.shutdown(socket.SHUT_WR); s.settimeout(8)
+g = b""
+while True:
+    d = s.recv(4096)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"stcp-inherit\n" else 1)
 EOF
 
 # ---------- SUDP ----------

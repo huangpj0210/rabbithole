@@ -44,8 +44,10 @@ const ProxyListPage: React.FC<{
   /** 空态文案中的规则名词(默认取 title,再退回「转发规则」)。 */
   emptyNoun?: string;
   kinds: ProxyKind[];
+  /** 密钥访问页传入:行内「创建访问器」入口,把目标规则与类型带给访问器表单。 */
+  onCreateVisitor?: (row: ServiceRow) => void;
   title?: string;
-}> = ({ title, description, kinds, defaultKind, bare, emptyNoun }) => {
+}> = ({ title, description, kinds, defaultKind, bare, emptyNoun, onCreateVisitor }) => {
   const queryClient = useQueryClient();
   const { message } = App.useApp();
   const [modal, setModal] = useState<{ editing: null | ServiceRow; open: boolean }>({
@@ -314,12 +316,17 @@ const ProxyListPage: React.FC<{
     {
       title: '操作',
       key: 'action',
-      width: 140,
+      width: 200,
       render: (_, row: ServiceRow) => (
         <>
           <Button onClick={() => setModal({ open: true, editing: row })} size="small" type="link">
             编辑
           </Button>
+          {isSecret && onCreateVisitor && (
+            <Button onClick={() => onCreateVisitor(row)} size="small" type="link">
+              创建访问器
+            </Button>
+          )}
           <Popconfirm
             cancelText="取消"
             okButtonProps={{ danger: true }}

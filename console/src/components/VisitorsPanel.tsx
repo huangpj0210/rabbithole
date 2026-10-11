@@ -22,17 +22,28 @@ interface VisitorForm {
   bind_addr: string;
   bind_port: number | null;
   target_proxy_name: string;
-  secret_key: string;
   use_compression: boolean;
 }
 
-/** 密钥访问页「访问器」面板:STCP/SUDP/XTCP 访问端规则 CRUD(平移自 vben 版)。 */
-const VisitorsPanel: React.FC = () => {
+/** 从规则列表「创建访问器」带入的预填(目标规则 + 类型)。 */
+export interface VisitorSeed {
+  kind: 'stcp' | 'sudp' | 'xtcp';
+  target: string;
+}
+
+/** 密钥访问页「访问器」面板:STCP/SUDP/XTCP 访问端规则 CRUD。
+ *  密钥不在表单出现:访问器密钥留空 = 继承目标规则当前密钥(服务端连接时判定)。 */
+const VisitorsPanel: React.FC<{ seed?: VisitorSeed | null; onSeedUsed?: () => void }> = ({
+  seed,
+  onSeedUsed,
+}) => {
   const queryClient = useQueryClient();
   const { message } = App.useApp();
   const [modalOpen, setModalOpen] = useState(false);
   const [editId, setEditId] = useState<null | number>(null);
   const [form] = Form.useForm<VisitorForm>();
+  // 经 ref 读取一次性 seed,避免 seed 清空触发表单重置
+  const seedRef = React.useRef<VisitorSeed | null>(null);
 
   const visitorsQ = useQuery({ queryKey: ['visitors'], queryFn: () => listVisitors() });
   const clientsQ = useQuery({ queryKey: ['clients'], queryFn: listClients });
@@ -65,7 +76,6 @@ const VisitorsPanel: React.FC = () => {
         bind_addr: values.bind_addr,
         bind_port: values.bind_port ?? 0,
         target_proxy_name: values.target_proxy_name,
-        secret_key: values.secret_key ?? '',
         use_compression: !!values.use_compression,
         ...(id ? {} : { client_id: values.client_id }),
       };
@@ -93,6 +103,13 @@ const VisitorsPanel: React.FC = () => {
   });
 
   const editRow = editId ? rows.find((r) => r.id === editId) : null;
+  // 规则页「创建访问器」跳入:带目标与类型打开新建弹窗
+  useEffect(() => {
+    if (!seed) return;
+    seedRef.current = seed;
+    setEditId(null);
+    setModalOpen(true);
+  }, [seed]);
   useEffect(() => {
     if (!modalOpen) return;
     form.resetFields();
@@ -106,38 +123,33 @@ const VisitorsPanel: React.FC = () => {
           bind_addr: row.bind_addr,
           bind_port: row.bind_port,
           target_proxy_name: row.target_proxy_name,
-          secret_key: row.spec?.secret_key ?? '',
           use_compression: !!row.spec?.use_compression,
         });
       }
     } else {
+      const s = seedRef.current;
       form.setFieldsValue({
         client_id: clients[0]?.id ?? '',
         name: '',
-        kind: 'stcp',
+        kind: s?.kind ?? 'stcp',
         bind_addr: '127.0.0.1',
         bind_port: 6000,
-        target_proxy_name: '',
-        secret_key: '',
+        target_proxy_name: s?.target ?? '',
         use_compression: false,
       });
+      if (s) {
+        seedRef.current = null;
+        onSeedUsed?.();
+      }
     }
-  }, [modalOpen, editId, form, rows, clients]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modalOpen, editId]);
 
   const columns: ColumnsType<VisitorRow> = [
     { title: '名称', dataIndex: 'name', key: 'name', width: 140 },
     { title: '类型', dataIndex: 'kind', key: 'kind', width: 80, render: (v: string) => <Tag>{v.toUpperCase()}</Tag> },
-    { title: '本地监听', key: 'bind', width: 150, render: (_, row) => `${row.bind_addr}:${row.bind_port}` },
+    { title: '本地监听', key: 'bind', width: 150, render: (_, row) => <span className="rh-mono">{`${row.bind_addr}:${row.bind_port}`}</span> },
     { title: '目标代理', dataIndex: 'target_proxy_name', key: 'target' },
-    {
-      title: '密钥',
-      key: 'secret',
-      width: 110,
-      render: (_, row) => {
-        const k = row.spec?.secret_key;
-        return k ? <Tag color="purple">{`${String(k).slice(0, 6)}…`}</Tag> : '-';
-      },
-    },
     {
       title: '压缩',
       key: 'compress',
@@ -257,7 +269,7 @@ const VisitorsPanel: React.FC = () => {
             <InputNumber max={65535} min={1} precision={0} />
           </Form.Item>
           <Form.Item
-            extra="类型须与目标规则一致"
+            extra="类型须与目标规则一致;中继密钥自动继承目标规则,无需重复填写"
             label="目标代理名"
             name="target_proxy_name"
             rules={[{ required: true, message: '请选择目标代理' }]}
@@ -268,13 +280,6 @@ const VisitorsPanel: React.FC = () => {
               placeholder="选择目标规则"
               showSearch
             />
-          </Form.Item>
-          <Form.Item
-            extra={editId ? '留空则清除密钥' : undefined}
-            label="访问密钥"
-            name="secret_key"
-          >
-            <Input placeholder="与目标规则 secret_key 一致" />
           </Form.Item>
           <Form.Item label="压缩" name="use_compression" valuePropName="checked">
             <Checkbox>启用 snappy 压缩</Checkbox>

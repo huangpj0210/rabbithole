@@ -101,7 +101,13 @@ async fn secret_and_allow_ok(
     let Some(secret_cfg) = pspec.secret_cfg() else {
         return false;
     };
-    if !secret_cfg.secret_key.is_empty() && secret_cfg.secret_key != vspec.secret_key {
+    // 密钥单一事实源在规则侧:访问器密钥留空 = 继承目标规则当前密钥
+    // (访问器记录仅管理员可建,选了规则即视为授权,无需重复录入同一凭据;
+    // 规则轮换密钥也不会留下过期副本)。非空仍比对,兼容两侧显式双写的旧部署。
+    if !secret_cfg.secret_key.is_empty()
+        && !vspec.secret_key.is_empty()
+        && secret_cfg.secret_key != vspec.secret_key
+    {
         warn!(visitor = vspec.name, "visitor secret mismatch");
         return false;
     }
