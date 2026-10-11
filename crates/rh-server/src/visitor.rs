@@ -239,6 +239,7 @@ async fn relay_udp(
     };
     let st = state.clone();
     let vid = vspec.id;
+    let prt = state.proxies.get(pspec.id);
     tokio::spawn(async move {
         // 通道签发后 ≤15s 内必须到达;否则清理 relay 槽位避免死占
         let a = match tokio::time::timeout(Duration::from_secs(15), pr).await {
@@ -256,7 +257,15 @@ async fn relay_udp(
             }
         };
         let mut a = a;
-        let mut b = crate::data::CountedUserIo::new(b, st.metrics.clone());
+        // 计量归因到目标代理(visitor 流量按目标归属,design-parity 决策 3)
+        let _conn_guard = match crate::data::try_open_user_conn(&st, prt.as_ref()) {
+            Some(g) => g,
+            None => {
+                st.udp_relays.lock().await.remove(&vid);
+                return;
+            }
+        };
+        let mut b = crate::data::CountedUserIo::user(b, &st, prt);
         let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
         st.udp_relays.lock().await.remove(&vid);
     });
@@ -365,10 +374,15 @@ async fn splice_relay(
     proxy_stream: BoxedIo,
     visitor_stream: BoxedIo,
 ) {
-    let _ = (&pspec, src_addr);
+    let _ = src_addr;
     let mut a = proxy_stream;
-    // 计量取 visitor 侧(用户侧口径,与 tcp/vhost 一致)
-    let mut b = crate::data::CountedUserIo::new(visitor_stream, state.metrics.clone());
+    // 计量取 visitor 侧(用户口径),归因到目标代理(design-parity 决策 3)
+    let rt = state.proxies.get(pspec.id);
+    let _conn_guard = match crate::data::try_open_user_conn(&state, rt.as_ref()) {
+        Some(g) => g,
+        None => return, // F2 配额超限:中继不建立
+    };
+    let mut b = crate::data::CountedUserIo::user(visitor_stream, &state, rt);
     let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
 }
 

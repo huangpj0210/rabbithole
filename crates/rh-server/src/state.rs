@@ -13,7 +13,7 @@ use rh_protocol::{
 use rh_transport::BoxedIo;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::{TcpListener, UdpSocket};
@@ -45,6 +45,136 @@ pub struct AppState {
     pub web_jwt_secret: Arc<Mutex<Option<String>>>,
     /// 每 IP 认证中并发连接数(控制面未认证窗口)。
     unauth_conns: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
+    /// 热生效配置子集(网页可管:端口策略/日志级别/SSH 网关)。
+    pub hot: Arc<RwLock<HotConfig>>,
+    /// F2 每客户端用量/配额缓存。
+    pub client_usage: Arc<dashmap::DashMap<String, Arc<ClientUsage>>>,
+    /// M3 服务端终结证书(SNI 匹配;certs 表变更后整体重建)。
+    pub certs: Arc<RwLock<Vec<Arc<CertEntry>>>>,
+    /// SSH 网关配置变更通知(supervisor 据此热启停监听)。
+    pub ssh_watch: (
+        tokio::sync::watch::Sender<u64>,
+        Arc<tokio::sync::watch::Receiver<u64>>,
+    ),
+}
+
+/// 网页可管且即时生效的配置子集;其余字段改动标记需重启。
+#[derive(Debug, Clone)]
+pub struct HotConfig {
+    pub allow_ports: Vec<String>,
+    pub max_services_per_client: usize,
+    pub log_level: String,
+    pub ssh_gateway: crate::config::SshGatewayConfig,
+}
+
+impl HotConfig {
+    pub fn from_cfg(cfg: &ServerConfig) -> Self {
+        Self {
+            allow_ports: cfg.ports.allow_ports.clone(),
+            max_services_per_client: cfg.ports.max_services_per_client,
+            log_level: cfg.log.level.clone(),
+            ssh_gateway: cfg.ssh_gateway.clone(),
+        }
+    }
+
+    pub fn port_allow_list(&self) -> PortAllowList {
+        PortAllowList {
+            ranges: self
+                .allow_ports
+                .iter()
+                .filter_map(|s| PortsRange::parse(s))
+                .collect(),
+        }
+    }
+}
+
+/// M3 服务端终结证书(预构建 rustls 配置,按 SNI 精确/通配匹配)。
+pub struct CertEntry {
+    pub domains: Vec<String>,
+    pub cfg: Arc<rustls::ServerConfig>,
+}
+
+impl CertEntry {
+    /// 域名匹配:精确或单层通配(*.example.com 覆盖 sub.example.com)。
+    pub fn matches(&self, sni: &str) -> bool {
+        let sni = sni.to_lowercase();
+        self.domains.iter().any(|d| {
+            let d = d.to_lowercase();
+            if let Some(suffix) = d.strip_prefix("*.") {
+                sni.ends_with(&format!(".{suffix}"))
+                    && sni.len() > suffix.len() + 1
+                    && !sni[..sni.len() - suffix.len() - 1].contains('.')
+            } else {
+                d == sni
+            }
+        })
+    }
+}
+
+/// F2 每客户端配额(DB 为准,内存缓存;API 改动即刷新)。
+#[derive(Debug, Clone, Default)]
+pub struct ClientQuota {
+    pub rate_limit: String,
+    pub max_conns: i64,
+    pub flow_limit: i64,
+}
+
+/// 每客户端运行用量(进程内存量,重启归零)。
+pub struct ClientUsage {
+    pub conns: AtomicI64,
+    pub bytes: AtomicU64,
+    /// 流量上限击穿标记(置位后相关连接在下一轮 IO 即关)。
+    pub flow_cut: AtomicBool,
+    pub quota: std::sync::RwLock<ClientQuota>,
+    /// 服务端侧客户端级限速桶(随 rate_limit 重建)。
+    pub rate_bucket: std::sync::RwLock<Option<Arc<rh_core::TokenBucket>>>,
+}
+
+impl Default for ClientUsage {
+    fn default() -> Self {
+        Self {
+            conns: AtomicI64::new(0),
+            bytes: AtomicU64::new(0),
+            flow_cut: AtomicBool::new(false),
+            quota: std::sync::RwLock::new(ClientQuota::default()),
+            rate_bucket: std::sync::RwLock::new(None),
+        }
+    }
+}
+
+impl ClientUsage {
+    /// 应用新配额;rate_limit 变化时重建限速桶。
+    pub fn set_quota(&self, q: ClientQuota) {
+        let mut cur = self.quota.write().unwrap();
+        if cur.rate_limit != q.rate_limit {
+            let bucket = rh_core::BandwidthQuantity::parse(&q.rate_limit)
+                .map(|b| Arc::new(rh_core::TokenBucket::new(b.bytes_per_sec() as f64)));
+            *self.rate_bucket.write().unwrap() = bucket;
+        }
+        if q.flow_limit == 0 {
+            self.flow_cut
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        *cur = q;
+    }
+
+    /// 字节计量 + 流量上限判定。
+    pub fn add_bytes(&self, n: u64) {
+        let total = self
+            .bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
+            + n;
+        let limit = self.quota.read().unwrap().flow_limit;
+        if limit > 0 && total >= limit as u64 {
+            self.flow_cut
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 服务端侧限速桶(无配置返回 None)。
+    pub fn bucket(&self) -> Option<Arc<rh_core::TokenBucket>> {
+        self.rate_bucket.read().unwrap().clone()
+    }
 }
 
 impl Clone for AppState {
@@ -65,16 +195,75 @@ impl Clone for AppState {
             login_limiter: self.login_limiter.clone(),
             web_jwt_secret: self.web_jwt_secret.clone(),
             unauth_conns: self.unauth_conns.clone(),
+            hot: self.hot.clone(),
+            client_usage: self.client_usage.clone(),
+            certs: self.certs.clone(),
+            ssh_watch: (self.ssh_watch.0.clone(), self.ssh_watch.1.clone()),
         }
     }
 }
 
 impl AppState {
+    /// 取(或建)客户端用量条目。
+    pub fn client_usage(&self, id: &str) -> Arc<ClientUsage> {
+        self.client_usage
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(ClientUsage::default()))
+            .clone()
+    }
+
+    /// M3:从 certs 表重建服务端终结证书集(启动与证书 CRUD 后调用)。
+    /// 解析失败的行跳过并告警(不阻塞其余证书)。
+    pub async fn rebuild_certs(&self) {
+        let mut out = Vec::new();
+        if let Ok(rows) = self.db.list_certs().await {
+            for c in rows {
+                match crate::vhost::build_cert_entry(&c.cert_pem, &c.key_pem) {
+                    Ok((domains, fingerprint, not_after, cfg)) => {
+                        let mut doms: Vec<String> =
+                            serde_json::from_str(&c.domains).unwrap_or_default();
+                        if doms.is_empty() {
+                            doms = domains;
+                        }
+                        let _ = (fingerprint, not_after); // 由 /api/certs 从 DB 读取展示
+                        out.push(Arc::new(CertEntry {
+                            domains: doms,
+                            cfg: Arc::new(cfg),
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(cert = %c.name, error = %e, "certs: skip bad pem");
+                    }
+                }
+            }
+        }
+        *self.certs.write().await = out;
+    }
+
+    /// 从 DB 刷新全部客户端配额缓存(启动与客户端 CRUD 后调用)。
+    pub async fn refresh_client_quotas(&self) {
+        if let Ok(rows) = self.db.list_clients().await {
+            let live: std::collections::HashSet<&str> =
+                rows.iter().map(|c| c.id.as_str()).collect();
+            for c in &rows {
+                self.client_usage(&c.id).set_quota(ClientQuota {
+                    rate_limit: c.rate_limit.clone(),
+                    max_conns: c.max_conns,
+                    flow_limit: c.flow_limit,
+                });
+            }
+            // 清理已删客户端的残留条目
+            self.client_usage.retain(|k, _| live.contains(k.as_str()));
+        }
+    }
+
     pub fn new(cfg: ServerConfig, db: Db) -> Self {
         let events = EventBus::new(db.clone());
         let metrics = Arc::new(Metrics::new());
         let cfg = Arc::new(cfg);
-        let proxies = Arc::new(ProxyManager::new(cfg.clone()));
+        let hot = Arc::new(RwLock::new(HotConfig::from_cfg(&cfg)));
+        let proxies = Arc::new(ProxyManager::new(cfg.clone(), hot.clone()));
+        let (ssh_tx, ssh_rx) = tokio::sync::watch::channel(0u64);
         let jwt_secret = cfg
             .web
             .jwt_secret
@@ -92,6 +281,10 @@ impl AppState {
             client_locks: Arc::new(dashmap::DashMap::new()),
             metrics,
             shutdown: CancellationToken::new(),
+            hot,
+            client_usage: Arc::new(dashmap::DashMap::new()),
+            certs: Arc::new(RwLock::new(Vec::new())),
+            ssh_watch: (ssh_tx, Arc::new(ssh_rx)),
             relay_pairs: Arc::new(Mutex::new(HashMap::new())),
             udp_relays: Arc::new(Mutex::new(std::collections::HashSet::new())),
             nathole: Arc::new(crate::nathole::NatCoordinator::new()),
@@ -285,6 +478,12 @@ pub struct ProxyRuntime {
     pub pool: Mutex<Option<Arc<TcpPool>>>,
     /// UDP pump 通道投递。
     pub udp_new_channel_tx: Mutex<Option<tokio::sync::mpsc::Sender<BoxedIo>>>,
+    /// F1 分规则计量(用户侧口径;进程内存量,重启归零)。
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+    pub conns_current: AtomicI64,
+    /// M2 HTTP 静态缓存(仅 http 规则使用)。
+    pub http_cache: std::sync::Mutex<HttpCache>,
 }
 
 impl ProxyRuntime {
@@ -300,6 +499,10 @@ impl ProxyRuntime {
             healthy: AtomicBool::new(true),
             bound: AtomicBool::new(false),
             rule_cancel: CancellationToken::new(),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            conns_current: AtomicI64::new(0),
+            http_cache: std::sync::Mutex::new(HttpCache::default()),
             tcp_listener: Mutex::new(None),
             udp_socket: Mutex::new(None),
             pool: Mutex::new(None),
@@ -357,6 +560,8 @@ pub struct ProxyManager {
     pub vhost_http: RwLock<Vec<VhostRoute>>,
     pub vhost_https: RwLock<Vec<VhostRoute>>,
     pub vhost_tcpmux: RwLock<Vec<VhostRoute>>,
+    /// 热生效端口策略(网页可改,与 AppState.hot 同源)。
+    pub hot: Arc<RwLock<HotConfig>>,
 }
 
 #[derive(Clone)]
@@ -369,12 +574,81 @@ pub struct VhostRoute {
     pub request_headers: rh_protocol::HeaderOp,
     pub response_headers: rh_protocol::HeaderOp,
     pub proxy_id: u64,
+    /// M2:域名命中但路径未命中 locations 时的自定义 404。
+    pub not_found_html: String,
+    /// M2:静态缓存配置(仅 http 路由)。
+    pub cache: Option<rh_protocol::CacheConfig>,
+}
+
+/// M2 HTTP 静态缓存(每规则一份;std::Mutex 短临界区,不跨 await)。
+#[derive(Clone)]
+pub struct HttpCacheEntry {
+    pub expires: std::time::Instant,
+    pub status: u16,
+    pub content_type: String,
+    pub body: std::sync::Arc<[u8]>,
+}
+
+#[derive(Default)]
+pub struct HttpCache {
+    pub map: std::collections::HashMap<String, HttpCacheEntry>,
+    pub bytes: usize,
+}
+
+impl HttpCache {
+    pub fn get(&mut self, key: &str) -> Option<HttpCacheEntry> {
+        let expired = self
+            .map
+            .get(key)
+            .map(|e| e.expires < std::time::Instant::now())
+            .unwrap_or(true);
+        if expired {
+            if let Some(e) = self.map.remove(key) {
+                self.bytes = self.bytes.saturating_sub(e.body.len());
+            }
+            return None;
+        }
+        self.map.get(key).cloned()
+    }
+
+    /// 插入(容量不足时先清过期再逐出任意项);超过单项上限或总容量则放弃。
+    pub fn put(&mut self, key: String, entry: HttpCacheEntry, max_bytes: usize) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        let len = entry.body.len();
+        if len > max_bytes {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.map.retain(|_, e| {
+            if e.expires < now {
+                self.bytes = self.bytes.saturating_sub(e.body.len());
+                return false;
+            }
+            true
+        });
+        while self.bytes + len > max_bytes {
+            let k = self.map.keys().next().cloned();
+            match k {
+                Some(k) => {
+                    if let Some(e) = self.map.remove(&k) {
+                        self.bytes = self.bytes.saturating_sub(e.body.len());
+                    }
+                }
+                None => break,
+            }
+        }
+        self.bytes += len;
+        self.map.insert(key, entry);
+    }
 }
 
 impl ProxyManager {
-    pub fn new(cfg: Arc<ServerConfig>) -> Self {
+    pub fn new(cfg: Arc<ServerConfig>, hot: Arc<RwLock<HotConfig>>) -> Self {
         Self {
             cfg,
+            hot,
             runtimes: dashmap::DashMap::new(),
             groups: dashmap::DashMap::new(),
             vhost_http: RwLock::new(Vec::new()),
@@ -444,24 +718,15 @@ impl ProxyManager {
         false
     }
 
-    /// 白名单校验。
-    pub fn port_allowed(&self, port: u16) -> bool {
-        let allow = PortAllowList {
-            ranges: self
-                .cfg
-                .allow_ports()
-                .into_iter()
-                .collect::<Vec<PortsRange>>(),
-        };
-        allow.allows(port)
+    /// 白名单校验(读热配置,网页改动即时生效)。
+    pub async fn port_allowed(&self, port: u16) -> bool {
+        self.hot.read().await.port_allow_list().allows(port)
     }
 
     /// 从自动分配范围挑选空闲端口(白名单 + 运行时冲突 + OS 探测)。
     pub async fn allocate_port(&self, proto: &str, bind_ip: IpAddr) -> Option<u16> {
         let ranges: Vec<PortsRange> = self.cfg.auto_port_ranges();
-        let allow = PortAllowList {
-            ranges: self.cfg.allow_ports(),
-        };
+        let allow = self.hot.read().await.port_allow_list();
         for r in ranges {
             for p in r.start..=r.end {
                 if !allow.allows(p) {
@@ -566,6 +831,8 @@ impl ProxyManager {
                             request_headers: Default::default(),
                             response_headers: Default::default(),
                             proxy_id: rt.id,
+                            not_found_html: String::new(),
+                            cache: None,
                         });
                     }
                     if !c.subdomain.is_empty() && !subdomain_host.is_empty() {
@@ -578,6 +845,8 @@ impl ProxyManager {
                             request_headers: Default::default(),
                             response_headers: Default::default(),
                             proxy_id: rt.id,
+                            not_found_html: String::new(),
+                            cache: None,
                         });
                     }
                 }
@@ -593,6 +862,8 @@ impl ProxyManager {
                             request_headers: Default::default(),
                             response_headers: Default::default(),
                             proxy_id: rt.id,
+                            not_found_html: String::new(),
+                            cache: None,
                         });
                     }
                 }
@@ -620,6 +891,8 @@ fn route_from(
         request_headers: c.request_headers.clone(),
         response_headers: c.response_headers.clone(),
         proxy_id: rt.id,
+        not_found_html: c.not_found_html.clone(),
+        cache: c.cache.clone(),
     }
 }
 

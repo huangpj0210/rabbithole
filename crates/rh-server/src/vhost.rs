@@ -33,6 +33,8 @@ async fn serve_http(state: Arc<AppState>, sock: TcpStream, peer: SocketAddr) -> 
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
 
+    // 连接级计数(一条连接可服务多个请求/规则,规则归因在请求通道侧)
+    let _conn_guard = crate::data::try_open_user_conn(&state, None);
     let st = state.clone();
     let mut builder = http1::Builder::new();
     // 头部读取超时(防 slowloris 未认证挂连接);0 = 不启用
@@ -71,6 +73,7 @@ async fn handle_http_request(
     req: hyper::Request<hyper::body::Incoming>,
     peer: SocketAddr,
 ) -> anyhow::Result<hyper::Response<BoxBody>> {
+    let method = req.method().clone();
     let host = req
         .headers()
         .get(hyper::header::HOST)
@@ -85,9 +88,13 @@ async fn handle_http_request(
     // 路由:域名 + locations 前缀(最长匹配)
     let routes = state.proxies.vhost_http.read().await.clone();
     let mut best: Option<(&VhostRoute, usize)> = None;
+    let mut domain_hit: Option<&VhostRoute> = None;
     for r in &routes {
         if r.host != host {
             continue;
+        }
+        if domain_hit.is_none() {
+            domain_hit = Some(r);
         }
         if r.locations.is_empty() {
             if best.map(|(_, l)| l == 0).unwrap_or(true) && best.is_none() {
@@ -107,6 +114,12 @@ async fn handle_http_request(
         }
     }
     let Some((route, _)) = best else {
+        // M2:域名命中但路径未命中该规则 locations → 规则级自定义 404
+        if let Some(r) = domain_hit {
+            if !r.not_found_html.is_empty() {
+                return Ok(custom_404(&r.not_found_html));
+            }
+        }
         return Ok(not_found_response(&state));
     };
     // Basic 认证
@@ -127,10 +140,29 @@ async fn handle_http_request(
             return Ok(resp);
         }
     }
+    // M2:GET + 扩展名匹配 → 先查静态缓存(命中不走上游)
+    let cache_cfg = route.cache.clone();
+    let cacheable = method == hyper::Method::GET
+        && cache_cfg
+            .as_ref()
+            .map(|c| ext_cached(&path, &c.extensions))
+            .unwrap_or(false);
     // 上游通道(先组选路再取通道:通道属主须与 START_FORWARD 目标一致)
     let Some(rt) = state.proxies.get(route.proxy_id) else {
         return Ok(not_found_response(&state));
     };
+    if cache_cfg.is_some() && cacheable {
+        {
+            if let Some(hit) = rt.http_cache.lock().unwrap().get(&path) {
+                let resp = hyper::Response::builder()
+                    .status(hit.status)
+                    .header("content-type", hit.content_type.clone())
+                    .header("x-cache", "HIT")
+                    .body(full_body_body(hyper::body::Bytes::from(hit.body.to_vec())))?;
+                return Ok(resp);
+            }
+        }
+    }
     let rt = crate::data::group_pick_public(&state, &rt)
         .await
         .unwrap_or(rt);
@@ -187,14 +219,65 @@ async fn handle_http_request(
         channel
     };
 
-    // 上游即普通 HTTP/1.1 连接:用 hyper client 桥接
-    let upstream = hyper_util::rt::TokioIo::new(channel);
+    // 上游即普通 HTTP/1.1 连接:用 hyper client 桥接;
+    // 通道侧反向计量归因到该规则(read=响应→出站,write=请求→入站)
+    let upstream = hyper_util::rt::TokioIo::new(crate::data::CountedUserIo::upstream(
+        channel,
+        &state,
+        Some(rt.clone()),
+    ));
     let resp = hyper::client::conn::http1::handshake(upstream).await?;
     let (mut sender, conn) = resp;
     tokio::spawn(async move {
         let _ = conn.with_upgrades().await;
     });
     let resp = sender.send_request(upstream_req).await?;
+    // M2:可缓存(GET + 扩展匹配 + 200)→ 完整读回并落缓存(受单项上限约束)
+    if let Some(cfg) = &cache_cfg {
+        if cacheable && resp.status() == 200 {
+            use http_body_util::BodyExt as _;
+            let (up_parts, up_body) = resp.into_parts();
+            let collected = match up_body.collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(_) => return Ok(service_unavailable()),
+            };
+            let ct = up_parts
+                .headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            if collected.len() as u64 > cfg.max_item_size_kb * 1024 {
+                // 超单项上限:不缓存,原样回给用户
+                let resp: hyper::Response<BoxBody> =
+                    hyper::Response::from_parts(up_parts, full_body_body(collected.clone()));
+                return Ok(resp);
+            }
+            let entry = crate::state::HttpCacheEntry {
+                expires: std::time::Instant::now()
+                    + std::time::Duration::from_secs(cfg.ttl_seconds.max(1)),
+                status: 200,
+                content_type: ct.clone(),
+                body: collected.to_vec().into(),
+            };
+            rt.http_cache.lock().unwrap().put(
+                path.clone(),
+                entry,
+                (cfg.max_size_mb.max(1) * 1024 * 1024) as usize,
+            );
+            let mut b = hyper::Response::builder()
+                .status(200)
+                .header("content-type", ct)
+                .header("x-cache", "MISS");
+            for (n, v) in up_parts.headers.iter() {
+                if n != hyper::header::CONTENT_TYPE {
+                    b = b.header(n.clone(), v.clone());
+                }
+            }
+            let resp: hyper::Response<BoxBody> = b.body(full_body_body(collected))?;
+            return Ok(resp);
+        }
+    }
     let resp: hyper::Response<BoxBody> = resp
         .map(|b| b.map_err(std::io::Error::other))
         .map(|b| b.boxed());
@@ -223,6 +306,36 @@ fn check_basic_auth(header: Option<&str>, user: &str, pass: &str) -> bool {
     let decoded = base64_decode(b64).unwrap_or_default();
     let expect = format!("{user}:{pass}");
     rh_transport::constant_time_eq(&decoded, expect.as_bytes())
+}
+
+/// M2:规则级自定义 404(HTML 全文)。
+fn custom_404(html: &str) -> hyper::Response<BoxBody> {
+    hyper::Response::builder()
+        .status(404)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(full_body_body(hyper::body::Bytes::from(html.to_owned())))
+        .unwrap()
+}
+
+/// Full 构造(BoxBody<Bytes, io::Error>)。
+fn full_body_body(b: hyper::body::Bytes) -> BoxBody {
+    http_body_util::Full::new(b)
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+/// 路径扩展名是否在缓存白名单(忽略大小写与前导点)。
+fn ext_cached(path: &str, extensions: &[String]) -> bool {
+    let Some(dot) = path.rfind('.') else {
+        return false;
+    };
+    if path[dot..].contains('/') {
+        return false;
+    }
+    let ext = path[dot + 1..].to_lowercase();
+    extensions
+        .iter()
+        .any(|e| e.trim().trim_start_matches('.').to_lowercase() == ext)
 }
 
 fn not_found_response(state: &Arc<AppState>) -> hyper::Response<BoxBody> {
@@ -296,6 +409,59 @@ pub async fn https_vhost_serve(state: Arc<AppState>, listener: tokio::net::TcpLi
     }
 }
 
+/// M3:解析 PEM 证书/私钥 → (SAN+CN 域名, 指纹, not_after ms, rustls 配置)。
+/// 构建即校验证书链与私钥配对(不匹配直接报错)。
+pub fn build_cert_entry(
+    cert_pem: &str,
+    key_pem: &str,
+) -> anyhow::Result<(Vec<String>, String, i64, rustls::ServerConfig)> {
+    let mut certs: Vec<rustls_pki_types::CertificateDer<'static>> = Vec::new();
+    for r in rustls_pemfile::certs(&mut cert_pem.as_bytes()) {
+        certs.push(r?);
+    }
+    if certs.is_empty() {
+        anyhow::bail!("证书 PEM 中无 CERTIFICATE 块");
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
+        .ok_or_else(|| anyhow::anyhow!("私钥 PEM 中无 PRIVATE KEY 块"))?;
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key)
+        .map_err(|e| anyhow::anyhow!("证书/私钥不匹配或非法:{e}"))?;
+    // DER 解析:SAN/CN + 有效期
+    let der = certs[0].as_ref();
+    let (_, cert) = x509_parser::parse_x509_certificate(der)?;
+    let mut domains: Vec<String> = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for gn in &san.value.general_names {
+            if let x509_parser::extensions::GeneralName::DNSName(d) = gn {
+                domains.push(d.to_string());
+            }
+        }
+    }
+    if let Some(cn) = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|a| a.as_str().ok())
+    {
+        if !domains.iter().any(|d| d == cn) {
+            domains.push(cn.to_string());
+        }
+    }
+    let not_after_sec = cert.validity().not_after.timestamp();
+    let not_after_ms = not_after_sec * 1000;
+    let fp = hex_short(&<sha2::Sha256 as sha2::Digest>::digest(der));
+    Ok((domains, fp, not_after_ms, cfg))
+}
+
+fn hex_short(bytes: &[u8]) -> String {
+    bytes[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
 async fn serve_https(
     state: Arc<AppState>,
     sock: TcpStream,
@@ -310,6 +476,45 @@ async fn serve_https(
             return Ok(());
         }
     };
+    // M3:证书表命中该域名 → 服务端终结 TLS,明文 HTTP 走 vhost http 路由;
+    // 未命中 → 维持原 passthrough 语义(端到端 TLS 到客户端)
+    {
+        let certs = state.certs.read().await;
+        if let Some(entry) = certs.iter().find(|c| c.matches(&sni)) {
+            let acceptor = tokio_rustls::TlsAcceptor::from(entry.cfg.clone());
+            let stream = match acceptor.accept(sock).await {
+                Ok(s) => s,
+                Err(_) => return Ok(()),
+            };
+            let st = state.clone();
+            let _conn_guard = crate::data::try_open_user_conn(&st, None);
+            use hyper::server::conn::http1;
+            use hyper::service::service_fn;
+            let mut builder = http1::Builder::new();
+            let header_to = st.cfg.vhost.http_timeout_s;
+            if header_to > 0 {
+                builder.header_read_timeout(Some(std::time::Duration::from_secs(header_to)));
+            }
+            let conn = builder
+                .timer(hyper_util::rt::TokioTimer::new())
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(crate::data::CountedUserIo::user(
+                        stream, &st, None,
+                    )),
+                    service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let st = st.clone();
+                        let peer = peer;
+                        async move {
+                            handle_http_request(st, req, peer)
+                                .await
+                                .map_err(|_e| std::io::Error::other("vhost error"))
+                        }
+                    }),
+                );
+            conn.await?;
+            return Ok(());
+        }
+    }
     let routes = state.proxies.vhost_https.read().await.clone();
     let route = routes.iter().find(|r| r.host == sni);
     let Some(route) = route else {
@@ -337,7 +542,10 @@ async fn serve_https(
         channel
     };
     let mut channel = channel;
-    let mut sock = crate::data::CountedUserIo::new(sock, state.metrics.clone());
+    let Some(_conn_guard) = crate::data::try_open_user_conn(&state, Some(&rt)) else {
+        return Ok(()); // F2 配额超限
+    };
+    let mut sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
     let _ = tokio::io::copy_bidirectional(&mut sock, &mut channel).await;
     Ok(())
 }
@@ -568,7 +776,10 @@ async fn serve_tcpmux(
         if !tail.is_empty() && channel.write_all(&tail).await.is_err() {
             return Ok(());
         }
-        let mut sock = crate::data::CountedUserIo::new(sock, state.metrics.clone());
+        let Some(_conn_guard) = crate::data::try_open_user_conn(&state, Some(&rt)) else {
+            return Ok(()); // F2 配额超限
+        };
+        let mut sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
         let _ = tokio::io::copy_bidirectional(&mut sock, &mut channel).await;
         return Ok(());
     }
@@ -599,7 +810,11 @@ async fn serve_tcpmux(
                     return;
                 };
                 let mut ch = ch;
-                let mut stream = crate::data::CountedUserIo::new(stream, st2.metrics.clone());
+                let _conn_guard = match crate::data::try_open_user_conn(&st2, Some(&rt2)) {
+                    Some(g) => g,
+                    None => return, // F2 配额超限
+                };
+                let mut stream = crate::data::CountedUserIo::user(stream, &st2, Some(rt2.clone()));
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut ch).await;
             }
         });

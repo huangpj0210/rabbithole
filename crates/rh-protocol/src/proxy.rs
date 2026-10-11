@@ -288,6 +288,23 @@ pub struct HttpProxyConfig {
     /// 按终端用户(经 PROXY protocol 传入)二级路由;空 = 不启用。
     #[serde(default)]
     pub route_by_http_user: String,
+    /// M2:请求未命中 locations 时的自定义 404 页(HTML;空 = 全局行为)。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub not_found_html: String,
+    /// M2:HTTP 静态资源缓存。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
+}
+
+/// M2 静态缓存配置(vhost 服务端执行)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheConfig {
+    pub ttl_seconds: u64,
+    pub max_size_mb: u64,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub max_item_size_kb: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +536,8 @@ mod tests {
                 request_headers: Default::default(),
                 response_headers: Default::default(),
                 route_by_http_user: String::new(),
+                not_found_html: String::new(),
+                cache: None,
             }),
             https: None,
             stcp: None,

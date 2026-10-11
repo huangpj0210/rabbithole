@@ -48,10 +48,24 @@ enum AdminAction {
     Create { username: String, password: String },
 }
 
+/// 日志级别热切换出口(网页设置页即时生效);启动时经 init_tracing 注入。
+pub type SetLevelFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
+pub static LOG_SET_LEVEL: std::sync::OnceLock<SetLevelFn> = std::sync::OnceLock::new();
+
 fn init_tracing(cfg: &config::ServerConfig) {
+    use tracing_subscriber::layer::SubscriberExt;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log.level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    let subscriber = tracing_subscriber::fmt().finish().with(filter);
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    let set = move |level: &str| -> bool {
+        match tracing_subscriber::EnvFilter::try_new(level) {
+            Ok(f) => handle.modify(|cur| *cur = f).is_ok(),
+            Err(_) => false,
+        }
+    };
+    let _ = LOG_SET_LEVEL.set(Box::new(set));
 }
 
 /// 首次启动引导:users 表为空时创建 admin 账号与随机密码。
@@ -233,15 +247,15 @@ async fn main() -> anyhow::Result<()> {
         let pt = cfg.vhost.tcpmux_passthrough;
         tokio::spawn(vhost::tcpmux_serve(state.clone(), l, pt));
     }
-    // SSH Tunnel Gateway
-    if cfg.ssh_gateway.enabled {
-        let key_dir = cfg
-            .ssh_gateway
-            .auto_gen_key_dir
-            .clone()
-            .unwrap_or_else(|| db_dir.join("certs"));
-        let gw = sshgateway::SshGateway::new(state.clone(), key_dir);
-        tokio::spawn(gw.serve());
+    // F2:加载客户端配额缓存;M3:加载证书表
+    state.refresh_client_quotas().await;
+    state.rebuild_certs().await;
+    // SSH Tunnel Gateway(supervisor 常驻,跟随热配置启停)
+    {
+        let st = state.clone();
+        let watch = (*st.ssh_watch.1).clone();
+        let shutdown = st.shutdown.clone();
+        tokio::spawn(sshgateway::supervisor(st, watch, shutdown));
     }
     // 管理 API
     let mut app = api::router(state.clone());

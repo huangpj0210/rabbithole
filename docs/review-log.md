@@ -576,3 +576,47 @@ vhost 10/10、plugins 15/15、transports 12/12、xtcp 9/9(计 130 项)。
 /api/stats/overview bytes_in/out 必须 > 0),57/57;全套 131 项复跑全绿
 (vhost 10 / plugins 15 / transports 12 / xtcp 9 / resilience 19 / embed 9);
 fmt/clippy 0 警告、test 42/42。
+
+## R21(2026-10-11)管理面功能补全(F1 完整口径/F2 配额/M2/M3/服务器配置,用户指令"补全所有应该有但没有的管理页面的功能")
+
+一次补齐控制台全部"表单在、后端空"的降级项与缺失管理面:
+
+- **A 服务器配置(网页管理,热生效)**:GET/PUT /api/server/config(GET 脱敏不回
+  jwt_secret)。热生效子集:ports.allow_ports / max_services_per_client、log.level
+  (tracing reload 热切)、ssh_gateway 全项(supervisor 常驻,配置变更即热启停监听)、
+  authorized_keys(读写文件,未配置路径时默认 <配置目录>/authorized_keys)。
+  保存后合并写回 toml(原文件备份 .bak 一次,注释会丢失;写回失败仅告警不回滚运行态)。
+  port_allowed/allocate_port 改读 HotConfig;其余字段(vhost 端口/主监听/web)仍需重启。
+- **B F1 分实体计量**:ProxyRuntime 增 bytes_in/out + conns_current 原子计数,
+  CountedUserIo 全部七个入口同步累计(tcp/http/https/tcpmux×2/visitor×2/udp),
+  http vhost 因连接多路复用改在请求通道侧反向归因;list_services 回规则级字段、
+  list_clients 回该客户端全部规则聚合 —— 控制台对应列自动点亮(此前空壳)。
+  进程内存量,重启归零(持久化仍未做,DB 迁移路径已在 design-parity 记录)。
+- **C F2 客户端配额**:迁移 0002(clients 增 rate_limit/max_conns/max_services/
+  flow_limit 列);创建/更新接口收配额并校验(rate 用 BandwidthQuantity 解析);
+  执行点:max_services 覆盖全局默认(create 串行域内计数)、max_conns 与 flow_limit
+  在用户连接准入(try_open_user_conn,超限即断)、flow 超限置 flow_cut 位后
+  CountedUserIo 下一轮 IO 即断连、rate_limit 在 copy_limited 与规则级限速叠加
+  (仅 TCP 族;vhost/UDP 限速不执行,已知限制)。ClientUsage 配额缓存随 CRUD 刷新。
+- **D M2 域名增强**:HttpProxyConfig 增 not_found_html + cache(CacheConfig);
+  vhost 路由域名命中而路径未命中 locations → 规则级自定义 404;静态缓存按
+  (GET+扩展名白名单+200+单项 KB 上限)整读落缓存,容量上限内逐出,X-Cache: MISS/HIT。
+- **E M3 证书管理**:迁移 0003(certs 表);/api/certs CRUD(PEM 解析校验证书链与
+  私钥配对、SAN/CN 自动提取域名、sha256 指纹、not_after;key_pem 任何响应不回显);
+  state.certs 预构建 rustls 配置,SNI 命中(精确/单层通配)→ 服务端终结 TLS 并走
+  vhost http 路由,未命中维持原 passthrough(端到端 TLS 到客户端)。
+- **F 控制台**:设置页新增「服务器配置」区(SSH 网关表单+公钥白名单编辑+端口策略+
+  日志级别);规则列表行选择 + 批量启用/停用/删除(接既有 /services/batch);
+  总览事件级别筛选;访问器目标改为同类型规则下拉(带空态提示);客户端页配额
+  提示改为"保存即生效"。
+
+验证:cargo fmt/clippy 0 警告、test 42/42;console typecheck/build exit 0;
+e2e 主套 65/65(新增 8 项:F1 分规则、配置 401/收紧/拒白名单外端口/SSH 热开热关×2、
+日志热切、F2 max_services)与 vhost 套 16/16(新增 6 项:M2 自定义 404、缓存
+MISS→HIT、M3 上传不回显私钥、SNI 服务端终结(--cacert 校验)、非法 PEM 拒绝、
+删除后恢复 passthrough);其余套件回归:plugins 15 / transports 12 / xtcp 9 /
+resilience 19 / embed 9 —— 共 145 项全绿。
+
+已知限制(如实):配额与计量均为进程内存量(重启归零,持久化未做);客户端级
+rate_limit 仅在 TCP 族转发执行;SSH 网关流量未计量;HTTPS 证书命中即服务端终结
+(与同名 https 规则的 passthrough 语义按"证书优先"裁决)。

@@ -44,10 +44,20 @@ impl Db {
 
     /// 轻量迁移器:按序应用未执行的迁移文件(嵌入二进制)。
     async fn migrate(&self) -> Result<()> {
-        const MIGRATIONS: &[(&str, &str)] = &[(
-            "0001_init",
-            include_str!("../../../migrations/0001_init.sql"),
-        )];
+        const MIGRATIONS: &[(&str, &str)] = &[
+            (
+                "0001_init",
+                include_str!("../../../migrations/0001_init.sql"),
+            ),
+            (
+                "0002_client_quotas",
+                include_str!("../../../migrations/0002_client_quotas.sql"),
+            ),
+            (
+                "0003_certs",
+                include_str!("../../../migrations/0003_certs.sql"),
+            ),
+        ];
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)",
         )
@@ -151,7 +161,7 @@ impl Db {
     }
 
     pub async fn get_client(&self, id: &str) -> Result<Option<ClientRow>> {
-        let row = sqlx::query("SELECT id, name, secret, enabled, remark, config_revision, created_at, last_online_at, client_version, hostname, os FROM clients WHERE id = ?1")
+        let row = sqlx::query("SELECT id, name, secret, enabled, remark, config_revision, created_at, last_online_at, client_version, hostname, os, rate_limit, max_conns, max_services, flow_limit FROM clients WHERE id = ?1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -159,7 +169,7 @@ impl Db {
     }
 
     pub async fn list_clients(&self) -> Result<Vec<ClientRow>> {
-        let rows = sqlx::query("SELECT id, name, secret, enabled, remark, config_revision, created_at, last_online_at, client_version, hostname, os FROM clients ORDER BY created_at")
+        let rows = sqlx::query("SELECT id, name, secret, enabled, remark, config_revision, created_at, last_online_at, client_version, hostname, os, rate_limit, max_conns, max_services, flow_limit FROM clients ORDER BY created_at")
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.iter().map(ClientRow::from_row).collect())
@@ -207,6 +217,28 @@ impl Db {
         .bind(id)
         .bind(name)
         .bind(remark)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// F2 配额更新(控制台);逐字段可空 = 不改。
+    pub async fn update_client_quota(
+        &self,
+        id: &str,
+        rate_limit: Option<&str>,
+        max_conns: Option<i64>,
+        max_services: Option<i64>,
+        flow_limit: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE clients SET rate_limit=COALESCE(?2, rate_limit), max_conns=COALESCE(?3, max_conns), max_services=COALESCE(?4, max_services), flow_limit=COALESCE(?5, flow_limit) WHERE id=?1",
+        )
+        .bind(id)
+        .bind(rate_limit)
+        .bind(max_conns)
+        .bind(max_services)
+        .bind(flow_limit)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -632,6 +664,11 @@ pub struct ClientRow {
     pub client_version: String,
     pub hostname: String,
     pub os: String,
+    /// F2 配额(0/空 = 不限)。rate_limit 如 "1MB";flow_limit 单位字节。
+    pub rate_limit: String,
+    pub max_conns: i64,
+    pub max_services: i64,
+    pub flow_limit: i64,
 }
 
 impl ClientRow {
@@ -648,7 +685,98 @@ impl ClientRow {
             client_version: r.get(8),
             hostname: r.get(9),
             os: r.get(10),
+            rate_limit: r.get(11),
+            max_conns: r.get(12),
+            max_services: r.get(13),
+            flow_limit: r.get(14),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CertRow {
+    pub id: i64,
+    pub name: String,
+    /// JSON 数组字符串。
+    pub domains: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub fingerprint: String,
+    /// unix ms。
+    pub not_after: i64,
+    pub created_at: i64,
+}
+
+/// 证书写入参数(domains 为 JSON 数组字符串)。
+pub struct CertUpdate {
+    pub name: String,
+    pub domains: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub fingerprint: String,
+    pub not_after: i64,
+}
+
+impl Db {
+    pub async fn insert_cert(&self, c: &CertUpdate) -> Result<i64> {
+        let r = sqlx::query(
+            "INSERT INTO certs (name, domains, cert_pem, key_pem, fingerprint, not_after, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )
+        .bind(&c.name)
+        .bind(&c.domains)
+        .bind(&c.cert_pem)
+        .bind(&c.key_pem)
+        .bind(&c.fingerprint)
+        .bind(c.not_after)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.last_insert_rowid())
+    }
+
+    pub async fn list_certs(&self) -> Result<Vec<CertRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, domains, cert_pem, key_pem, fingerprint, not_after, created_at FROM certs ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| CertRow {
+                id: r.get(0),
+                name: r.get(1),
+                domains: r.get(2),
+                cert_pem: r.get(3),
+                key_pem: r.get(4),
+                fingerprint: r.get(5),
+                not_after: r.get(6),
+                created_at: r.get(7),
+            })
+            .collect())
+    }
+
+    pub async fn update_cert(&self, id: i64, c: &CertUpdate) -> Result<()> {
+        sqlx::query(
+            "UPDATE certs SET name=?2, domains=?3, cert_pem=?4, key_pem=?5, fingerprint=?6, not_after=?7 WHERE id=?1",
+        )
+        .bind(id)
+        .bind(&c.name)
+        .bind(&c.domains)
+        .bind(&c.cert_pem)
+        .bind(&c.key_pem)
+        .bind(&c.fingerprint)
+        .bind(c.not_after)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_cert(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM certs WHERE id=?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

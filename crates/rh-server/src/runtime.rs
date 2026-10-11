@@ -253,7 +253,7 @@ pub async fn spawn_runtime(
     // 白名单资格同样适用于恢复/批量重建路径(§4.6 与创建共用资格判定)
     if spec.kind.uses_bind_port()
         && spec.bind_port != 0
-        && !state.proxies.port_allowed(spec.bind_port)
+        && !state.proxies.port_allowed(spec.bind_port).await
     {
         bind_error = true;
         rt.set_state(ProxyState::BindError, "port not in allow_ports")

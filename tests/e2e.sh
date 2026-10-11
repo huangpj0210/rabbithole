@@ -670,6 +670,54 @@ check $? "统计总览"
 # F1 流量计量:此前 suite 已跑过 TCP/UDP/HTTP 等多类转发,全局字节计数必须 > 0
 echo "$stats" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; sys.exit(0 if d["bytes_in"]>0 and d["bytes_out"]>0 else 1)'
 check $? "流量统计(F1:入/出站字节数递增)"
+# F1 分规则计量:任一 tcp 规则 bytes_in > 0
+api "http://127.0.0.1:$API_PORT/api/services" | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)["data"]
+tcp = [r for r in rows if r["kind"] == "tcp" and r.get("bytes_in", 0) > 0]
+sys.exit(0 if tcp else 1)'; check $? "流量统计(F1:分规则 bytes_in 递增)"
+
+# ---------- 服务器配置(热生效) ----------
+unauth_cfg=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$API_PORT/api/server/config")
+[ "$unauth_cfg" = "401" ]; check $? "服务器配置:未认证拒绝"
+cfg_restore=$(api "http://127.0.0.1:$API_PORT/api/server/config" | python3 -c 'import json,sys;print("|".join(json.load(sys.stdin)["data"]["hot"]["allow_ports"]))')
+r=$(api -X PUT "http://127.0.0.1:$API_PORT/api/server/config" -H 'Content-Type: application/json' -d '{"ports":{"allow_ports":["18301"]}}')
+echo "$r" | python3 -c 'import json,sys;d=json.load(sys.stdin)["data"];sys.exit(0 if "ports.allow_ports" in d["applied"] and d["persisted"] else 1)'
+check $? "服务器配置:allow_ports 收紧热生效并写回"
+cat > "$WORK/denysvc.json" <<EOF
+{"client_id":"$CID","name":"denytest","kind":"tcp","bind_port":18999,"target_host":"127.0.0.1","target_port":80,"enabled":false}
+EOF
+denied=$(api -X POST "http://127.0.0.1:$API_PORT/api/services" -H 'Content-Type: application/json' --data-binary "@$WORK/denysvc.json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["code"]!=0)')
+[ "$denied" = "True" ]; check $? "服务器配置:收紧后白名单外端口被拒"
+restore_body=$(CFG="$cfg_restore" python3 -c '
+import json, os
+allow = [x for x in os.environ["CFG"].split("|") if x]
+print(json.dumps({"ports": {"allow_ports": allow}}))')
+api -X PUT "http://127.0.0.1:$API_PORT/api/server/config" -H 'Content-Type: application/json' -d "$restore_body" > /dev/null
+api -X PUT "http://127.0.0.1:$API_PORT/api/server/config" -H 'Content-Type: application/json' -d '{"ssh_gateway":{"enabled":true,"bind_port":18022,"bind_addr":"127.0.0.1"},"log":{"level":"debug"}}' | python3 -c 'import json,sys;d=json.load(sys.stdin)["data"];sys.exit(0 if "ssh_gateway.enabled" in d["applied"] and "log.level" in d["applied"] else 1)'
+check $? "服务器配置:SSH 网关热开启 + 日志级别热切"
+sleep 1
+python3 -c 'import socket;s=socket.create_connection(("127.0.0.1",18022),timeout=3);s.close()' 2>/dev/null; check $? "SSH 网关:热开启后监听可达"
+api -X PUT "http://127.0.0.1:$API_PORT/api/server/config" -H 'Content-Type: application/json' -d '{"ssh_gateway":{"enabled":false},"log":{"level":"info"}}' > /dev/null
+sleep 1
+python3 -c 'import socket
+try:
+    socket.create_connection(("127.0.0.1",18022),timeout=2); raise SystemExit(1)
+except OSError: raise SystemExit(0)' 2>/dev/null; check $? "SSH 网关:热关闭后监听撤销"
+
+# ---------- F2 客户端配额(max_services) ----------
+QR=$(api -X POST "http://127.0.0.1:$API_PORT/api/clients" -H 'Content-Type: application/json' -d '{"name":"quota-test","max_services":1}')
+QID=$(echo "$QR" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["id"])')
+cat > "$WORK/q1.json" <<EOF
+{"client_id":"$QID","name":"q1","kind":"http","target_host":"127.0.0.1","target_port":80,"enabled":false,"http":{"custom_domains":["q1.test"]}}
+EOF
+cat > "$WORK/q2.json" <<EOF
+{"client_id":"$QID","name":"q2","kind":"http","target_host":"127.0.0.1","target_port":80,"enabled":false,"http":{"custom_domains":["q2.test"]}}
+EOF
+q1=$(api -X POST "http://127.0.0.1:$API_PORT/api/services" -H 'Content-Type: application/json' --data-binary "@$WORK/q1.json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["code"]==0)' 2>/dev/null)
+q2=$(api -X POST "http://127.0.0.1:$API_PORT/api/services" -H 'Content-Type: application/json' --data-binary "@$WORK/q2.json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["code"]!=0)' 2>/dev/null)
+[ "$q1" = "True" ] && [ "$q2" = "True" ]; check $? "F2 配额:max_services=1 时第二条被拒(q1=$q1 q2=$q2)"
+api -X DELETE "http://127.0.0.1:$API_PORT/api/clients/$QID" > /dev/null
 events=$(api "http://127.0.0.1:$API_PORT/api/events?limit=5" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"])>0)')
 [ "$events" = "True" ]; check $? "事件查询"
 metrics=$(curl -s -m 5 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")

@@ -46,7 +46,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/visitors/{id}/disable", post(disable_visitor));
     let misc = Router::new()
         .route("/api/stats/overview", get(stats_overview))
-        .route("/api/events", get(list_events));
+        .route("/api/events", get(list_events))
+        .route(
+            "/api/server/config",
+            get(get_server_config).put(put_server_config),
+        )
+        .route("/api/certs", get(list_certs_api).post(create_cert_api))
+        .route(
+            "/api/certs/{id}",
+            put(update_cert_api).delete(delete_cert_api),
+        );
     let mut r = auth
         .merge(clients)
         .merge(services)
@@ -319,10 +328,27 @@ async fn list_clients(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         Ok(r) => r,
         Err(e) => return err(500, &format!("{e}")),
     };
+    // F1 分客户端聚合:其名下全部规则运行时之和(重名规则口径与 visitor 归因一致)
+    let per_client: std::collections::HashMap<String, (u64, u64, i64)> = state
+        .proxies
+        .runtimes
+        .iter()
+        .fold(std::collections::HashMap::new(), |mut m, e| {
+            let rt = e.value();
+            let ent = m.entry(rt.client_id.clone()).or_insert((0, 0, 0));
+            ent.0 += rt.bytes_in.load(std::sync::atomic::Ordering::Relaxed);
+            ent.1 += rt.bytes_out.load(std::sync::atomic::Ordering::Relaxed);
+            ent.2 += rt
+                .conns_current
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(0);
+            m
+        });
     let out: Vec<_> = rows
         .into_iter()
         .map(|c| {
             let sess = state.sessions.get(&c.id);
+            let meter = per_client.get(&c.id).copied().unwrap_or((0, 0, 0));
             json!({
                 "id": c.id,
                 "name": c.name,
@@ -337,6 +363,14 @@ async fn list_clients(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
                 "os": c.os,
                 "last_online_at": c.last_online_at,
                 "created_at": c.created_at,
+                "bytes_in": meter.0,
+                "bytes_out": meter.1,
+                "conns_current": meter.2,
+                // F2 配额(0/空 = 不限)
+                "rate_limit": c.rate_limit,
+                "max_conns": c.max_conns,
+                "max_services": c.max_services,
+                "flow_limit": c.flow_limit,
             })
         })
         .collect();
@@ -348,6 +382,27 @@ struct CreateClientReq {
     name: String,
     #[serde(default)]
     remark: String,
+    /// F2 配额(可选;rate_limit 如 "1MB",flow_limit 单位字节,0/空 = 不限)。
+    #[serde(default)]
+    rate_limit: Option<String>,
+    #[serde(default)]
+    max_conns: Option<i64>,
+    #[serde(default)]
+    max_services: Option<i64>,
+    #[serde(default)]
+    flow_limit: Option<i64>,
+}
+
+fn validate_quota(rate: Option<&str>, max_conns: i64, max_services: i64) -> Option<String> {
+    if let Some(r) = rate {
+        if !r.is_empty() && rh_core::BandwidthQuantity::parse(r).is_none() {
+            return Some(format!("限速格式非法:{r}(示例 1MB / 512KB)"));
+        }
+    }
+    if max_conns < 0 || max_services < 0 {
+        return Some("配额不能为负".into());
+    }
+    None
 }
 
 async fn create_client(
@@ -377,6 +432,25 @@ async fn create_client(
     {
         return err(1003, &format!("创建失败:{e}"));
     }
+    if let Some(msg) = validate_quota(
+        req.rate_limit.as_deref(),
+        req.max_conns.unwrap_or(0),
+        req.max_services.unwrap_or(0),
+    ) {
+        let _ = state.db.delete_client(&id).await;
+        return err(1002, &msg);
+    }
+    let _ = state
+        .db
+        .update_client_quota(
+            &id,
+            req.rate_limit.as_deref(),
+            req.max_conns,
+            req.max_services,
+            req.flow_limit,
+        )
+        .await;
+    state.refresh_client_quotas().await;
     state
         .events
         .emit("info", "client", &format!("客户端已创建:{name}"))
@@ -396,6 +470,14 @@ struct UpdateClientReq {
     name: Option<String>,
     #[serde(default)]
     remark: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<String>,
+    #[serde(default)]
+    max_conns: Option<i64>,
+    #[serde(default)]
+    max_services: Option<i64>,
+    #[serde(default)]
+    flow_limit: Option<i64>,
 }
 
 async fn update_client(
@@ -430,6 +512,41 @@ async fn update_client(
         state
             .events
             .emit("info", "client", &format!("客户端资料已更新:{}", _c.name))
+            .await;
+    }
+    if req.rate_limit.is_some()
+        || req.max_conns.is_some()
+        || req.max_services.is_some()
+        || req.flow_limit.is_some()
+    {
+        let cur_rate = req
+            .rate_limit
+            .clone()
+            .unwrap_or_else(|| _c.rate_limit.clone());
+        if let Some(msg) = validate_quota(
+            Some(&cur_rate),
+            req.max_conns.unwrap_or(_c.max_conns),
+            req.max_services.unwrap_or(_c.max_services),
+        ) {
+            return err(1002, &msg);
+        }
+        if let Err(e) = state
+            .db
+            .update_client_quota(
+                &id,
+                req.rate_limit.as_deref(),
+                req.max_conns,
+                req.max_services,
+                req.flow_limit,
+            )
+            .await
+        {
+            return err(500, &format!("{e}"));
+        }
+        state.refresh_client_quotas().await;
+        state
+            .events
+            .emit("info", "client", &format!("客户端配额已更新:{}", _c.name))
             .await;
     }
     if let Some(enabled) = req.enabled {
@@ -530,6 +647,7 @@ async fn delete_client(
     if let Err(e) = state.db.delete_client(&id).await {
         return err(500, &format!("{e}"));
     }
+    state.refresh_client_quotas().await;
     state.events.emit("warn", "client", "客户端已删除").await;
     ok(json!({"deleted": true}))
 }
@@ -570,6 +688,15 @@ async fn list_services(
             },
             None => 0,
         };
+        let rt_meter = state.proxies.get(id as u64).map(|rt| {
+            (
+                rt.bytes_in.load(std::sync::atomic::Ordering::Relaxed),
+                rt.bytes_out.load(std::sync::atomic::Ordering::Relaxed),
+                rt.conns_current
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(0),
+            )
+        });
         out.push(json!({
             "id": id,
             "client_id": client_id,
@@ -588,6 +715,10 @@ async fn list_services(
             "healthy": state.proxies.get(id as u64).map(|rt| rt.healthy.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(true),
             "pool_ready": pool_ready,
             "spec": spec,
+            // F1 分规则计量(用户侧口径;运行时不在(已禁用)则为 0)
+            "bytes_in": rt_meter.map(|(i, _, _)| i).unwrap_or(0),
+            "bytes_out": rt_meter.map(|(_, o, _)| o).unwrap_or(0),
+            "conns_current": rt_meter.map(|(_, _, c)| c).unwrap_or(0),
         }));
     }
     ok(out)
@@ -635,15 +766,21 @@ async fn create_service_inner(
     spec.enabled = spec.enabled && client_enabled;
     let lock = state.serial_lock(&client.id);
     let _g = lock.lock().await;
-    // 每客户端数量上限(串行域内计数,防并发创建突破配额)
-    if state.cfg.ports.max_services_per_client > 0 {
+    // 每客户端数量上限(串行域内计数,防并发创建突破配额);
+    // F2:客户端级 max_services 覆盖全局默认
+    let per_client_max = if client.max_services > 0 {
+        client.max_services as usize
+    } else {
+        state.hot.read().await.max_services_per_client
+    };
+    if per_client_max > 0 {
         let count = state
             .db
             .list_proxies(Some(&client.id))
             .await
             .map_err(|e| (500, format!("{e}")))?
             .len();
-        if count >= state.cfg.ports.max_services_per_client {
+        if count >= per_client_max {
             return Err((2003, "LIMIT_EXCEEDED:超出配额限制".into()));
         }
     }
@@ -672,7 +809,7 @@ async fn create_service_inner(
         if spec.bind_port == 0 {
             port_auto = true;
         } else {
-            if !state.proxies.port_allowed(spec.bind_port) {
+            if !state.proxies.port_allowed(spec.bind_port).await {
                 return Err((2005, "PORT_DENIED:端口不在允许范围".into()));
             }
             let proto = spec.kind.as_str();
@@ -840,7 +977,7 @@ async fn update_service(
         {
             return err(3002, "OVERLAP_ADDR_UPDATE:绑定地址重叠,不支持直接修改");
         }
-        if !state.proxies.port_allowed(spec.bind_port) {
+        if !state.proxies.port_allowed(spec.bind_port).await {
             return err(3003, "PORT_DENIED:端口不在允许范围");
         }
         let gkey = crate::state::ProxyManager::group_key(&spec);
@@ -990,7 +1127,7 @@ async fn create_bind_checked(
     }
     let bind_ip =
         rh_core::net::parse_bind_ip(&spec.bind_ip).ok_or((2004, "invalid bind_ip".to_string()))?;
-    if !state.proxies.port_allowed(spec.bind_port) {
+    if !state.proxies.port_allowed(spec.bind_port).await {
         return Err((2005, "PORT_DENIED:端口不在允许范围".into()));
     }
     let gkey = crate::state::ProxyManager::group_key(spec);
@@ -1590,6 +1727,382 @@ async fn list_events(
         Err(e) => return err(500, &format!("{e}")),
     };
     ok(rows)
+}
+
+// ---------------- 服务器配置(网页可管子集:端口策略/日志级别/SSH 网关) ----------------
+
+/// GET:完整配置(脱敏)+ 热配置当前值 + authorized_keys 内容。
+async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let mut view = state.cfg.as_ref().clone();
+    view.web.jwt_secret = None; // 密钥不回显
+    let hot = state.hot.read().await.clone();
+    let keys_path = hot.ssh_gateway.authorized_keys_file.clone();
+    let authorized_keys = keys_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    ok(json!({
+        "config": serde_json::to_value(&view).unwrap_or(serde_json::Value::Null),
+        "hot": {
+            "allow_ports": hot.allow_ports,
+            "max_services_per_client": hot.max_services_per_client,
+            "log_level": hot.log_level,
+            "ssh_gateway": serde_json::to_value(&hot.ssh_gateway).unwrap_or(serde_json::Value::Null),
+        },
+        "authorized_keys": authorized_keys,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ServerConfigUpdate {
+    #[serde(default)]
+    ports: Option<PortsUpdate>,
+    #[serde(default)]
+    log: Option<LogUpdate>,
+    #[serde(default)]
+    ssh_gateway: Option<SshGatewayUpdate>,
+    /// authorized_keys 文件全文(空串 = 清空;null = 不动)。
+    #[serde(default)]
+    authorized_keys: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct PortsUpdate {
+    allow_ports: Option<Vec<String>>,
+    max_services_per_client: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LogUpdate {
+    level: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SshGatewayUpdate {
+    enabled: Option<bool>,
+    bind_port: Option<u16>,
+    bind_addr: Option<String>,
+}
+
+/// PUT:仅接受热生效子集;应用后回写 toml(原文件备份 .bak 一次,注释会丢失)。
+async fn put_server_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ServerConfigUpdate>,
+) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    // 校验
+    if let Some(p) = &req.ports {
+        if let Some(list) = &p.allow_ports {
+            for item in list {
+                if rh_core::net::PortsRange::parse(item).is_none() {
+                    return err(1002, &format!("端口范围非法:{item}(示例 10000-40000)"));
+                }
+            }
+        }
+        if let Some(n) = p.max_services_per_client {
+            if n > 10_000 {
+                return err(1002, "max_services_per_client 须为 0-10000");
+            }
+        }
+    }
+    if let Some(l) = &req.log {
+        if let Some(lv) = &l.level {
+            if !matches!(lv.as_str(), "trace" | "debug" | "info" | "warn" | "error") {
+                return err(1002, "日志级别须为 trace/debug/info/warn/error");
+            }
+        }
+    }
+    if let Some(g) = &req.ssh_gateway {
+        if let Some(a) = &g.bind_addr {
+            if !a.is_empty() && a.parse::<std::net::IpAddr>().is_err() {
+                return err(1002, "bind_addr 须为合法 IP 字面量");
+            }
+        }
+        if let Some(p) = g.bind_port {
+            if p == 0 {
+                return err(1002, "bind_port 不能为 0");
+            }
+        }
+    }
+    if let Some(keys) = &req.authorized_keys {
+        for (i, line) in keys.lines().enumerate() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            // 形态粗校验(key-type base64 comment);完整解析在网关重启载入时做
+            let mut parts = t.split_whitespace();
+            let ktype = parts.next().unwrap_or("");
+            if !ktype.starts_with("ssh-")
+                && !ktype.starts_with("ecdsa-")
+                && !ktype.starts_with("sk-")
+            {
+                return err(1002, &format!("authorized_keys 第 {} 行不是公钥", i + 1));
+            }
+        }
+    }
+
+    let mut applied: Vec<String> = Vec::new();
+    let mut ssh_changed = false;
+    {
+        let mut hot = state.hot.write().await;
+        if let Some(p) = req.ports {
+            if let Some(list) = p.allow_ports {
+                hot.allow_ports = list;
+                applied.push("ports.allow_ports".into());
+            }
+            if let Some(n) = p.max_services_per_client {
+                hot.max_services_per_client = n;
+                applied.push("ports.max_services_per_client".into());
+            }
+        }
+        if let Some(l) = req.log {
+            if let Some(lv) = l.level {
+                hot.log_level = lv.clone();
+                match crate::LOG_SET_LEVEL.get() {
+                    Some(f) if f(&lv) => applied.push("log.level".into()),
+                    _ => return err(500, "日志级别切换失败(不支持热更新)"),
+                }
+            }
+        }
+        if let Some(g) = req.ssh_gateway {
+            let target = &mut hot.ssh_gateway;
+            if let Some(v) = g.enabled {
+                if target.enabled != v {
+                    ssh_changed = true;
+                }
+                target.enabled = v;
+                applied.push("ssh_gateway.enabled".into());
+            }
+            if let Some(v) = g.bind_port {
+                if target.bind_port != v {
+                    ssh_changed = true;
+                }
+                target.bind_port = v;
+                applied.push("ssh_gateway.bind_port".into());
+            }
+            if let Some(v) = g.bind_addr {
+                if target.bind_addr != v {
+                    ssh_changed = true;
+                }
+                target.bind_addr = v;
+                applied.push("ssh_gateway.bind_addr".into());
+            }
+        }
+        // authorized_keys:写入(或初始化默认)文件路径
+        if let Some(keys) = &req.authorized_keys {
+            if hot.ssh_gateway.authorized_keys_file.is_none() {
+                let dir = state
+                    .cfg
+                    .config_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
+                hot.ssh_gateway.authorized_keys_file = Some(dir.join("authorized_keys"));
+            }
+            let path = hot.ssh_gateway.authorized_keys_file.clone().unwrap();
+            if let Err(e) = std::fs::write(&path, keys) {
+                return err(
+                    500,
+                    &format!("authorized_keys 写入失败({}):{e}", path.display()),
+                );
+            }
+            ssh_changed = true;
+            applied.push("authorized_keys".into());
+        }
+    }
+    if ssh_changed {
+        let _ = state.ssh_watch.0.send(u64::MAX);
+    }
+
+    // 回写配置文件:热子集合并进启动配置快照;原文件备份一次(.bak),注释会丢失
+    let persist_err;
+    {
+        let hot = state.hot.read().await;
+        let mut disk = state.cfg.as_ref().clone();
+        disk.ports.allow_ports = hot.allow_ports.clone();
+        disk.ports.max_services_per_client = hot.max_services_per_client;
+        disk.log.level = hot.log_level.clone();
+        disk.ssh_gateway = hot.ssh_gateway.clone();
+        disk.web.jwt_secret = state.cfg.web.jwt_secret.clone(); // 保留原值(未脱敏源)
+        persist_err = match toml::to_string_pretty(&disk) {
+            Ok(text) => {
+                let path = &state.cfg.config_path;
+                let bak = path.with_extension("toml.bak");
+                if !bak.exists() {
+                    let _ = std::fs::copy(path, &bak);
+                }
+                std::fs::write(path, text).map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    if let Err(e) = persist_err {
+        state
+            .events
+            .emit("warn", "server", &format!("配置已生效但写回文件失败:{e}"))
+            .await;
+        return ok(
+            json!({ "applied": applied, "restart_required": [], "persisted": false, "error": e }),
+        );
+    }
+    state
+        .events
+        .emit("info", "server", "服务器配置已更新(热生效并写回文件)")
+        .await;
+    ok(json!({ "applied": applied, "restart_required": [], "persisted": true }))
+}
+
+// ---------------- 证书管理(M3:SNI 服务端终结) ----------------
+
+async fn list_certs_api(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let rows = match state.db.list_certs().await {
+        Ok(r) => r,
+        Err(e) => return err(500, &format!("{e}")),
+    };
+    // key_pem 任何响应不回显
+    let out: Vec<_> = rows
+        .into_iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "name": c.name,
+                "domains": serde_json::from_str::<Vec<String>>(&c.domains).unwrap_or_default(),
+                "not_after": if c.not_after > 0 { Some(c.not_after) } else { None },
+                "fingerprint": c.fingerprint,
+                "created_at": c.created_at,
+            })
+        })
+        .collect();
+    ok(out)
+}
+
+#[derive(Deserialize)]
+struct CertReq {
+    name: String,
+    cert_pem: String,
+    key_pem: String,
+    #[serde(default)]
+    domains: Option<Vec<String>>,
+}
+
+async fn create_cert_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CertReq>,
+) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return err(1002, "名称须为 1-64 字符");
+    }
+    let (san_domains, fp, not_after, _cfg) =
+        match crate::vhost::build_cert_entry(&req.cert_pem, &req.key_pem) {
+            Ok(v) => v,
+            Err(e) => return err(5002, &format!("证书解析失败:{e}")),
+        };
+    let domains = req.domains.filter(|d| !d.is_empty()).unwrap_or(san_domains);
+    let doms_json = serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into());
+    let id = match state
+        .db
+        .insert_cert(&crate::db::CertUpdate {
+            name: name.to_string(),
+            domains: doms_json,
+            cert_pem: req.cert_pem.clone(),
+            key_pem: req.key_pem.clone(),
+            fingerprint: fp.clone(),
+            not_after,
+        })
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => return err(500, &format!("{e}")),
+    };
+    state.rebuild_certs().await;
+    state
+        .events
+        .emit("info", "cert", &format!("证书已上传:{name}"))
+        .await;
+    ok(json!({ "id": id, "fingerprint": fp }))
+}
+
+async fn update_cert_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<CertReq>,
+) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return err(1002, "名称须为 1-64 字符");
+    }
+    let (san_domains, fp, not_after, _cfg) =
+        match crate::vhost::build_cert_entry(&req.cert_pem, &req.key_pem) {
+            Ok(v) => v,
+            Err(e) => return err(5002, &format!("证书解析失败:{e}")),
+        };
+    let domains = req.domains.filter(|d| !d.is_empty()).unwrap_or(san_domains);
+    let doms_json = serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into());
+    let rows = state.db.list_certs().await.unwrap_or_default();
+    if !rows.iter().any(|c| c.id == id) {
+        return err(5001, "证书不存在");
+    }
+    if let Err(e) = state
+        .db
+        .update_cert(
+            id,
+            &crate::db::CertUpdate {
+                name: name.to_string(),
+                domains: doms_json,
+                cert_pem: req.cert_pem.clone(),
+                key_pem: req.key_pem.clone(),
+                fingerprint: fp,
+                not_after,
+            },
+        )
+        .await
+    {
+        return err(500, &format!("{e}"));
+    }
+    state.rebuild_certs().await;
+    state
+        .events
+        .emit("info", "cert", &format!("证书已更新:{name}"))
+        .await;
+    ok(json!({"updated": true}))
+}
+
+async fn delete_cert_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    if let Err(e) = state.db.delete_cert(id).await {
+        return err(500, &format!("{e}"));
+    }
+    state.rebuild_certs().await;
+    state.events.emit("warn", "cert", "证书已删除").await;
+    ok(json!({"deleted": true}))
 }
 
 async fn prometheus_metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {

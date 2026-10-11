@@ -304,7 +304,7 @@ const ClientsPage: React.FC = () => {
           <Form.Item label="高级配置" style={{ marginBottom: 0 }}>
             <Card size="small" style={{ background: '#fafafa' }}>
               <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>
-                以下配额字段需服务端 M1 支持,当前提交后暂不生效
+                配额保存即生效:并发/流量上限在接入时执行,限速在 TCP 隧道转发中执行
               </div>
               <Form.Item label="限速" name="rate_limit" style={{ marginBottom: 8 }}>
                 <Input placeholder="如 1MB / 512KB,留空不限" />

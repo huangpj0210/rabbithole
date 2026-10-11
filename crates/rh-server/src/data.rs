@@ -205,7 +205,7 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
 /// START_FORWARD 指派(数据连接最后一帧)+ 桥接到用户连接。
 /// 半关闭:双向独立复制。
 pub async fn assign_forward(
-    _state: &Arc<AppState>,
+    state: &Arc<AppState>,
     rt: &Arc<ProxyRuntime>,
     mut channel: BoxedIo,
     user: BoxedIo,
@@ -256,15 +256,18 @@ pub async fn assign_forward(
             )
         })
         .map(|q| Arc::new(TokenBucket::new(q.bytes_per_sec() as f64)));
+    // F2 客户端级限速(服务端侧,与规则级限速叠加)
+    let client_bucket = state.client_usage(&rt.client_id).bucket();
     let (mut u_r, mut u_w) = tokio::io::split(user);
     let (mut c_r, mut c_w) = tokio::io::split(channel);
     let _ = local_addr_override;
     let bucket2 = bucket.clone();
+    let cb2 = client_bucket.clone();
     let cancel = rt.rule_cancel.clone();
     let t1 = tokio::spawn(async move {
         // 规则取消(禁用/删除)级联关闭在途转发(§4.1)
         tokio::select! {
-            _ = copy_limited(&mut u_r, &mut c_w, bucket2) => {}
+            _ = copy_limited(&mut u_r, &mut c_w, bucket2, cb2) => {}
             _ = cancel.cancelled() => {}
         }
         let _ = c_w.shutdown().await;
@@ -272,7 +275,7 @@ pub async fn assign_forward(
     let cancel2 = rt.rule_cancel.clone();
     let t2 = tokio::spawn(async move {
         tokio::select! {
-            _ = copy_limited(&mut c_r, &mut u_w, bucket) => {}
+            _ = copy_limited(&mut c_r, &mut u_w, bucket, client_bucket) => {}
             _ = cancel2.cancelled() => {}
         }
         let _ = u_w.shutdown().await;
@@ -280,8 +283,12 @@ pub async fn assign_forward(
     let _ = tokio::join!(t1, t2);
 }
 
-async fn copy_limited<R, W>(r: &mut R, w: &mut W, bucket: Option<Arc<TokenBucket>>)
-where
+async fn copy_limited<R, W>(
+    r: &mut R,
+    w: &mut W,
+    bucket: Option<Arc<TokenBucket>>,
+    client_bucket: Option<Arc<TokenBucket>>,
+) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -295,22 +302,103 @@ where
         if let Some(b) = &bucket {
             b.acquire(n).await;
         }
+        if let Some(b) = &client_bucket {
+            b.acquire(n).await;
+        }
         if w.write_all(&buf[..n]).await.is_err() {
             break;
         }
     }
 }
 
-/// F1 全局计量:用户侧 IO 透明包装。read 计入入站、write 计入出站,
-/// 不改变任何 IO 行为;tcp/vhost/tcpmux/visitor 的用户连接统一套用。
+/// F1 计量:IO 透明包装,不改任何 IO 行为。
+/// user 模式:read→入站、write→出站(用户侧连接)。
+/// upstream 模式:read→出站、write→入站(上游通道,http vhost 反向归因)。
+/// 同时计入全局 Metrics 与所属规则(可选)。
 pub struct CountedUserIo<T> {
     inner: T,
     metrics: Arc<crate::state::Metrics>,
+    proxy: Option<Arc<crate::state::ProxyRuntime>>,
+    usage: Option<Arc<crate::state::ClientUsage>>,
+    reversed: bool,
 }
 
 impl<T> CountedUserIo<T> {
     pub fn new(inner: T, metrics: Arc<crate::state::Metrics>) -> Self {
-        Self { inner, metrics }
+        Self {
+            inner,
+            metrics,
+            proxy: None,
+            usage: None,
+            reversed: false,
+        }
+    }
+
+    /// 用户侧连接(归属到规则;state 派生客户端用量)。
+    pub fn user(
+        inner: T,
+        state: &AppState,
+        proxy: Option<Arc<crate::state::ProxyRuntime>>,
+    ) -> Self {
+        let usage = proxy.as_ref().map(|rt| state.client_usage(&rt.client_id));
+        Self {
+            inner,
+            metrics: state.metrics.clone(),
+            proxy,
+            usage,
+            reversed: false,
+        }
+    }
+
+    /// 上游通道(http vhost:连接层无法归因单规则,按请求通道计量)。
+    pub fn upstream(
+        inner: T,
+        state: &AppState,
+        proxy: Option<Arc<crate::state::ProxyRuntime>>,
+    ) -> Self {
+        let usage = proxy.as_ref().map(|rt| state.client_usage(&rt.client_id));
+        Self {
+            inner,
+            metrics: state.metrics.clone(),
+            proxy,
+            usage,
+            reversed: true,
+        }
+    }
+
+    fn flow_cut(&self) -> bool {
+        self.usage
+            .as_ref()
+            .map(|u| u.flow_cut.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    fn count_in(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.metrics.count_user_in(n);
+        if let Some(rt) = &self.proxy {
+            rt.bytes_in
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(u) = &self.usage {
+            u.add_bytes(n as u64);
+        }
+    }
+
+    fn count_out(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.metrics.count_user_out(n);
+        if let Some(rt) = &self.proxy {
+            rt.bytes_out
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(u) = &self.usage {
+            u.add_bytes(n as u64);
+        }
     }
 }
 
@@ -320,10 +408,21 @@ impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountedUserIo<T> 
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if self.flow_cut() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "client flow limit exceeded",
+            )));
+        }
         let before = buf.filled().len();
         match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
             std::task::Poll::Ready(Ok(())) => {
-                self.metrics.count_user_in(buf.filled().len() - before);
+                let n = buf.filled().len() - before;
+                if self.reversed {
+                    self.count_out(n);
+                } else {
+                    self.count_in(n);
+                }
                 std::task::Poll::Ready(Ok(()))
             }
             other => other,
@@ -337,9 +436,19 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountedUserIo<T
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.flow_cut() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "client flow limit exceeded",
+            )));
+        }
         match std::pin::Pin::new(&mut self.inner).poll_write(cx, buf) {
             std::task::Poll::Ready(Ok(n)) => {
-                self.metrics.count_user_out(n);
+                if self.reversed {
+                    self.count_in(n);
+                } else {
+                    self.count_out(n);
+                }
                 std::task::Poll::Ready(Ok(n))
             }
             other => other,
@@ -385,13 +494,57 @@ pub async fn tcp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, listene
 }
 
 /// 连接计数守卫:转发结束(含指派失败的早退路径)即递减,
-/// 避免 conns_current 在死通道场景下单调漂移。
-struct ConnGuard(Arc<crate::state::Metrics>);
+/// 避免 conns_current 在死通道场景下单调漂移;全局 + 分规则 + 分客户端三计。
+pub struct ConnGuard {
+    metrics: Arc<crate::state::Metrics>,
+    proxy: Option<Arc<crate::state::ProxyRuntime>>,
+    usage: Option<Arc<crate::state::ClientUsage>>,
+}
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.0.totals.lock().unwrap().conns_current -= 1;
+        self.metrics.totals.lock().unwrap().conns_current -= 1;
+        if let Some(rt) = &self.proxy {
+            rt.conns_current
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(u) = &self.usage {
+            u.conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
+}
+
+/// 用户连接准入 + 计数:F2 配额(max_conns 并发上限 / flow_limit 流量上限)
+/// 超限返回 None(调用方直接断开);通过则全局/规则/客户端三处 +1。
+pub fn try_open_user_conn(
+    state: &AppState,
+    proxy: Option<&Arc<crate::state::ProxyRuntime>>,
+) -> Option<ConnGuard> {
+    let usage = proxy.map(|rt| state.client_usage(&rt.client_id));
+    if let Some(u) = &usage {
+        let q = u.quota.read().unwrap().clone();
+        if q.max_conns > 0 && u.conns.load(std::sync::atomic::Ordering::Relaxed) >= q.max_conns {
+            return None;
+        }
+        if q.flow_limit > 0
+            && u.bytes.load(std::sync::atomic::Ordering::Relaxed) >= q.flow_limit as u64
+        {
+            return None;
+        }
+    }
+    state.metrics.totals.lock().unwrap().conns_current += 1;
+    if let Some(rt) = proxy {
+        rt.conns_current
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(u) = &usage {
+        u.conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(ConnGuard {
+        metrics: state.metrics.clone(),
+        proxy: proxy.cloned(),
+        usage,
+    })
 }
 
 async fn serve_tcp_user(
@@ -413,8 +566,9 @@ async fn serve_tcp_user(
     let Some(channel) = get_channel(&state, &target_rt).await else {
         return; // 池空超时:快速失败
     };
-    state.metrics.totals.lock().unwrap().conns_current += 1;
-    let _conn_guard = ConnGuard(state.metrics.clone());
+    let Some(_conn_guard) = try_open_user_conn(&state, Some(&target_rt)) else {
+        return; // F2 配额超限:直接断开
+    };
     state
         .metrics
         .connections
@@ -424,7 +578,7 @@ async fn serve_tcp_user(
         &state,
         &target_rt,
         channel,
-        Box::new(CountedUserIo::new(sock, state.metrics.clone())),
+        Box::new(CountedUserIo::user(sock, &state, Some(target_rt.clone()))),
         &peer.to_string(),
         local,
     )
@@ -541,6 +695,8 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                     match r {
                         Ok((n, peer)) => {
                             state.metrics.count_user_in(n);
+                            rt.bytes_in.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            state.client_usage(&rt.client_id).add_bytes(n as u64);
                             let payload = udp_packet::encode(&peer.to_string(), &pkt_buf[..n]);
                             if rh_protocol::write_frame(&mut ch_w, FrameType::UDP_PACKET, &payload).await.is_err() {
                                 break true;
@@ -555,8 +711,19 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                         Ok((FrameType::UDP_PACKET, p)) => {
                             if let Some((src, data)) = udp_packet::decode(&p) {
                                 if let Ok(addr) = src.parse::<SocketAddr>() {
+                                    if state
+                                        .client_usage(&rt.client_id)
+                                        .flow_cut
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        last_alive = Instant::now();
+                                        continue;
+                                    }
                                     let _ = sock.send_to(data, addr).await;
                                     state.metrics.count_user_out(data.len());
+                                    rt.bytes_out
+                                        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                                    state.client_usage(&rt.client_id).add_bytes(data.len() as u64);
                                     sessions.insert(addr, Instant::now());
                                 }
                                 last_alive = Instant::now();

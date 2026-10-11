@@ -1,4 +1,5 @@
 import {
+  batchServices,
   createService,
   deleteService,
   disableService,
@@ -48,6 +49,8 @@ const ProxyListPage: React.FC<{
   const [batchResults, setBatchResults] = useState<null | Array<{ code: number; name: string; msg: string }>>(null);
   const [clientFilter, setClientFilter] = useState<null | string>(null);
   const [batchRunning, setBatchRunning] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [batchOpRunning, setBatchOpRunning] = useState(false);
 
   const servicesQ = useQuery({ queryKey: ['services'], queryFn: () => listServices() });
   const clientsQ = useQuery({ queryKey: ['clients'], queryFn: listClients });
@@ -92,6 +95,23 @@ const ProxyListPage: React.FC<{
       invalidate();
     },
   });
+
+  /** 批量启停删(后端逐项执行并回报 code/message)。 */
+  async function runBatchOp(action: 'delete' | 'disable' | 'enable') {
+    if (selectedIds.length === 0 || batchOpRunning) return;
+    setBatchOpRunning(true);
+    try {
+      const results = await batchServices(selectedIds, action);
+      const ok = results.filter((r) => r.code === 0).length;
+      const bad = results.filter((r) => r.code !== 0);
+      message.success(`批量${action === 'enable' ? '启用' : action === 'disable' ? '停用' : '删除'}:${ok} 成功${bad.length ? `,${bad.length} 失败` : ''}`);
+      bad.slice(0, 3).forEach((r) => message.error(`#${r.id}:${r.message}`));
+      setSelectedIds([]);
+      invalidate();
+    } finally {
+      setBatchOpRunning(false);
+    }
+  }
 
   async function runBatch() {
     if (batchRunning) return;
@@ -279,12 +299,46 @@ const ProxyListPage: React.FC<{
         <Button icon={<ReloadOutlined />} onClick={() => invalidate()} size="small" style={{ marginLeft: 8 }}>
           刷新
         </Button>
+        {selectedIds.length > 0 && (
+          <>
+            <Button
+              loading={batchOpRunning}
+              onClick={() => runBatchOp('enable')}
+              size="small"
+              style={{ marginLeft: 8 }}
+              type="primary"
+              ghost
+            >
+              批量启用({selectedIds.length})
+            </Button>
+            <Button
+              loading={batchOpRunning}
+              onClick={() => runBatchOp('disable')}
+              size="small"
+              style={{ marginLeft: 8 }}
+            >
+              批量停用
+            </Button>
+            <Popconfirm
+              onConfirm={() => runBatchOp('delete')}
+              title={`确认删除选中的 ${selectedIds.length} 条规则?`}
+            >
+              <Button danger loading={batchOpRunning} size="small" style={{ marginLeft: 8 }}>
+                批量删除
+              </Button>
+            </Popconfirm>
+          </>
+        )}
         <Table
           columns={columns}
           dataSource={filtered}
           loading={servicesQ.isLoading}
           pagination={false}
           rowKey="id"
+          rowSelection={{
+            onChange: (ids) => setSelectedIds(ids as number[]),
+            selectedRowKeys: selectedIds,
+          }}
           size="middle"
           style={{ marginTop: 12 }}
         />

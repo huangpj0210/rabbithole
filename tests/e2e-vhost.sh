@@ -199,6 +199,36 @@ neg=$(curl -sk -o /dev/null -w "%{http_code}" -m 8 --resolve "nope.vh.test:$VH_H
 # 未知 SNI:服务端 peek 后无路由直接关闭,curl 得不到 200(通常 000 连接层失败)
 [ "$neg" != "200" ]; check $? "HTTPS SNI:未知域名被拒(无 200,code=$neg)"
 
+# ---------- M2:规则级自定义 404 + HTTP 静态缓存 ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"m2\",\"kind\":\"http\",\"target_host\":\"127.0.0.1\",\"target_port\":$HDR1,\"enabled\":true,\"http\":{\"custom_domains\":[\"m2.vh.test\"],\"locations\":[\"/api\"],\"not_found_html\":\"<h1>m2-nf</h1>\",\"cache\":{\"ttl_seconds\":60,\"max_size_mb\":1,\"extensions\":[\"js\"],\"max_item_size_kb\":16}}}"
+wait_rule m2
+m2nf=$(curl -s -m 8 -H "Host: m2.vh.test" "http://127.0.0.1:$VH_HTTP/other")
+m2ok=$(curl -s -m 8 -H "Host: m2.vh.test" "http://127.0.0.1:$VH_HTTP/api")
+[ "$m2nf" = "<h1>m2-nf</h1>" ] && [ "$m2ok" = "OK" ]; check $? "M2 规则级 404:未命中 locations 返回自定义页($m2nf / $m2ok)"
+cache1=$(curl -s -D - -o /dev/null -m 8 -H "Host: m2.vh.test" "http://127.0.0.1:$VH_HTTP/api/app.js" | tr -d '\r' | grep -i '^x-cache:' | awk '{print tolower($2)}')
+cache2=$(curl -s -D - -o /dev/null -m 8 -H "Host: m2.vh.test" "http://127.0.0.1:$VH_HTTP/api/app.js" | tr -d '\r' | grep -i '^x-cache:' | awk '{print tolower($2)}')
+[ "$cache1" = "miss" ] && [ "$cache2" = "hit" ]; check $? "M2 静态缓存:首访 MISS 二访 HIT($cache1/$cache2)"
+
+# ---------- M3:证书管理 + SNI 服务端终结 ----------
+CERT_JSON=$(python3 - "$WORK/tls.crt" "$WORK/tls.key" <<'CERTEOF'
+import json, sys
+cert = open(sys.argv[1]).read(); key = open(sys.argv[2]).read()
+print(json.dumps({"name": "e2e-cert", "cert_pem": cert, "key_pem": key}))
+CERTEOF
+)
+up=$(api -X POST "http://127.0.0.1:$API/api/certs" -H 'Content-Type: application/json' -d "$CERT_JSON")
+upid=$(echo "$up" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["id"])' 2>/dev/null)
+CERT_LIST=$(api "http://127.0.0.1:$API/api/certs" | python3 -c 'import json,sys;d=json.load(sys.stdin)["data"];print(len(d)==1 and d[0]["fingerprint"]!="" and "one.vh.test" in d[0]["domains"] and "key_pem" not in d[0])' 2>/dev/null)
+[ "$CERT_LIST" = "True" ]; check $? "M3 证书上传:列表含指纹/域名且不回显私钥"
+m3code=$(curl -s --cacert "$WORK/tls.crt" -o /dev/null -w "%{http_code}" -m 8 --resolve "one.vh.test:$VH_HTTPS:127.0.0.1" "https://one.vh.test:$VH_HTTPS/x" 2>/dev/null)
+m3rc=$?
+[ "$m3rc" = "0" ] && [ "$m3code" = "404" ]; check $? "M3 SNI 服务端终结:证书校验通过且走 HTTP 路由(rc=$m3rc code=$m3code)"
+badcert=$(api -X POST "http://127.0.0.1:$API/api/certs" -H 'Content-Type: application/json' -d '{"name":"bad","cert_pem":"nope","key_pem":"nope"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["code"]!=0)' 2>/dev/null)
+[ "$badcert" = "True" ]; check $? "M3 非法 PEM 被拒"
+api -X DELETE "http://127.0.0.1:$API/api/certs/$upid" > /dev/null
+back1=$(curl -sk -m 8 --resolve "one.vh.test:$VH_HTTPS:127.0.0.1" "https://one.vh.test:$VH_HTTPS/after" 2>/dev/null)
+[ "$back1" = "OK" ]; check $? "M3 证书删除后恢复 passthrough($back1)"
+
 echo
 echo "== 结果: PASS=$PASS FAIL=$FAIL =="
 [ "$FAIL" = "0" ]

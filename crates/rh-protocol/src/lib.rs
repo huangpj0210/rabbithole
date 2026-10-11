@@ -14,9 +14,9 @@ pub use frame::{
 };
 pub use message::{forward_flags, ClientMessage, ServerMessage};
 pub use proxy::{
-    BandwidthMode, HeaderOp, HealthCheckKind, HealthCheckSpec, HttpProxyConfig, HttpsProxyConfig,
-    PluginKind, PluginSpec, ProxyKind, ProxyProtoVersion, ProxySpec, ProxyTransport,
-    StcpProxyConfig, SudpProxyConfig, TcpMuxProxyConfig, UdpProxyConfig,
+    BandwidthMode, CacheConfig, HeaderOp, HealthCheckKind, HealthCheckSpec, HttpProxyConfig,
+    HttpsProxyConfig, PluginKind, PluginSpec, ProxyKind, ProxyProtoVersion, ProxySpec,
+    ProxyTransport, StcpProxyConfig, SudpProxyConfig, TcpMuxProxyConfig, UdpProxyConfig,
 };
 pub use visitor::{VisitorKind, VisitorSpec};
 

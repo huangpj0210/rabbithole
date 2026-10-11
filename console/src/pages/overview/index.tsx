@@ -2,7 +2,7 @@ import { listEvents, statsOverview } from '@/api/rabbithole';
 import { fmtBytes, fmtTime } from '@/utils/format';
 import { useQuery } from '@tanstack/react-query';
 import { PageContainer } from '@ant-design/pro-components';
-import { Card, Col, Row, Statistic, Table, Tag } from 'antd';
+import { Card, Col, Row, Select, Statistic, Table, Tag } from 'antd';
 import React, { useRef } from 'react';
 import {
   CartesianGrid,
@@ -30,9 +30,10 @@ const OverviewPage: React.FC = () => {
     queryFn: statsOverview,
     refetchInterval: 5000,
   });
+  const [level, setLevel] = React.useState<string>('');
   const eventsQ = useQuery({
-    queryKey: ['events', 20],
-    queryFn: () => listEvents({ limit: 20 }),
+    queryKey: ['events', 20, level],
+    queryFn: () => listEvents(level ? { limit: 20, level } : { limit: 20 }),
     refetchInterval: 5000,
   });
 
@@ -155,7 +156,25 @@ const OverviewPage: React.FC = () => {
         </ResponsiveContainer>
       </Card>
 
-      <Card style={{ marginTop: 16 }} title="最近事件">
+      <Card
+        extra={
+          <Select
+            allowClear
+            onChange={(v) => setLevel(v ?? '')}
+            options={[
+              { label: '全部', value: '' },
+              { label: 'info', value: 'info' },
+              { label: 'warn', value: 'warn' },
+              { label: 'error', value: 'error' },
+            ]}
+            placeholder="级别"
+            style={{ width: 110 }}
+            value={level || undefined}
+          />
+        }
+        style={{ marginTop: 16 }}
+        title="最近事件"
+      >
         <Table
           columns={eventColumns}
           dataSource={events}

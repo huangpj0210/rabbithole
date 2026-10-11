@@ -1,10 +1,10 @@
 //! rh-server 配置(TOML)。示例见 deploy/rh-server.toml。
 
 use rh_core::net::PortsRange;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     pub bind_addr: String,
@@ -29,7 +29,7 @@ pub struct ServerConfig {
     pub log: LogConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct ListenerConfig {
     /// tcp | tls | ws | wss | quic | kcp
@@ -40,14 +40,14 @@ pub struct ListenerConfig {
     pub tls: Option<TlsServerFileConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct TlsServerFileConfig {
     pub cert_file: Option<PathBuf>,
     pub key_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WebConfig {
     /// 管理 API 监听;默认仅本机。
@@ -76,7 +76,7 @@ impl Default for WebConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct VhostConfig {
     /// HTTP vhost 共享监听端口;0 = 关闭。
@@ -94,7 +94,7 @@ pub struct VhostConfig {
     pub custom_404_page: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 #[derive(Default)]
 pub struct PortsConfig {
@@ -106,7 +106,7 @@ pub struct PortsConfig {
     pub max_services_per_client: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsConfig {
     pub max_pool_size: u8,
@@ -140,7 +140,7 @@ impl Default for LimitsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct SshGatewayConfig {
     pub enabled: bool,
@@ -150,7 +150,7 @@ pub struct SshGatewayConfig {
     pub auto_gen_key_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct NatholeConfig {
     /// 打洞 STUN 服务器(host:port);客户端用。
@@ -169,13 +169,13 @@ impl Default for NatholeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     pub enable_prometheus: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LogConfig {
     pub level: String,
@@ -206,13 +206,5 @@ impl ServerConfig {
                 end: 25000,
             }],
         }
-    }
-
-    pub fn allow_ports(&self) -> Vec<PortsRange> {
-        self.ports
-            .allow_ports
-            .iter()
-            .filter_map(|s| PortsRange::parse(s))
-            .collect()
     }
 }

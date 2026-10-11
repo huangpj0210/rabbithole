@@ -17,7 +17,7 @@ export interface ClientRow {
   hostname: string;
   os: string;
   expected_revision: number;
-  /** F2 配额(M1 后端落地前不返回,optional 容错)。 */
+  /** F2 配额(0/空 = 不限)。 */
   rate_limit?: string;
   max_conns?: number;
   flow_limit?: number;
@@ -206,6 +206,44 @@ export async function statsOverview(): Promise<StatsOverview> {
 }
 export async function listEvents(params?: { limit?: number; level?: string }): Promise<EventRow[]> {
   return httpGet<EventRow[]>('/events', { params });
+}
+
+// ---------- 服务器配置(热生效子集) ----------
+export interface ServerConfigView {
+  config: Record<string, any>;
+  hot: {
+    allow_ports: string[];
+    log_level: string;
+    max_services_per_client: number;
+    ssh_gateway: {
+      enabled: boolean;
+      bind_addr: string;
+      bind_port: number;
+    };
+  };
+  authorized_keys: null | string;
+}
+
+export interface ServerConfigUpdate {
+  ports?: { allow_ports?: string[]; max_services_per_client?: number };
+  log?: { level?: string };
+  ssh_gateway?: { enabled?: boolean; bind_addr?: string; bind_port?: number };
+  authorized_keys?: string;
+}
+
+export interface ServerConfigResult {
+  applied: string[];
+  error?: string;
+  persisted: boolean;
+  restart_required: string[];
+}
+
+export async function getServerConfig(): Promise<ServerConfigView> {
+  return httpGet<ServerConfigView>('/server/config');
+}
+
+export async function putServerConfig(update: ServerConfigUpdate): Promise<ServerConfigResult> {
+  return httpPut<ServerConfigResult>('/server/config', update);
 }
 
 /** 修改自身密码:成功后所有会话失效(后端轮换 JWT 密钥),需重新登录。 */

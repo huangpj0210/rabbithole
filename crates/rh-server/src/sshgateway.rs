@@ -22,6 +22,52 @@ pub struct SshGateway {
     host_key_dir: PathBuf,
 }
 
+/// SSH 网关监督任务:跟随热配置启停监听(网页开关/换端口/换公钥即时生效)。
+/// 每次变更取消当前 serve(在途会话随连接自然结束),按最新配置重建。
+pub async fn supervisor(
+    state: Arc<AppState>,
+    mut watch: tokio::sync::watch::Receiver<u64>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        let cfg = state.hot.read().await.ssh_gateway.clone();
+        if cfg.enabled {
+            let key_dir = cfg.auto_gen_key_dir.clone().unwrap_or_else(|| {
+                state
+                    .cfg
+                    .config_path
+                    .parent()
+                    .map(|p| p.to_path_buf().join("certs"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("certs"))
+            });
+            let token = CancellationToken::new();
+            let gw = SshGateway::new(state.clone(), key_dir);
+            let t2 = token.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = gw.serve(t2).await {
+                    tracing::warn!(error = %e, "ssh gateway serve error");
+                }
+            });
+            tokio::select! {
+                _ = watch.changed() => {
+                    token.cancel();
+                    let _ = handle.await;
+                }
+                _ = shutdown.cancelled() => {
+                    token.cancel();
+                    let _ = handle.await;
+                    return;
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = watch.changed() => {}
+                _ = shutdown.cancelled() => return,
+            }
+        }
+    }
+}
+
 impl SshGateway {
     pub fn new(state: Arc<AppState>, host_key_dir: PathBuf) -> Self {
         Self {
@@ -30,8 +76,8 @@ impl SshGateway {
         }
     }
 
-    pub async fn serve(self) -> anyhow::Result<()> {
-        let cfg = self.state.cfg.ssh_gateway.clone();
+    pub async fn serve(self, stop: CancellationToken) -> anyhow::Result<()> {
+        let cfg = self.state.hot.read().await.ssh_gateway.clone();
         let authorized_keys = load_authorized_keys(cfg.authorized_keys_file.as_ref());
         let host_key = load_or_gen_host_key(&self.host_key_dir)?;
         let scfg = Arc::new(russh::server::Config {
@@ -49,9 +95,12 @@ impl SshGateway {
         let l = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!(%addr, "ssh gateway up");
         loop {
-            let (sock, _peer) = match l.accept().await {
-                Ok(v) => v,
-                Err(_) => continue,
+            let (sock, _peer) = tokio::select! {
+                a = l.accept() => match a { Ok(v) => v, Err(_) => continue },
+                _ = stop.cancelled() => {
+                    tracing::info!("ssh gateway stopped (config change)");
+                    return Ok(());
+                }
             };
             let state = self.state.clone();
             let keys = authorized_keys.clone();
@@ -267,7 +316,7 @@ impl Handler for SshSession {
         } else {
             // 客户端指定端口必须过白名单与占用检查(与常规规则同策略,
             // 不得绕过 allow_ports 在服务器上抢占任意端口)
-            if !self.state.proxies.port_allowed(requested) {
+            if !self.state.proxies.port_allowed(requested).await {
                 tracing::warn!(
                     client = %self.client_id,
                     port = requested,

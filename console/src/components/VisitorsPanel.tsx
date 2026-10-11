@@ -4,6 +4,7 @@ import {
   disableVisitor,
   enableVisitor,
   listClients,
+  listServices,
   listVisitors,
   updateVisitor,
 } from '@/api/rabbithole';
@@ -35,8 +36,20 @@ const VisitorsPanel: React.FC = () => {
 
   const visitorsQ = useQuery({ queryKey: ['visitors'], queryFn: () => listVisitors() });
   const clientsQ = useQuery({ queryKey: ['clients'], queryFn: listClients });
+  const servicesQ = useQuery({ queryKey: ['services'], queryFn: () => listServices() });
   const clients: ClientRow[] = clientsQ.data ?? [];
   const rows = visitorsQ.data ?? [];
+
+  // 目标代理候选:同类型规则名去重(与服务端解析的 名称+类型 匹配口径一致)
+  const targetOptions = Array.from(
+    new Set(
+      (servicesQ.data ?? [])
+        .filter((r) => ['stcp', 'sudp', 'xtcp'].includes(r.kind))
+        .map((r) => r.name),
+    ),
+  )
+    .sort()
+    .map((n) => ({ label: n, value: n }));
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['visitors'] });
@@ -230,8 +243,18 @@ const VisitorsPanel: React.FC = () => {
           <Form.Item label="本地监听端口" name="bind_port" rules={[{ required: true, message: '请输入端口' }]}>
             <InputNumber max={65535} min={1} precision={0} />
           </Form.Item>
-          <Form.Item label="目标代理名" name="target_proxy_name" rules={[{ required: true, message: '请输入目标代理名' }]}>
-            <Input placeholder="sdb(类型须与目标规则一致)" />
+          <Form.Item
+            extra="类型须与目标规则一致"
+            label="目标代理名"
+            name="target_proxy_name"
+            rules={[{ required: true, message: '请选择目标代理' }]}
+          >
+            <Select
+              notFoundContent="暂无 STCP/SUDP/XTCP 规则,请先在「规则」页创建"
+              options={targetOptions}
+              placeholder="选择目标规则"
+              showSearch
+            />
           </Form.Item>
           <Form.Item
             extra={editId ? '留空则清除密钥' : undefined}
