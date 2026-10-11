@@ -43,7 +43,7 @@ async fn serve_http(state: Arc<AppState>, sock: TcpStream, peer: SocketAddr) -> 
     let conn = builder
         .timer(hyper_util::rt::TokioTimer::new())
         .serve_connection(
-            hyper_util::rt::TokioIo::new(sock),
+            hyper_util::rt::TokioIo::new(crate::data::CountedUserIo::new(sock, st.metrics.clone())),
             service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let st = st.clone();
                 let peer = peer;
@@ -337,7 +337,7 @@ async fn serve_https(
         channel
     };
     let mut channel = channel;
-    let mut sock = sock;
+    let mut sock = crate::data::CountedUserIo::new(sock, state.metrics.clone());
     let _ = tokio::io::copy_bidirectional(&mut sock, &mut channel).await;
     Ok(())
 }
@@ -568,6 +568,7 @@ async fn serve_tcpmux(
         if !tail.is_empty() && channel.write_all(&tail).await.is_err() {
             return Ok(());
         }
+        let mut sock = crate::data::CountedUserIo::new(sock, state.metrics.clone());
         let _ = tokio::io::copy_bidirectional(&mut sock, &mut channel).await;
         return Ok(());
     }
@@ -598,7 +599,7 @@ async fn serve_tcpmux(
                     return;
                 };
                 let mut ch = ch;
-                let mut stream = stream;
+                let mut stream = crate::data::CountedUserIo::new(stream, st2.metrics.clone());
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut ch).await;
             }
         });

@@ -256,7 +256,7 @@ async fn relay_udp(
             }
         };
         let mut a = a;
-        let mut b = b;
+        let mut b = crate::data::CountedUserIo::new(b, st.metrics.clone());
         let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
         st.udp_relays.lock().await.remove(&vid);
     });
@@ -367,9 +367,9 @@ async fn splice_relay(
 ) {
     let _ = (&pspec, src_addr);
     let mut a = proxy_stream;
-    let mut b = visitor_stream;
+    // 计量取 visitor 侧(用户侧口径,与 tcp/vhost 一致)
+    let mut b = crate::data::CountedUserIo::new(visitor_stream, state.metrics.clone());
     let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
-    let _ = &state;
 }
 
 fn conv_proxy_proto(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::ProxyProto {

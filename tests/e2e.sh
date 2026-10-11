@@ -667,6 +667,9 @@ TOKEN=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/auth/login" \
 stats=$(api "http://127.0.0.1:$API_PORT/api/stats/overview")
 echo "$stats" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; sys.exit(0 if d["clients_total"]>=1 and d["services_total"]>=6 else 1)'
 check $? "统计总览"
+# F1 流量计量:此前 suite 已跑过 TCP/UDP/HTTP 等多类转发,全局字节计数必须 > 0
+echo "$stats" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; sys.exit(0 if d["bytes_in"]>0 and d["bytes_out"]>0 else 1)'
+check $? "流量统计(F1:入/出站字节数递增)"
 events=$(api "http://127.0.0.1:$API_PORT/api/events?limit=5" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"])>0)')
 [ "$events" = "True" ]; check $? "事件查询"
 metrics=$(curl -s -m 5 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")

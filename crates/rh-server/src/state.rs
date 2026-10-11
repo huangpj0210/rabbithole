@@ -141,6 +141,9 @@ pub struct Metrics {
     pub registry: prometheus::Registry,
     pub connections: prometheus::IntGaugeVec,
     pub client_online: prometheus::IntGauge,
+    /// F1 全局字节计量(用户侧口径,含请求/响应头)。
+    pub bytes_in_total: prometheus::IntCounter,
+    pub bytes_out_total: prometheus::IntCounter,
     /// 汇总(控制台 overview)。
     pub totals: std::sync::Mutex<Totals>,
 }
@@ -154,7 +157,7 @@ pub struct Totals {
 
 impl Metrics {
     pub fn new() -> Self {
-        use prometheus::{self, IntGauge, IntGaugeVec, Opts, Registry};
+        use prometheus::{self, IntCounter, IntGauge, IntGaugeVec, Opts, Registry};
         let registry = Registry::new();
         let connections = IntGaugeVec::new(
             Opts::new("rabbithole_connections", "active forwarded connections"),
@@ -162,14 +165,40 @@ impl Metrics {
         )
         .unwrap();
         let client_online = IntGauge::new("rabbithole_clients_online", "online clients").unwrap();
+        let bytes_in_total =
+            IntCounter::new("rabbithole_bytes_in_total", "bytes received from users").unwrap();
+        let bytes_out_total =
+            IntCounter::new("rabbithole_bytes_out_total", "bytes sent to users").unwrap();
         let _ = registry.register(Box::new(connections.clone()));
         let _ = registry.register(Box::new(client_online.clone()));
+        let _ = registry.register(Box::new(bytes_in_total.clone()));
+        let _ = registry.register(Box::new(bytes_out_total.clone()));
         Self {
             registry,
             connections,
             client_online,
+            bytes_in_total,
+            bytes_out_total,
             totals: std::sync::Mutex::new(Totals::default()),
         }
+    }
+
+    /// 用户→服务端方向 n 字节(入站):totals 供控制台,counter 供 /metrics。
+    pub fn count_user_in(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.bytes_in_total.inc_by(n as u64);
+        self.totals.lock().unwrap().bytes_in += n as u64;
+    }
+
+    /// 服务端→用户方向 n 字节(出站)。
+    pub fn count_user_out(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.bytes_out_total.inc_by(n as u64);
+        self.totals.lock().unwrap().bytes_out += n as u64;
     }
 }
 

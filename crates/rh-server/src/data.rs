@@ -301,6 +301,66 @@ where
     }
 }
 
+/// F1 全局计量:用户侧 IO 透明包装。read 计入入站、write 计入出站,
+/// 不改变任何 IO 行为;tcp/vhost/tcpmux/visitor 的用户连接统一套用。
+pub struct CountedUserIo<T> {
+    inner: T,
+    metrics: Arc<crate::state::Metrics>,
+}
+
+impl<T> CountedUserIo<T> {
+    pub fn new(inner: T, metrics: Arc<crate::state::Metrics>) -> Self {
+        Self { inner, metrics }
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountedUserIo<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                self.metrics.count_user_in(buf.filled().len() - before);
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountedUserIo<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match std::pin::Pin::new(&mut self.inner).poll_write(cx, buf) {
+            std::task::Poll::Ready(Ok(n)) => {
+                self.metrics.count_user_out(n);
+                std::task::Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// TCP 监听服务循环(独享端口或组成员共享)。
 pub async fn tcp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, listener: TcpListener) {
     let local = listener.local_addr().ok();
@@ -364,7 +424,7 @@ async fn serve_tcp_user(
         &state,
         &target_rt,
         channel,
-        Box::new(sock),
+        Box::new(CountedUserIo::new(sock, state.metrics.clone())),
         &peer.to_string(),
         local,
     )
@@ -480,6 +540,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                 r = sock.recv_from(&mut pkt_buf) => {
                     match r {
                         Ok((n, peer)) => {
+                            state.metrics.count_user_in(n);
                             let payload = udp_packet::encode(&peer.to_string(), &pkt_buf[..n]);
                             if rh_protocol::write_frame(&mut ch_w, FrameType::UDP_PACKET, &payload).await.is_err() {
                                 break true;
@@ -495,6 +556,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                             if let Some((src, data)) = udp_packet::decode(&p) {
                                 if let Ok(addr) = src.parse::<SocketAddr>() {
                                     let _ = sock.send_to(data, addr).await;
+                                    state.metrics.count_user_out(data.len());
                                     sessions.insert(addr, Instant::now());
                                 }
                                 last_alive = Instant::now();

@@ -556,3 +556,23 @@ client_id 列(无跨客户端改属主风险);协议按 proxy_id/revision 关联
 验证:cargo fmt/clippy 0 警告/test 42/42;console typecheck/build exit 0;
 release 重编;e2e 全套复跑:e2e.sh 56/56、embed 9/9、resilience 19/19、
 vhost 10/10、plugins 15/15、transports 12/12、xtcp 9/9(计 130 项)。
+
+## R20(2026-10-11)F1 全局流量计量落地(用户实测:总览流量恒 0)
+
+用户报告总览页入/出站流量在有真实转发时恒为 0 —— 即 design-parity F1 记录的
+"字段存在但从未计数"空壳展示。本次落地**全局口径**(总览卡片 + 速率图即实数据):
+
+- `Metrics` 新增 `count_user_in/out(n)`(totals 供控制台 + `rabbithole_bytes_in/out_total`
+  IntCounter 供 /metrics)。
+- `data.rs` 新增 `CountedUserIo<T>`:用户侧 IO 透明包装(read→入站,write→出站,
+  不改任何 IO 行为),七个服务端入口统一套用:TCP(serve_tcp_user)、HTTP vhost
+  (hyper 连接层包装)、HTTPS vhost、TCPMux passthrough、TCPMux 标准模式(每流)、
+  visitor TCP/UDP 中继(splice_relay / relay_udp,取 visitor 侧=用户口径)、
+  UDP 规则(udp_serve_loop 内联 recv_from/send_to 计数)。
+- XTCP 打洞直连流量不经过服务端,天然不计;SSH 网关流量暂未计量(已知限制)。
+- 计数为进程内存量,重启归零;分客户端/分规则(F1 完整口径,需 0002 迁移)仍属 M1 未落地。
+
+验证:e2e.sh 新增断言"流量统计(F1:入/出站字节数递增)"(套件内多类真实转发后
+/api/stats/overview bytes_in/out 必须 > 0),57/57;全套 131 项复跑全绿
+(vhost 10 / plugins 15 / transports 12 / xtcp 9 / resilience 19 / embed 9);
+fmt/clippy 0 警告、test 42/42。
