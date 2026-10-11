@@ -12,6 +12,7 @@ import type { ClientRow, VisitorRow } from '@/api/rabbithole';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { PlusOutlined } from '@ant-design/icons';
 import { App, Button, Card, Checkbox, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Switch, Table, Tag } from 'antd';
+import { InfoLabel } from '@/components/ui';
 import type { ColumnsType } from 'antd/es/table';
 import React, { useEffect, useState } from 'react';
 
@@ -239,11 +240,11 @@ const VisitorsPanel: React.FC<{ seed?: VisitorSeed | null; onSeedUsed?: () => vo
           onFinish={(values) => saveMut.mutate({ id: editId, values })}
           wrapperCol={{ span: 16 }}
         >
-          <Form.Item label="所属客户端" name="client_id" rules={[{ required: true, message: '请选择客户端' }]}>
+          <Form.Item label={<InfoLabel info="在这台客户端上打开本地监听端口,访问器随它运行" title="所属客户端" />} name="client_id" rules={[{ required: true, message: '请选择客户端' }]}>
             <Select disabled={!!editId} options={clients.map((c) => ({ label: c.name, value: c.id }))} />
           </Form.Item>
           <Form.Item
-            label="名称"
+            label={<InfoLabel info="访问器标识,同一客户端内唯一" title="名称" />}
             name="name"
             rules={[
               { required: true, message: '请输入名称' },
@@ -252,7 +253,7 @@ const VisitorsPanel: React.FC<{ seed?: VisitorSeed | null; onSeedUsed?: () => vo
           >
             <Input />
           </Form.Item>
-          <Form.Item label="类型" name="kind" rules={[{ required: true }]}>
+          <Form.Item label={<InfoLabel info="须与目标规则类型一致" title="类型" />} name="kind" rules={[{ required: true }]}>
             <Select
               disabled={!!editId}
               options={[
@@ -262,15 +263,14 @@ const VisitorsPanel: React.FC<{ seed?: VisitorSeed | null; onSeedUsed?: () => vo
               ]}
             />
           </Form.Item>
-          <Form.Item label="本地监听地址" name="bind_addr">
+          <Form.Item label={<InfoLabel info="访问端本地绑定地址,访问方连接它进入隧道" title="本地监听地址" />} name="bind_addr">
             <Input placeholder="127.0.0.1" />
           </Form.Item>
-          <Form.Item label="本地监听端口" name="bind_port" rules={[{ required: true, message: '请输入端口' }]}>
+          <Form.Item label={<InfoLabel info="本地入口端口,流量经服务端中继或打洞直达目标规则" title="本地监听端口" />} name="bind_port" rules={[{ required: true, message: '请输入端口' }]}>
             <InputNumber max={65535} min={1} precision={0} />
           </Form.Item>
           <Form.Item
-            extra="类型须与目标规则一致;中继密钥自动继承目标规则,无需重复填写"
-            label="目标代理名"
+            label={<InfoLabel info="选择要访问的密钥访问规则,类型须一致;中继凭据自动继承目标规则,无需填写" title="目标代理名" />}
             name="target_proxy_name"
             rules={[{ required: true, message: '请选择目标代理' }]}
           >
@@ -281,7 +281,7 @@ const VisitorsPanel: React.FC<{ seed?: VisitorSeed | null; onSeedUsed?: () => vo
               showSearch
             />
           </Form.Item>
-          <Form.Item label="压缩" name="use_compression" valuePropName="checked">
+          <Form.Item label={<InfoLabel info="中继通道启用 snappy 压缩" title="压缩" />} name="use_compression" valuePropName="checked">
             <Checkbox>启用 snappy 压缩</Checkbox>
           </Form.Item>
         </Form>

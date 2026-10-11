@@ -7,7 +7,7 @@ import {
 } from '@/api/rabbithole';
 import type { ClientRow } from '@/api/rabbithole';
 import SecretModal from '@/components/SecretModal';
-import { Mono, MonoCopy, StatusBadge } from '@/components/ui';
+import { InfoLabel, Mono, MonoCopy, StatusBadge } from '@/components/ui';
 import { fmtBytes } from '@/utils/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -360,7 +360,7 @@ const ClientsPage: React.FC = () => {
       >
         <Form form={form} labelCol={{ span: 5 }} wrapperCol={{ span: 17 }}>
           <Form.Item
-            label="名称"
+            label={<InfoLabel info="客户端显示名;创建后凭据仅展示一次" title="名称" />}
             name="name"
             rules={[
               { required: true, message: '请输入名称' },
@@ -369,24 +369,21 @@ const ClientsPage: React.FC = () => {
           >
             <Input placeholder="edge-1" />
           </Form.Item>
-          <Form.Item label="备注" name="remark">
+          <Form.Item label={<InfoLabel info="任意说明文字,便于识别机器" title="备注" />} name="remark">
             <Input.TextArea placeholder="可选" rows={2} />
           </Form.Item>
-          <Form.Item label="高级配置" style={{ marginBottom: 0 }}>
+          <Form.Item label={<InfoLabel info="配额与限速;保存即生效,并发/流量上限在接入时执行,限速在 TCP 隧道转发中执行" title="高级配置" />} style={{ marginBottom: 0 }}>
             <Card size="small" style={{ background: '#fafafa' }}>
-              <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>
-                配额保存即生效:并发/流量上限在接入时执行,限速在 TCP 隧道转发中执行
-              </div>
-              <Form.Item label="限速" name="rate_limit" style={{ marginBottom: 8 }}>
+              <Form.Item label={<InfoLabel info="客户端整体限速,如 1MB / 512KB;留空不限" title="限速" />} name="rate_limit" style={{ marginBottom: 8 }}>
                 <Input placeholder="如 1MB / 512KB,留空不限" />
               </Form.Item>
-              <Form.Item label="最大连接" name="max_conns" style={{ marginBottom: 8 }}>
+              <Form.Item label={<InfoLabel info="该客户端全部规则的并发连接上限" title="最大连接" />} name="max_conns" style={{ marginBottom: 8 }}>
                 <InputNumber min={0} placeholder="0 = 不限" precision={0} style={{ width: '100%' }} />
               </Form.Item>
-              <Form.Item label="最大规则数" name="max_services" style={{ marginBottom: 8 }}>
+              <Form.Item label={<InfoLabel info="可创建规则数上限;0 = 用全局默认" title="最大规则数" />} name="max_services" style={{ marginBottom: 8 }}>
                 <InputNumber min={0} placeholder="0 = 不限" precision={0} style={{ width: '100%' }} />
               </Form.Item>
-              <Form.Item label="流量上限(MB)" name="flow_limit_mb" style={{ marginBottom: 0 }}>
+              <Form.Item label={<InfoLabel info="入+出累计流量达到上限后拒绝新连接" title="流量上限(MB)" />} name="flow_limit_mb" style={{ marginBottom: 0 }}>
                 <InputNumber min={0} placeholder="0 = 不限" precision={0} style={{ width: '100%' }} />
               </Form.Item>
             </Card>

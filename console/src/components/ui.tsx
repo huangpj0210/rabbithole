@@ -1,4 +1,5 @@
-import { Typography } from 'antd';
+import { InfoCircleOutlined } from '@ant-design/icons';
+import { Tooltip, Typography } from 'antd';
 import React from 'react';
 
 /**
@@ -97,5 +98,24 @@ export const Mono: React.FC<{ children: React.ReactNode; style?: React.CSSProper
 }) => (
   <span className="rh-mono" style={{ fontSize: 13, ...style }}>
     {children}
+  </span>
+);
+
+/**
+ * 带说明的名词(§7 文案规范升级):名词 + ℹ 图标,悬停或点按弹出该项的功能说明,
+ * 替代"括号补充说明"式文案——说明内容不在界面常驻,界面只留名词本身。
+ */
+export const InfoLabel: React.FC<{ info: React.ReactNode; title: React.ReactNode }> = ({
+  title,
+  info,
+}) => (
+  <span>
+    {title}
+    <Tooltip title={info} trigger={['hover', 'click']}>
+      <InfoCircleOutlined
+        aria-label={typeof title === 'string' ? `${title} 说明` : '说明'}
+        style={{ color: 'rgba(0,0,0,0.45)', cursor: 'help', marginInlineStart: 4 }}
+      />
+    </Tooltip>
   </span>
 );

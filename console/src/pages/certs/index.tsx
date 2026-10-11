@@ -1,7 +1,7 @@
 import { createCert, deleteCert, listCerts, updateCert } from '@/api/rabbithole';
 import type { CertRow } from '@/api/rabbithole';
 import { fmtTime } from '@/utils/format';
-import { Mono, MonoCopy } from '@/components/ui';
+import { InfoLabel, Mono, MonoCopy } from '@/components/ui';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import { PageContainer } from '@ant-design/pro-components';
@@ -233,28 +233,27 @@ const CertsPage: React.FC = () => {
           onFinish={handleFinish}
           wrapperCol={{ span: 19 }}
         >
-          <Form.Item label="名称" name="name" rules={[{ required: true, message: '请输入名称' }]}>
+          <Form.Item label={<InfoLabel info="证书条目标识,便于识别" title="名称" />} name="name" rules={[{ required: true, message: '请输入名称' }]}>
             <Input placeholder="wildcard-example" />
           </Form.Item>
-          <Form.Item label="域名" name="domains">
+          <Form.Item label={<InfoLabel info="留空自动从证书 SAN/CN 提取;HTTPS 请求 SNI 命中(含单层通配)即由服务端终结 TLS" title="域名" />} name="domains">
             <Input placeholder="留空从证书 SAN/CN 自动提取" />
           </Form.Item>
           <Form.Item
-            label="证书 PEM"
+            label={<InfoLabel info="PEM 格式证书链,粘贴或用下方文件选择" title="证书 PEM" />}
             name="cert_pem"
             rules={[{ required: true, message: '请粘贴或上传证书 PEM' }]}
           >
             <Input.TextArea placeholder="-----BEGIN CERTIFICATE-----…" rows={5} />
           </Form.Item>
           <Form.Item
-            extra="私钥仅上传时提交,任何响应不回显;编辑时需重新粘贴"
-            label="私钥 PEM"
+            label={<InfoLabel info="仅上传时提交,任何响应不回显;编辑时需重新粘贴" title="私钥 PEM" />}
             name="key_pem"
             rules={[{ required: true, message: '请粘贴或上传私钥 PEM' }]}
           >
             <Input.Password placeholder="-----BEGIN PRIVATE KEY-----…" visibilityToggle />
           </Form.Item>
-          <Form.Item label="文件上传">
+          <Form.Item label={<InfoLabel info="按文件名或 PEM 头自动识别证书/私钥并填充" title="文件上传" />}>
             <Upload
               accept=".pem,.crt,.key,.txt"
               beforeUpload={async (file) => {

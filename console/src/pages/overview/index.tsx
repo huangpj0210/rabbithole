@@ -1,5 +1,6 @@
 import { listEvents, listServices, statsOverview } from '@/api/rabbithole';
 import { fmtBytes, fmtTime } from '@/utils/format';
+import { InfoLabel } from '@/components/ui';
 import { Mono, StatusBadge, proxyStatusSignal } from '@/components/ui';
 import { useQuery } from '@tanstack/react-query';
 import { PageContainer } from '@ant-design/pro-components';
@@ -89,7 +90,7 @@ const OverviewPage: React.FC = () => {
     [servicesQ.data],
   );
 
-  const metricCell = (label: string, value: React.ReactNode, extra?: React.ReactNode) => (
+  const metricCell = (label: string, value: React.ReactNode, extra?: React.ReactNode, info?: string) => (
     <div
       key={label}
       style={{
@@ -99,7 +100,7 @@ const OverviewPage: React.FC = () => {
         borderRight: '1px solid rgba(5,5,5,0.06)',
       }}
     >
-      <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12, marginBottom: 8 }}>{label}</div>
+      <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12, marginBottom: 8 }}>{info ? <InfoLabel info={info} title={label} /> : label}</div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
         <span className="rh-mono" style={{ fontSize: 28, fontWeight: 600, lineHeight: 1 }}>
           {value}
@@ -145,16 +146,18 @@ const OverviewPage: React.FC = () => {
             '在线客户端',
             stats ? `${stats.clients_online}` : '-',
             stats ? <Mono style={{ color: 'rgba(0,0,0,0.45)' }}>/ {stats.clients_total}</Mono> : undefined,
+            '已连接服务端的客户端数 / 注册总数',
           )}
           {metricCell(
             '运行服务',
             stats?.services_running ?? 0,
             stats ? <Mono style={{ color: 'rgba(0,0,0,0.45)' }}>/ {stats.services_total}</Mono> : undefined,
+            '正在监听公网入口的规则数 / 启用总数',
           )}
-          {metricCell('当前连接', stats?.conns_current ?? 0)}
-          {metricCell('入站速率', `${fmtBytes(curIn)}/s`)}
-          {metricCell('出站速率', `${fmtBytes(curOut)}/s`)}
-          {metricCell('累计流量', stats ? `${fmtBytes(stats.bytes_in + stats.bytes_out)}` : '-')}
+          {metricCell('当前连接', stats?.conns_current ?? 0, undefined, '全部规则当前承载的并发连接')}
+          {metricCell('入站速率', `${fmtBytes(curIn)}/s`, undefined, '公网侧流入服务端的流量速率(按最近采样)')}
+          {metricCell('出站速率', `${fmtBytes(curOut)}/s`, undefined, '服务端流向公网侧的流量速率(按最近采样)')}
+          {metricCell('累计流量', stats ? `${fmtBytes(stats.bytes_in + stats.bytes_out)}` : '-', undefined, '服务端启动以来的入+出累计(进程内计量,重启归零)')}
         </div>
       </Card>
 

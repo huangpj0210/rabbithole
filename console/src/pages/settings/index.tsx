@@ -4,6 +4,7 @@ import { useAuthStore } from '@/stores/auth';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { history } from '@umijs/max';
 import { PageContainer } from '@ant-design/pro-components';
+import { InfoLabel } from '@/components/ui';
 import { Alert, App, Button, Card, Checkbox, Form, Input, InputNumber, Select, Typography } from 'antd';
 import React from 'react';
 
@@ -95,9 +96,9 @@ const ServerConfigCard: React.FC = () => {
     <Card
       loading={cfgQ.isLoading}
       style={{ marginTop: 16 }}
-      title="服务器配置"
+      
       styles={{ header: { borderBottom: 'none' } }}
-      extra={<span style={{ fontSize: 12, color: 'rgba(0,0,0,0.45)' }}>保存后立即生效,无需重启</span>}
+      title={<InfoLabel info="保存后立即生效,无需重启;同时写回配置文件(原文件备份为 .bak,注释会丢失)" title="服务器配置" />}
     >
       <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
         {restartNote ??
@@ -105,16 +106,16 @@ const ServerConfigCard: React.FC = () => {
       </Typography.Paragraph>
       <Form form={sshForm} labelCol={{ span: 6 }} layout="horizontal" wrapperCol={{ span: 14 }}>
         <Typography.Title level={5}>SSH Tunnel Gateway</Typography.Title>
-        <Form.Item label="启用" name="enabled" valuePropName="checked">
+        <Form.Item label={<InfoLabel info="开启后可用 ssh -R 在服务端开临时转发端口,凭据与客户端一致" title="启用" />} name="enabled" valuePropName="checked">
           <Checkbox>开启 ssh -R 隧道入口</Checkbox>
         </Form.Item>
-        <Form.Item extra="留空 = 0.0.0.0" label="监听地址" name="bind_addr">
+        <Form.Item label={<InfoLabel info="SSH 网关绑定地址,留空 = 0.0.0.0" title="监听地址" />} name="bind_addr">
           <Input placeholder="0.0.0.0" />
         </Form.Item>
-        <Form.Item label="监听端口" name="bind_port">
+        <Form.Item label={<InfoLabel info="SSH 网关端口" title="监听端口" />} name="bind_port">
           <InputNumber max={65535} min={1} precision={0} />
         </Form.Item>
-        <Form.Item extra="每行一个公钥(用户名须为已启用客户端 ID);密码认证仍可用(客户端密钥)" label="公钥白名单">
+        <Form.Item label={<InfoLabel info="每行一个公钥,用户名须为已启用客户端 ID;密码认证(客户端密钥)始终可用" title="公钥白名单" />}>
           <Input.TextArea
             onChange={(e) => setKeys(e.target.value)}
             placeholder={'ssh-ed25519 AAAA... client-id\nssh-ed25519 AAAA... edge-2'}
@@ -125,14 +126,14 @@ const ServerConfigCard: React.FC = () => {
       </Form>
       <Form form={portsForm} labelCol={{ span: 6 }} layout="horizontal" wrapperCol={{ span: 14 }}>
         <Typography.Title level={5}>端口策略</Typography.Title>
-        <Form.Item extra="逗号分隔,支持范围(如 10000-20000,30000);空 = 不限制" label="允许端口">
+        <Form.Item label={<InfoLabel info="逗号分隔,支持范围如 10000-20000,30000;空 = 不限制" title="允许端口" />}>
           <Input placeholder="10000-40000" />
         </Form.Item>
-        <Form.Item extra="0 = 不限;客户端级配额在「客户端」页按客户端覆盖" label="每客户端最大规则数">
+        <Form.Item label={<InfoLabel info="全局默认上限;单个客户端可在「客户端」页覆盖,0 = 不限" title="每客户端最大规则数" />}>
           <InputNumber max={10000} min={0} precision={0} />
         </Form.Item>
         <Typography.Title level={5}>日志</Typography.Title>
-        <Form.Item label="级别">
+        <Form.Item label={<InfoLabel info="服务端日志级别,保存立即生效" title="级别" />}>
           <Select
             onChange={(v) => setLogLevel(v)}
             options={['trace', 'debug', 'info', 'warn', 'error'].map((v) => ({ label: v, value: v }))}

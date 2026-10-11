@@ -1,5 +1,6 @@
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import HeaderPairsInput from '@/components/HeaderPairsInput';
+import { InfoLabel } from '@/components/ui';
 import type { HeaderPairValue } from '@/components/HeaderPairsInput';
 import { Checkbox, Collapse, Divider, Form, Input, InputNumber, Modal, Select } from 'antd';
 import React, { useMemo, useState } from 'react';
@@ -447,13 +448,13 @@ const ProxyFormModal: React.FC<{
         label: '传输与限速',
         children: (
           <>
-            <Form.Item label="压缩" name="use_compression" valuePropName="checked">
+            <Form.Item label={<InfoLabel info="隧道传输启用 snappy 压缩,节省公网带宽" title="压缩" />} name="use_compression" valuePropName="checked">
               <Checkbox>启用 snappy 压缩</Checkbox>
             </Form.Item>
-            <Form.Item extra='如 "1MB" / "512KB",留空不限' label="带宽限制" name="bandwidth_limit">
+            <Form.Item label={<InfoLabel info="该规则单连接限速,如 1MB / 512KB;留空不限" title="带宽限制" />} name="bandwidth_limit">
               <Input placeholder="留空不限" />
             </Form.Item>
-            <Form.Item label="限速位置" name="bandwidth_mode">
+            <Form.Item label={<InfoLabel info="在服务端出口还是客户端入口执行限速" title="限速位置" />} name="bandwidth_mode">
               <Select
                 options={[
                   { label: '服务端(默认)', value: 'server' },
@@ -462,7 +463,7 @@ const ProxyFormModal: React.FC<{
               />
             </Form.Item>
             {(kind === 'tcp' || kind === 'http') && (
-              <Form.Item label="PROXY protocol" name="proxy_proto">
+              <Form.Item label={<InfoLabel info="向目标服务传递真实客户端地址:v1 明文头 / v2 二进制头" title="PROXY protocol" />} name="proxy_proto">
                 <Select
                   options={[
                     { label: '不启用', value: 'none' },
@@ -473,7 +474,7 @@ const ProxyFormModal: React.FC<{
               </Form.Item>
             )}
             {kind === 'tcp' && (
-              <Form.Item extra="0 = 使用服务端默认" label="连接池大小" name="pool_size">
+              <Form.Item label={<InfoLabel info="预热连接数,降低首包延迟;0 = 使用服务端默认" title="连接池大小" />} name="pool_size">
                 <InputNumber max={16} min={0} precision={0} />
               </Form.Item>
             )}
@@ -486,7 +487,7 @@ const ProxyFormModal: React.FC<{
         key: 'group',
         label: '负载均衡组',
         children: (
-          <Form.Item extra="组内同 (kind,bind) 规则共享监听并轮询分发" label="分组名" name="group">
+          <Form.Item label={<InfoLabel info="组内相同类型+监听端口的规则共享监听并轮询分发,实现负载均衡" title="分组名" />} name="group">
             <Input placeholder="留空不分组" />
           </Form.Item>
         ),
@@ -496,10 +497,10 @@ const ProxyFormModal: React.FC<{
         label: '健康检查',
         children: (
           <>
-            <Form.Item label="启用" name="hc_enabled" valuePropName="checked">
+            <Form.Item label={<InfoLabel info="客户端定期探测目标服务,连续失败自动摘除流量" title="启用" />} name="hc_enabled" valuePropName="checked">
               <Checkbox>客户端探测本地目标</Checkbox>
             </Form.Item>
-            <Form.Item label="检查类型" name="hc_type">
+            <Form.Item label={<InfoLabel info="TCP 端口连通或 HTTP 请求判定健康状态" title="检查类型" />} name="hc_type">
               <Select
                 options={[
                   { label: 'TCP 端口连通', value: 'tcp' },
@@ -507,16 +508,16 @@ const ProxyFormModal: React.FC<{
                 ]}
               />
             </Form.Item>
-            <Form.Item label="间隔(秒)" name="hc_interval">
+            <Form.Item label={<InfoLabel info="探测周期" title="间隔(秒)" />} name="hc_interval">
               <InputNumber min={1} precision={0} />
             </Form.Item>
-            <Form.Item label="超时(秒)" name="hc_timeout">
+            <Form.Item label={<InfoLabel info="单次探测的超时时间" title="超时(秒)" />} name="hc_timeout">
               <InputNumber max={60} min={1} precision={0} />
             </Form.Item>
-            <Form.Item label="连续失败阈值" name="hc_max_failed">
+            <Form.Item label={<InfoLabel info="连续失败达到该次数标记 unhealthy 并从池中摘除" title="连续失败阈值" />} name="hc_max_failed">
               <InputNumber min={1} precision={0} />
             </Form.Item>
-            <Form.Item label="HTTP 路径" name="hc_path">
+            <Form.Item label={<InfoLabel info="仅 HTTP 检查类型有效" title="HTTP 路径" />} name="hc_path">
               <Input placeholder="/healthz(仅 http 检查)" />
             </Form.Item>
           </>
@@ -529,25 +530,25 @@ const ProxyFormModal: React.FC<{
         label: 'HTTP 高级',
         children: (
           <>
-            <Form.Item extra="逗号分隔,如 /api,/static;空 = 全部" label="路由路径" name="locations">
+            <Form.Item label={<InfoLabel info="逗号分隔,如 /api,/static;空 = 匹配全部路径" title="路由路径" />} name="locations">
               <Input placeholder="/api,/static" />
             </Form.Item>
-            <Form.Item label="Host 改写" name="host_rewrite">
+            <Form.Item label={<InfoLabel info="改写转发到目标的 Host 头" title="Host 改写" />} name="host_rewrite">
               <Input placeholder="留空不改写" />
             </Form.Item>
-            <Form.Item label="Basic Auth 用户" name="http_user">
+            <Form.Item label={<InfoLabel info="访问本规则时要求基础认证,与密码成对填写" title="Basic Auth 用户" />} name="http_user">
               <Input placeholder="留空不启用" />
             </Form.Item>
-            <Form.Item label="Basic Auth 密码" name="http_password">
+            <Form.Item label={<InfoLabel info="与用户名成对填写的认证密码" title="Basic Auth 密码" />} name="http_password">
               <Input placeholder="与用户名成对填写" />
             </Form.Item>
-            <Form.Item label="请求头改写" name="req_headers">
+            <Form.Item label={<InfoLabel info="追加或覆盖发往目标的请求头" title="请求头改写" />} name="req_headers">
               <HeaderPairsInput />
             </Form.Item>
-            <Form.Item label="响应头改写" name="resp_headers">
+            <Form.Item label={<InfoLabel info="追加或覆盖返回客户端的响应头" title="响应头改写" />} name="resp_headers">
               <HeaderPairsInput />
             </Form.Item>
-            <Form.Item extra="经 PROXY protocol 传入的终端用户二级路由,留空不启用" label="按用户路由" name="route_by_http_user">
+            <Form.Item label={<InfoLabel info="按经 PROXY protocol 传入的终端用户分流,留空不启用" title="按用户路由" />} name="route_by_http_user">
               <Input placeholder="留空不启用" />
             </Form.Item>
           </>
@@ -555,10 +556,10 @@ const ProxyFormModal: React.FC<{
       });
       items.push({
         key: 'vhost-enhance',
-        label: '域名增强(需服务端 M2)',
+        label: '域名增强',
         children: (
           <>
-            <Form.Item label="自定义 404 页" name="not_found_html">
+            <Form.Item label={<InfoLabel info="域名命中但路径未命中时返回的 HTML,最多 8KiB" title="自定义 404 页" />} name="not_found_html">
               <Input.TextArea
                 maxLength={8192}
                 placeholder="HTML 内容,请求未命中 locations 时返回(≤8KiB)"
@@ -566,19 +567,19 @@ const ProxyFormModal: React.FC<{
                 showCount
               />
             </Form.Item>
-            <Form.Item label="静态缓存" name="cache_enabled" valuePropName="checked">
+            <Form.Item label={<InfoLabel info="缓存 GET 静态资源响应,命中直接由服务端返回(响应头 X-Cache: HIT/MISS)" title="静态缓存" />} name="cache_enabled" valuePropName="checked">
               <Checkbox>启用 HTTP 静态资源缓存</Checkbox>
             </Form.Item>
-            <Form.Item label="TTL(秒)" name="cache_ttl">
+            <Form.Item label={<InfoLabel info="缓存条目存活时间" title="TTL(秒)" />} name="cache_ttl">
               <InputNumber max={86400} min={10} precision={0} />
             </Form.Item>
-            <Form.Item label="缓存容量(MB)" name="cache_max_size_mb">
+            <Form.Item label={<InfoLabel info="规则级缓存总容量,满后逐出旧条目" title="缓存容量(MB)" />} name="cache_max_size_mb">
               <InputNumber max={256} min={1} precision={0} />
             </Form.Item>
-            <Form.Item extra="逗号分隔" label="缓存扩展名" name="cache_extensions">
+            <Form.Item label={<InfoLabel info="逗号分隔;仅这些扩展名的 GET 响应入缓存" title="缓存扩展名" />} name="cache_extensions">
               <Input placeholder="js,css,png" />
             </Form.Item>
-            <Form.Item label="单条上限(KB)" name="cache_max_item_size_kb">
+            <Form.Item label={<InfoLabel info="超过该大小的响应不缓存" title="单条上限(KB)" />} name="cache_max_item_size_kb">
               <InputNumber min={1} precision={0} />
             </Form.Item>
           </>
@@ -613,7 +614,7 @@ const ProxyFormModal: React.FC<{
         <Divider plain style={{ margin: '4px 0 16px' }} titlePlacement="left">
           连接
         </Divider>
-        <Form.Item label="所属客户端" name="client_id" rules={[{ required: true, message: '请选择客户端' }]}>
+        <Form.Item label={<InfoLabel info="承载并执行这条规则的边缘客户端,转发流量经它的隧道进出内网" title="所属客户端" />} name="client_id" rules={[{ required: true, message: '请选择客户端' }]}>
           <Select
             disabled={!!editing}
             options={clients.map((c) => ({ label: c.name, value: c.id }))}
@@ -621,7 +622,7 @@ const ProxyFormModal: React.FC<{
           />
         </Form.Item>
         <Form.Item
-          label="名称"
+          label={<InfoLabel info="规则唯一标识,1-64 位字母/数字/下划线/连字符;访问器按名称+类型匹配目标" title="名称" />}
           name="name"
           rules={[
             { required: true, message: '请输入名称' },
@@ -631,7 +632,7 @@ const ProxyFormModal: React.FC<{
           <Input placeholder="web-nginx" />
         </Form.Item>
         {multiKind && (
-          <Form.Item label="类型" name="kind" rules={[{ required: true }]}>
+          <Form.Item label={<InfoLabel info="转发协议,决定公网入口形态:端口直通(TCP/UDP)、域名路由(HTTP/HTTPS/TCPMux)或密钥访问(STCP/SUDP/XTCP)" title="类型" />} name="kind" rules={[{ required: true }]}>
             <Select
               disabled={!!editing}
               onChange={(v) => setKind(v as ProxyKind)}
@@ -641,22 +642,22 @@ const ProxyFormModal: React.FC<{
         )}
         {usesBind && (
           <>
-            <Form.Item label="监听 IP" name="bind_ip">
+            <Form.Item label={<InfoLabel info="服务端公网侧绑定地址,留空 0.0.0.0 监听全部网卡" title="监听 IP" />} name="bind_ip">
               <Input placeholder="0.0.0.0" />
             </Form.Item>
             {editing ? (
-              <Form.Item label="监听端口" name="bind_port" rules={[{ required: true, message: '请输入监听端口' }]}>
+              <Form.Item label={<InfoLabel info="服务端公网入口端口,进入的流量经隧道送往目标地址" title="监听端口" />} name="bind_port" rules={[{ required: true, message: '请输入监听端口' }]}>
                 <InputNumber className="rh-mono" max={65535} min={1} precision={0} />
               </Form.Item>
             ) : (
               <>
-                <Form.Item extra="开启后由服务端在允许范围内挑选空闲端口" label="自动分配" name="bind_auto" valuePropName="checked">
+                <Form.Item label={<InfoLabel info="开启后由服务端在允许端口范围内挑选空闲端口,免人工规划端口" title="自动分配" />} name="bind_auto" valuePropName="checked">
                   <Checkbox>自动分配监听端口</Checkbox>
                 </Form.Item>
                 <Form.Item noStyle shouldUpdate={(a, b) => a.bind_auto !== b.bind_auto}>
                   {({ getFieldValue }) =>
                     !getFieldValue('bind_auto') ? (
-                      <Form.Item label="监听端口" name="bind_port" rules={[{ required: true, message: '请输入监听端口' }]}>
+                      <Form.Item label={<InfoLabel info="服务端公网入口端口,进入的流量经隧道送往目标地址" title="监听端口" />} name="bind_port" rules={[{ required: true, message: '请输入监听端口' }]}>
                         <InputNumber className="rh-mono" max={65535} min={1} precision={0} />
                       </Form.Item>
                     ) : null
@@ -671,39 +672,39 @@ const ProxyFormModal: React.FC<{
             <Divider plain style={{ margin: '4px 0 16px' }} titlePlacement="left">
               目标(内网服务)
             </Divider>
-            <Form.Item label="目标地址" name="target_host" rules={[{ required: true, message: '请输入目标地址' }]}>
+            <Form.Item label={<InfoLabel info="内网服务的真实地址,由客户端侧发起连接(须在客户端所在网络可达)" title="目标地址" />} name="target_host" rules={[{ required: true, message: '请输入目标地址' }]}>
               <Input placeholder="127.0.0.1" />
             </Form.Item>
-            <Form.Item label="目标端口" name="target_port" rules={[{ required: true, message: '请输入目标端口' }]}>
+            <Form.Item label={<InfoLabel info="内网服务的真实端口" title="目标端口" />} name="target_port" rules={[{ required: true, message: '请输入目标端口' }]}>
               <InputNumber max={65535} min={1} precision={0} />
             </Form.Item>
           </>
         )}
         {usesDomain && (
           <>
-            <Form.Item extra="逗号分隔,支持 *.example.com 单层通配" label="自定义域名" name="custom_domains">
+            <Form.Item label={<InfoLabel info="逗号分隔,支持 *.example.com 单层通配;请求按域名路由到本规则" title="自定义域名" />} name="custom_domains">
               <Input placeholder="a.example.com,*.example.com" />
             </Form.Item>
             {kind !== 'tcpmux' && (
-              <Form.Item extra="拼接 vhost.subdomain_host" label="子域名" name="subdomain">
+              <Form.Item label={<InfoLabel info="与服务端 vhost.subdomain_host 拼接生成完整域名" title="子域名" />} name="subdomain">
                 <Input placeholder="app" />
               </Form.Item>
             )}
           </>
         )}
         {usesSecret && (
-          <Form.Item extra="逗号分隔的客户端名;空 = 任意。凭据由服务端自动生成并托管(列表中可「轮换密钥」)" label="允许访问方" name="allow_users">
+          <Form.Item label={<InfoLabel info="逗号分隔客户端名,空 = 任意客户端的访问器可中继;中继凭据由服务端自动生成托管,列表中可轮换" title="允许访问方" />} name="allow_users">
             <Input placeholder="visitor-a,visitor-b" />
           </Form.Item>
         )}
         <Divider plain style={{ margin: '4px 0 16px' }} titlePlacement="left">
           行为
         </Divider>
-        <Form.Item label="启用" name="enabled" valuePropName="checked">
+        <Form.Item label={<InfoLabel info="创建后立即生效并开始监听;关闭则仅保存、不承载流量" title="启用" />} name="enabled" valuePropName="checked">
           <Checkbox>创建后立即启用</Checkbox>
         </Form.Item>
 
-        <Form.Item label="插件" name="plugin_kind">
+        <Form.Item label={<InfoLabel info="在客户端本地处理流量(静态文件/SOCKS5/https2http 等),替代直连目标服务" title="插件" />} name="plugin_kind">
           <Select
             onChange={(v) => setPluginKind(v as PluginKindOpt)}
             options={PLUGIN_KINDS.map((k) => ({
@@ -713,7 +714,7 @@ const ProxyFormModal: React.FC<{
           />
         </Form.Item>
         {pluginOn && (
-          <Form.Item label="插件参数" style={{ marginBottom: 0 }}>
+          <Form.Item label={<InfoLabel info="按所选插件类型展开对应参数" title="插件参数" />} style={{ marginBottom: 0 }}>
             <Collapse
               defaultActiveKey={['plugin']}
               ghost
@@ -728,7 +729,7 @@ const ProxyFormModal: React.FC<{
           </Form.Item>
         )}
 
-        <Form.Item label="高级" style={{ marginTop: 8 }}>
+        <Form.Item label={<InfoLabel info="传输压缩、限速、负载均衡分组、健康检查与 HTTP 增强等低频配置" title="高级" />} style={{ marginTop: 8 }}>
           <Collapse ghost items={advancedItems} />
         </Form.Item>
       </Form>
