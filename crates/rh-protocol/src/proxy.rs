@@ -486,6 +486,15 @@ impl ProxySpec {
             _ => None,
         }
     }
+    /// secret_cfg 的可变版本(kind 不符返回 None;section 须先经 normalize 物化)。
+    pub fn secret_cfg_mut(&mut self) -> Option<&mut SecretProxyConfig> {
+        match self.kind {
+            ProxyKind::Stcp => self.stcp.as_mut(),
+            ProxyKind::Sudp => self.sudp.as_mut(),
+            ProxyKind::Xtcp => self.xtcp.as_mut(),
+            _ => None,
+        }
+    }
 }
 
 fn default_true() -> bool {

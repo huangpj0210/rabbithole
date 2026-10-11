@@ -115,9 +115,9 @@ sleep 3
 
 # ---------- 规则:client-P 持 xtcp 代理;client-V 持访问端 ----------
 api -X POST "http://127.0.0.1:$API/api/services" -H 'Content-Type: application/json' \
-  -d "{\"client_id\":\"$CID_P\",\"name\":\"xs\",\"kind\":\"xtcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO,\"enabled\":true,\"xtcp\":{\"secret_key\":\"xk\"}}" >/dev/null
+  -d "{\"client_id\":\"$CID_P\",\"name\":\"xs\",\"kind\":\"xtcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO,\"enabled\":true,\"xtcp\":{}}" >/dev/null
 api -X POST "http://127.0.0.1:$API/api/visitors" -H 'Content-Type: application/json' \
-  -d "{\"client_id\":\"$CID_V\",\"name\":\"xs-v\",\"kind\":\"xtcp\",\"bind_port\":$VIS,\"target_proxy_name\":\"xs\",\"secret_key\":\"xk\",\"enabled\":true}" >/dev/null
+  -d "{\"client_id\":\"$CID_V\",\"name\":\"xs-v\",\"kind\":\"xtcp\",\"bind_port\":$VIS,\"target_proxy_name\":\"xs\",\"enabled\":true}" >/dev/null
 sleep 2
 
 echo "== 场景1:打洞直连(NAT 中继开放,数据经 NAT-A 双向中继)=="
@@ -211,9 +211,9 @@ PIDS+=($!)
 PIDS+=($!)
 sleep 3
 api -X POST "http://127.0.0.1:$API/api/services" -H 'Content-Type: application/json' \
-  -d "{\"client_id\":\"$CID_P\",\"name\":\"xs\",\"kind\":\"xtcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO,\"enabled\":true,\"xtcp\":{\"secret_key\":\"xk\"}}" >/dev/null
+  -d "{\"client_id\":\"$CID_P\",\"name\":\"xs\",\"kind\":\"xtcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO,\"enabled\":true,\"xtcp\":{}}" >/dev/null
 api -X POST "http://127.0.0.1:$API/api/visitors" -H 'Content-Type: application/json' \
-  -d "{\"client_id\":\"$CID_V\",\"name\":\"xs-v\",\"kind\":\"xtcp\",\"bind_port\":$VIS,\"target_proxy_name\":\"xs\",\"secret_key\":\"xk\",\"enabled\":true}" >/dev/null
+  -d "{\"client_id\":\"$CID_V\",\"name\":\"xs-v\",\"kind\":\"xtcp\",\"bind_port\":$VIS,\"target_proxy_name\":\"xs\",\"enabled\":true}" >/dev/null
 sleep 2
 python3 - "$VIS" <<'EOF' && ok "拦截-回退中继后回显(打洞超时≈5s + 中继建立)" || bad "拦截-回退中继后回显"
 import socket, sys

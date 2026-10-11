@@ -139,6 +139,10 @@ export async function enableService(id: number): Promise<unknown> {
 export async function disableService(id: number): Promise<unknown> {
   return httpPost(`/services/${id}/disable`);
 }
+/** 轮换密钥访问规则凭据:服务端生成新随机值,访问器连接时自动继承,无需任何同步。 */
+export async function rotateServiceSecret(id: number): Promise<{ secret: string }> {
+  return httpPost(`/services/${id}/rotate-secret`);
+}
 /** 批量启停删(后端语义:按 ids + action,非批量导入)。 */
 export async function batchServices(
   ids: number[],

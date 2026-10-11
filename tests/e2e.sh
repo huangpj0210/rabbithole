@@ -292,10 +292,11 @@ body404=$(curl -s -m 8 -o /dev/null -w "%{http_code}" -H "Host: none.e2e.test" "
 [ "$body404" = "404" ]; check $? "HTTP vhost 未知域名 404"
 
 # ---------- STCP ----------
-mk_svc "{\"client_id\":\"$CID\",\"name\":\"sdb\",\"kind\":\"stcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"stcp\":{\"secret_key\":\"sk1\"}}" >/dev/null
-mk_vis "{\"client_id\":\"$CID\",\"name\":\"sdb-v\",\"kind\":\"stcp\",\"bind_port\":$V_STCP,\"target_proxy_name\":\"sdb\",\"secret_key\":\"sk1\",\"enabled\":true}" >/dev/null
+# 密钥完全服务端管理:创建即生成(入参提供的密钥一律被忽略),访问器不存副本(连接时继承)
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"sdb\",\"kind\":\"stcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"stcp\":{\"secret_key\":\"client-side-should-be-ignored\"}}" >/dev/null
+mk_vis "{\"client_id\":\"$CID\",\"name\":\"sdb-v\",\"kind\":\"stcp\",\"bind_port\":$V_STCP,\"target_proxy_name\":\"sdb\",\"enabled\":true}" >/dev/null
 sleep 2
-python3 - "$V_STCP" <<'EOF' && ok "STCP visitor" || bad "STCP visitor"
+python3 - "$V_STCP" <<'EOF' && ok "STCP visitor(服务端生成密钥+访问器继承)" || bad "STCP visitor(服务端生成密钥+访问器继承)"
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
 s.sendall(b"stcp\n"); s.shutdown(socket.SHUT_WR); s.settimeout(8)
@@ -306,26 +307,46 @@ while True:
     g += d
 sys.exit(0 if g == b"stcp\n" else 1)
 EOF
+# 入参密钥被忽略:库中值是服务端随机 32 hex,而非 client-side-should-be-ignored
+SEC_SDB=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["spec"]["stcp"]["secret_key"] for s in d if s["name"]=="sdb"][0])')
+[ "$SEC_SDB" != "client-side-should-be-ignored" ] && [ ${#SEC_SDB} -eq 32 ]; check $? "STCP 密钥由服务端随机生成(入参被忽略)"
 
-# 访问器密钥留空 = 继承目标规则当前密钥(单一事实源,不再要求两侧手工同步)
-mk_svc "{\"client_id\":\"$CID\",\"name\":\"sdb2\",\"kind\":\"stcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"stcp\":{\"secret_key\":\"sk2\"}}" >/dev/null
+# 轮换:服务端重新生成,访问器(无副本)自动继承新值,在途之外的新中继继续可用
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"sdb2\",\"kind\":\"stcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"stcp\":{}}" >/dev/null
 mk_vis "{\"client_id\":\"$CID\",\"name\":\"sdb2-v\",\"kind\":\"stcp\",\"bind_port\":$V_STCP2,\"target_proxy_name\":\"sdb2\",\"enabled\":true}" >/dev/null
 sleep 2
-python3 - "$V_STCP2" <<'EOF' && ok "STCP 访问器密钥留空继承规则密钥" || bad "STCP 访问器密钥留空继承规则密钥"
+python3 - "$V_STCP2" <<'EOF' && ok "STCP 轮换前中继正常" || bad "STCP 轮换前中继正常"
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
-s.sendall(b"stcp-inherit\n"); s.shutdown(socket.SHUT_WR); s.settimeout(8)
+s.sendall(b"stcp-pre\n"); s.shutdown(socket.SHUT_WR); s.settimeout(8)
 g = b""
 while True:
     d = s.recv(4096)
     if not d: break
     g += d
-sys.exit(0 if g == b"stcp-inherit\n" else 1)
+sys.exit(0 if g == b"stcp-pre\n" else 1)
+EOF
+SEC1=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["spec"]["stcp"]["secret_key"] for s in d if s["name"]=="sdb2"][0])')
+SDB2_ID=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["id"] for s in d if s["name"]=="sdb2"][0])')
+api -X POST "http://127.0.0.1:$API_PORT/api/services/$SDB2_ID/rotate-secret" >/dev/null
+SEC2=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["spec"]["stcp"]["secret_key"] for s in d if s["name"]=="sdb2"][0])')
+[ "$SEC1" != "$SEC2" ] && [ ${#SEC2} -eq 32 ]; check $? "轮换端点生成新 32 hex 密钥"
+sleep 2
+python3 - "$V_STCP2" <<'EOF' && ok "STCP 轮换后中继不断(访问器自动继承新密钥)" || bad "STCP 轮换后中继不断(访问器自动继承新密钥)"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+s.sendall(b"stcp-post\n"); s.shutdown(socket.SHUT_WR); s.settimeout(8)
+g = b""
+while True:
+    d = s.recv(4096)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"stcp-post\n" else 1)
 EOF
 
 # ---------- SUDP ----------
-mk_svc "{\"client_id\":\"$CID\",\"name\":\"udbs\",\"kind\":\"sudp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_UDP,\"enabled\":true,\"sudp\":{\"secret_key\":\"uk1\"}}" >/dev/null
-mk_vis "{\"client_id\":\"$CID\",\"name\":\"udbs-v\",\"kind\":\"sudp\",\"bind_port\":$V_SUDP,\"target_proxy_name\":\"udbs\",\"secret_key\":\"uk1\",\"enabled\":true}" >/dev/null
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"udbs\",\"kind\":\"sudp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_UDP,\"enabled\":true,\"sudp\":{}}" >/dev/null
+mk_vis "{\"client_id\":\"$CID\",\"name\":\"udbs-v\",\"kind\":\"sudp\",\"bind_port\":$V_SUDP,\"target_proxy_name\":\"udbs\",\"enabled\":true}" >/dev/null
 sleep 2
 python3 - "$V_SUDP" <<'EOF' && ok "SUDP visitor" || bad "SUDP visitor"
 import socket, sys
@@ -363,8 +384,8 @@ st=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c '
 kill "$HCPID" 2>/dev/null
 
 # ---------- XTCP ----------
-mk_svc "{\"client_id\":\"$CID\",\"name\":\"xsvc\",\"kind\":\"xtcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"xtcp\":{\"secret_key\":\"xk1\"}}" >/dev/null
-mk_vis "{\"client_id\":\"$CID\",\"name\":\"xsvc-v\",\"kind\":\"xtcp\",\"bind_port\":$V_XTCP,\"target_proxy_name\":\"xsvc\",\"secret_key\":\"xk1\",\"enabled\":true}" >/dev/null
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"xsvc\",\"kind\":\"xtcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"xtcp\":{}}" >/dev/null
+mk_vis "{\"client_id\":\"$CID\",\"name\":\"xsvc-v\",\"kind\":\"xtcp\",\"bind_port\":$V_XTCP,\"target_proxy_name\":\"xsvc\",\"enabled\":true}" >/dev/null
 sleep 2
 python3 - "$V_XTCP" <<'EOF' && ok "XTCP 打洞直连" || bad "XTCP 打洞直连"
 import socket, sys

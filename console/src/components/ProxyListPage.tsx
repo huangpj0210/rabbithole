@@ -6,12 +6,13 @@ import {
   enableService,
   listClients,
   listServices,
+  rotateServiceSecret,
   updateService,
 } from '@/api/rabbithole';
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import ProxyFormModal from '@/components/ProxyFormModal';
 import type { ProxyKind } from '@/components/ProxyFormModal';
-import { Mono, MonoCopy, StatusBadge, proxyStatusSignal } from '@/components/ui';
+import { Mono, StatusBadge, proxyStatusSignal } from '@/components/ui';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { DownloadOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import { PageContainer } from '@ant-design/pro-components';
@@ -100,6 +101,15 @@ const ProxyListPage: React.FC<{
     mutationFn: (id: number) => deleteService(id),
     onSuccess: () => {
       message.success('已删除');
+      invalidate();
+    },
+  });
+
+  // 密钥轮换:服务端生成新随机值;访问器连接时继承规则当前密钥,两端一起生效
+  const rotateMut = useMutation({
+    mutationFn: (id: number) => rotateServiceSecret(id),
+    onSuccess: () => {
+      message.success('密钥已轮换,访问器自动继承新密钥,无需其他操作');
       invalidate();
     },
   });
@@ -227,23 +237,6 @@ const ProxyListPage: React.FC<{
     ...(isSecret
       ? [
           {
-            title: '密钥',
-            key: 'secret',
-            width: 140,
-            render: (_: unknown, row: ServiceRow) => {
-              const k = row.spec?.[row.kind]?.secret_key;
-              return k ? (
-                <MonoCopy
-                  ariaLabel="复制访问密钥"
-                  display={`${String(k).slice(0, 8)}…`}
-                  full={String(k)}
-                />
-              ) : (
-                '-'
-              );
-            },
-          },
-          {
             title: '允许访问方',
             key: 'allow_users',
             width: 120,
@@ -316,7 +309,7 @@ const ProxyListPage: React.FC<{
     {
       title: '操作',
       key: 'action',
-      width: 200,
+      width: 250,
       render: (_, row: ServiceRow) => (
         <>
           <Button onClick={() => setModal({ open: true, editing: row })} size="small" type="link">
@@ -326,6 +319,21 @@ const ProxyListPage: React.FC<{
             <Button onClick={() => onCreateVisitor(row)} size="small" type="link">
               创建访问器
             </Button>
+          )}
+          {isSecret && (
+            <Popconfirm
+              description="服务端生成新随机密钥,访问器自动继承,现有中继不受影响。"
+              onConfirm={() => rotateMut.mutate(row.id)}
+              title={`轮换 ${row.name} 的密钥?`}
+            >
+              <Button
+                loading={rotateMut.isPending && rotateMut.variables === row.id}
+                size="small"
+                type="link"
+              >
+                轮换密钥
+              </Button>
+            </Popconfirm>
           )}
           <Popconfirm
             cancelText="取消"

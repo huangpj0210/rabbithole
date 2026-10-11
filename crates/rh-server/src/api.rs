@@ -35,6 +35,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/services/{id}/enable", post(enable_service))
         .route("/api/services/{id}/disable", post(disable_service))
+        .route(
+            "/api/services/{id}/rotate-secret",
+            post(rotate_service_secret),
+        )
         .route("/api/services/batch", post(batch_services));
     let visitors = Router::new()
         .route("/api/visitors", get(list_visitors).post(create_visitor))
@@ -753,6 +757,11 @@ async fn create_service_inner(
         return Err((2001, "名称须为 1-64 位字母/数字/下划线/连字符".into()));
     }
     normalize_spec(spec, state.cfg.limits.default_pool_size);
+    // 密钥完全服务端管理:创建即生成随机凭据(入参提供的一律覆盖),
+    // 库中密钥访问规则永不为空,也不存在人编口令
+    if let Some(cfg) = spec.secret_cfg_mut() {
+        cfg.secret_key = generate_secret();
+    }
     if spec.client_id.is_empty() {
         return Err((2002, "缺少 client_id".into()));
     }
@@ -930,6 +939,15 @@ async fn update_service(
     let Some((_, client_id, old, port_auto)) = state.db.get_proxy(id).await.ok().flatten() else {
         return err(3001, "转发规则不存在");
     };
+    // 密钥只由服务端管理:编辑永不改写(入参忽略),保证"任何写路径后库中不为空";
+    // 历史遗留空值在此顺带补齐为随机值
+    if let Some(cfg) = spec.secret_cfg_mut() {
+        cfg.secret_key = old
+            .secret_cfg()
+            .filter(|c| !c.secret_key.is_empty())
+            .map(|c| c.secret_key.clone())
+            .unwrap_or_else(generate_secret);
+    }
     let client = state.db.get_client(&client_id).await.ok().flatten();
     let client_enabled = client.as_ref().map(|c| c.enabled).unwrap_or(false);
     // 资格跳步:规则或客户端禁用 → 仅落库
@@ -1081,6 +1099,56 @@ async fn enable_service(
     crate::runtime::teardown_runtime(&state, id as u64).await;
     crate::runtime::spawn_runtime(&state, &client_id, &spec, rev).await;
     ok(json!({"enabled": true, "revision": rev}))
+}
+
+/// 轮换密钥访问规则的凭据:生成新随机值落库并推进 revision。
+/// 访问器侧不存密钥副本(连接时继承规则当前密钥),因此"两边一起轮换"天然成立,
+/// 在线客户端的原有中继不中断。
+async fn rotate_service_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    // 首读仅定位属主与资格(串行域);实体在锁内重读,与 update 同口径消解并发竞态
+    let Some((_, client_id, first, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+        return err(3001, "转发规则不存在");
+    };
+    if first.secret_cfg().is_none() {
+        return err(4004, "仅密钥访问规则(STCP/SUDP/XTCP)支持轮换");
+    }
+    let lock = state.serial_lock(&client_id);
+    let _g = lock.lock().await;
+    let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
+    else {
+        return err(3001, "转发规则不存在");
+    };
+    let Some(cfg) = spec.secret_cfg_mut() else {
+        return err(4004, "仅密钥访问规则(STCP/SUDP/XTCP)支持轮换");
+    };
+    cfg.secret_key = generate_secret();
+    let secret = cfg.secret_key.clone();
+    let rev = match state
+        .db
+        .update_proxy_bump(id, &client_id, &spec, port_auto)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return err(500, &format!("{e}")),
+    };
+    // 密钥不参与 listener/池:原位发布快照保持运行态与库一致即可
+    if let Some(rt) = state.proxies.get(id as u64) {
+        crate::runtime::publish_spec_in_place(&state, &rt, &spec, rev).await;
+    }
+    ok(json!({"rotated": true, "secret": secret, "revision": rev}))
+}
+
+/// 密钥访问规则的服务端凭据:32 hex(OsRng UUID v4)。
+/// 创建与轮换时生成;密钥完全服务端管理——不为空、不由人编、调用方入参一律忽略。
+fn generate_secret() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// enable 时的绑定资格检查(端口冲突/试绑)。
@@ -1433,6 +1501,8 @@ async fn create_visitor(
         return err(4001, "缺少 name 或 bind_port");
     }
     spec.id = 0;
+    // 密钥由目标规则单一管理:访问器一律不存储(连接时继承规则当前密钥),入参忽略
+    spec.secret_key = String::new();
     // 解析目标代理归属(同名规则可能存在于多个客户端:优先当前在线的客户端,
     // 全部离线时取创建序首个,并在歧义时告警)
     let clients = state.db.list_clients().await.unwrap_or_default();
@@ -1520,6 +1590,8 @@ async fn update_visitor(
         return err(4003, "访问器不存在");
     };
     spec.id = id as u64;
+    // 密钥由目标规则单一管理:访问器一律不存储(连接时继承规则当前密钥),入参忽略
+    spec.secret_key = String::new();
     // 重新解析目标:与创建同语义(名称 + 类型都须匹配,否则拒绝)
     let clients = state.db.list_clients().await.unwrap_or_default();
     let mut target_client = None;
