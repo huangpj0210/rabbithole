@@ -66,20 +66,41 @@ ssh -R 0:内网目标:端口 <client-id>@<server> -p <ssh_gateway.bind_port>   #
 
 ## Docker
 
-官方镜像(多架构 linux/amd64 + linux/arm64,随版本标签发布):
+官方镜像分两个,均为多架构(linux/amd64 + linux/arm64),随版本标签发布:
+
+**服务端**(公网机器):
 
 ```bash
 docker run -d --name rabbithole \
   -p 7100:7100 -p 8080:8080 -p 8081:8081 -p 8082:8082 -p 8443:8443 \
   -v rabbithole-data:/var/lib/rabbithole \
-  ghcr.io/xbclub/rabbithole:latest
+  ghcr.io/xbclub/rabbithole-server:latest
 # 首次启动:admin 随机密码与自签 TLS 证书一次性打印在容器日志,
 # 配置落在数据卷 /var/lib/rabbithole/server.toml,可挂载修改
 docker logs rabbithole        # 查看初始密码
+# 旧地址 ghcr.io/xbclub/rabbithole 与 server 内容相同,继续同步发布
 ```
 
+**客户端**(内网机器;先在控制台「客户端」页创建——创建成功会直接给出可复制的 `docker run` 命令):
+
+```bash
+docker run -d --name rh-client --restart unless-stopped \
+  -e RH_SERVER=example.com:7100 \
+  -e RH_CLIENT_ID=<客户端ID> \
+  -e RH_SECRET=<密钥> \
+  ghcr.io/xbclub/rabbithole-client:latest
+# 规则由服务端集中下发,客户端零配置文件;可选 env:RH_PROTOCOL / RH_MULTIPLEX /
+# RH_TLS_INSECURE / RH_TLS_PIN_SHA256 / RH_TRUSTED_CA_FILE / RH_LOG_LEVEL 等
+```
+
+需要高级项(自定义 CA / 代理 / STUN / DNS)时挂载 TOML 配置(模板 `deploy/client.example.toml`),
+挂载后文件模式优先:`-v $PWD/client.toml:/etc/rabbithole/client.toml:ro`。
+裸机同理:`RH_SERVER=host:7100 RH_CLIENT_ID=... RH_SECRET=... rh-client` 直接接入
+(优先级:CLI `--server/--id/--secret` > 环境变量 > 配置文件)。
+
 转发端口段(默认 20000-21000)按需追加 `-p` 映射;生产请置于反向代理 + HTTPS 之后。
-也可自行构建:`deploy/Dockerfile`(打包 musl 静态二进制,无 RUN 步骤,本地构建方式见文件头注释)。
+也可自行构建:`deploy/Dockerfile`(server)与 `deploy/Dockerfile.client`(client)
+(打包 musl 静态二进制,无 RUN 步骤,本地构建方式见文件头注释)。
 
 ## 发布(Release)
 

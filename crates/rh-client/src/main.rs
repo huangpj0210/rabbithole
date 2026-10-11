@@ -18,8 +18,9 @@ use tracing::{info, warn};
 #[derive(Parser)]
 #[command(name = "rh-client", version)]
 struct Cli {
-    #[arg(short, long, default_value = "rh-client.toml")]
-    config: std::path::PathBuf,
+    /// 配置文件(TOML);缺省时依次回退:当前目录 rh-client.toml → 纯环境变量模式。
+    #[arg(short, long)]
+    config: Option<std::path::PathBuf>,
     /// 覆盖服务器地址(host:port)。
     #[arg(long)]
     server: Option<String>,
@@ -34,9 +35,21 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let mut cfg = config::ClientConfig::load(&cli.config)?;
-    if let Some(s) = cli.server {
-        cfg.server_addr = s;
+    // 配置来源优先级:CLI 覆盖 > 环境变量(RH_*)> 配置文件 > 内置默认。
+    // 文件承载全部字段;env 是薄覆盖层(Docker 等场景 3 个字符串接入,见 config.rs)。
+    let default_path = std::path::PathBuf::from("rh-client.toml");
+    let explicit_config = cli
+        .config
+        .clone()
+        .or_else(|| default_path.exists().then_some(default_path));
+    let (mut cfg, from_file) = match &explicit_config {
+        Some(p) => (config::ClientConfig::load(p)?, true),
+        None => (config::ClientConfig::default(), false),
+    };
+    let cli_server = cli.server.clone();
+    cfg.apply_env()?;
+    if let Some(s) = cli_server.as_deref() {
+        cfg.server_addr = s.to_string();
     }
     if let Some(i) = cli.id {
         cfg.client_id = i;
@@ -44,11 +57,27 @@ async fn main() -> anyhow::Result<()> {
     if let Some(s) = cli.secret {
         cfg.secret = s;
     }
+    // 纯 env/CLI 模式(无文件)必须显式给服务器地址,避免静默连默认地址
+    if !from_file
+        && cli_server.is_none()
+        && std::env::var("RH_SERVER").unwrap_or_default().is_empty()
+    {
+        anyhow::bail!(
+            "未提供连接信息:请用 --config 指定配置文件,或设置环境变量 \
+             RH_SERVER / RH_CLIENT_ID / RH_SECRET(Docker 用法见 README)"
+        );
+    }
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
-    anyhow::ensure!(!cfg.client_id.is_empty(), "client_id required");
-    anyhow::ensure!(!cfg.secret.is_empty(), "secret required");
+    anyhow::ensure!(
+        !cfg.client_id.is_empty(),
+        "client_id 为空(配置文件 / RH_CLIENT_ID / --id)"
+    );
+    anyhow::ensure!(
+        !cfg.secret.is_empty(),
+        "secret 为空(配置文件 / RH_SECRET / --secret)"
+    );
 
     let cfg = Arc::new(cfg);
     dnsquery::set_server(cfg.dns_server.clone());

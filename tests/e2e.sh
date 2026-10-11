@@ -187,6 +187,24 @@ online=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bea
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["online"])')
 [ "$online" = "True" ]; check $? "客户端上线"
 
+# 第二个客户端:纯环境变量接入(无配置文件,Docker 形态)
+CRESP2=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/clients" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"name":"env-only"}')
+CID2=$(echo "$CRESP2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')
+CSECRET2=$(echo "$CRESP2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["secret"])')
+cd "$WORK"   # 离开仓库目录,确保没有 rh-client.toml 落回文件模式
+RH_SERVER="127.0.0.1:$CTL_PORT" RH_CLIENT_ID="$CID2" RH_SECRET="$CSECRET2" \
+  "$CLIENT" >"$WORK/client-env.log" 2>&1 &
+PIDS+=($!)
+cd - >/dev/null
+sleep 3
+env_online=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([c["online"] for c in d if c["name"]=="env-only"][0])')
+[ "$env_online" = "True" ]; check $? "纯环境变量客户端上线(RH_SERVER/RH_CLIENT_ID/RH_SECRET,无配置文件)"
+# 无连接信息时的报错可行动(非静默连默认地址)
+err_out=$(cd "$WORK" && "$CLIENT" 2>&1; echo "exit=$?")
+echo "$err_out" | grep -q "RH_SERVER"; check $? "裸启动报错含环境变量指引"
+
 mk_svc() { api -X POST "http://127.0.0.1:$API_PORT/api/services" -H 'Content-Type: application/json' -d "$1"; }
 mk_vis() { api -X POST "http://127.0.0.1:$API_PORT/api/visitors" -H 'Content-Type: application/json' -d "$1"; }
 

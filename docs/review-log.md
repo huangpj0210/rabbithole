@@ -703,3 +703,34 @@ R23 的"继承式"仍保留输入框,用户裁定进一步收敛为纯服务端�
 
 语义变化(如实):API 调用方提供的规则密钥/访问器密钥不再生效(忽略),
 密钥只能由服务端生成与轮换;旧库中已存在的显式密钥继续按原值比对工作。
+
+## R25(2026-10-11)Docker 拆分 server/client 双镜像 + 客户端零配置文件接入(用户:"两个 docker 镜像 一个 server 一个 client" + "客户端真的需要配置文件吗")
+
+- **镜像拆分**:ghcr.io/xbclub/rabbithole-server(仅 rh-server + 默认配置
+  + entrypoint)与 rabbithole-client(仅 rh-client + entrypoint);旧名
+  rabbithole 作为 server 别名继续同步推送,老拉取路径不断。Dockerfile 均
+  无 RUN 步骤、COPY --chmod=755,CI 逐架构单平台构建 + manifest 合并免 QEMU。
+- **客户端零配置文件**(灵魂拷问的答案:不需要——必填仅 server_addr/
+  client_id/secret 三字符串,规则本就服务端集中下发):
+  - rh-client 原生 env 覆盖层(RH_SERVER/RH_CLIENT_ID/RH_SECRET/RH_PROTOCOL/
+    RH_MULTIPLEX/RH_TLS_INSECURE/RH_TLS_PIN_SHA256/RH_TRUSTED_CA_FILE/
+    RH_SERVER_NAME/RH_PROXY_URL/RH_STUN_SERVER/RH_DNS_SERVER/RH_LOG_LEVEL),
+    优先级 CLI --server/--id/--secret > env > 配置文件;--config 变为可选
+    (回退当前目录 rh-client.toml,再回退纯 env 模式);无任何来源时报错
+    带环境变量指引,不静默连默认地址。单测覆盖层叠与布尔解析。
+  - client 镜像 entrypoint:挂载文件优先(高级项逃生舱),否则纯 env;
+    两者皆无打印最简 docker run 用法后退出。
+  - 控制台 SecretModal 重写:创建/轮换后首推「Docker 一键命令」(真实
+    client_id/secret 已填、server_addr 可编辑、协议可选),折叠提供 toml
+    模板。顺带修复存量 bug:旧模板生成 transport="noise" 字段——
+    ClientConfig 为 deny_unknown_fields,该字段不存在,照抄必解析失败;
+    且端口硬编码 7000(实际默认 7100)。
+  - e2e 新增:纯环境变量客户端上线(经无文件路径)、裸启动报错含指引;
+    本地全链路联调(env 接入→上线→隧道回环)实证。
+- **CI**:release.yml docker job 重构为双镜像(server 双仓推送)+ 旧名单播;
+  workflow_dispatch 触发时仅打 ci-<sha> 临时标签(不覆盖 latest/版本),
+  release job 门控 refs/tags(手动触发不再误发 Release)。
+
+验证:cargo fmt/clippy 0 警告、test 43/43(env 覆盖层单测);console
+typecheck/build exit 0;e2e 主套 69→71,全量 151/151;浏览器走查创建客户端
+→凭据弹窗 Docker 命令/toml 模板切换/复制全过。

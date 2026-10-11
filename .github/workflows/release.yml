@@ -131,7 +131,7 @@ jobs:
           if-no-files-found: error
 
   docker:
-    name: Docker 镜像(ghcr.io 多架构)
+    name: Docker 镜像(server / client,ghcr.io 多架构)
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -153,24 +153,45 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # 每架构单平台构建(Dockerfile 无 RUN 步骤,免 QEMU),再 manifest 合并
-      - name: Build & push 多架构镜像
+      # 每架构单平台构建(Dockerfile 无 RUN 步骤,免 QEMU),再 manifest 合并。
+      # 标签发布 → 版本号 + latest;手动触发(workflow_dispatch)→ 仅 ci-<sha> 临时标签,
+      # 用于不发版验证镜像流水线,不覆盖 latest / 版本标签。
+      - name: Build & push 多架构镜像(server / client)
         run: |
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          TAG="$GITHUB_REF_NAME"
-          docker build --platform linux/amd64 -f deploy/Dockerfile --build-arg BIN_DIR=bin/amd64 -t "$IMAGE:tmp-amd64" .
-          docker push "$IMAGE:tmp-amd64"
-          docker build --platform linux/arm64 -f deploy/Dockerfile --build-arg BIN_DIR=bin/arm64 -t "$IMAGE:tmp-arm64" .
-          docker push "$IMAGE:tmp-arm64"
-          for T in "$TAG" latest; do
-            docker manifest create "$IMAGE:$T" "$IMAGE:tmp-amd64" "$IMAGE:tmp-arm64"
-            docker manifest annotate "$IMAGE:$T" "$IMAGE:tmp-amd64" --os linux --arch amd64
-            docker manifest annotate "$IMAGE:$T" "$IMAGE:tmp-arm64" --os linux --arch arm64
-            docker manifest push "$IMAGE:$T"
-          done
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAGS=("$GITHUB_REF_NAME" latest)
+          else
+            TAGS=("ci-${GITHUB_SHA::7}")
+          fi
+          # $1=dockerfile,其余=要推送的镜像仓库(server 同时推旧名 rabbithole 作别名,老拉取路径不变)
+          build_push() {
+            local DF="$1"; shift
+            local IMGS=("$@")
+            local TAG_ARGS=()
+            for IMG in "${IMGS[@]}"; do TAG_ARGS+=(-t "$IMG:tmp-amd64"); done
+            docker build --platform linux/amd64 -f "$DF" --build-arg BIN_DIR=bin/amd64 "${TAG_ARGS[@]}" .
+            local TAG_ARGS_ARM=()
+            for IMG in "${IMGS[@]}"; do TAG_ARGS_ARM+=(-t "$IMG:tmp-arm64"); done
+            docker build --platform linux/arm64 -f "$DF" --build-arg BIN_DIR=bin/arm64 "${TAG_ARGS_ARM[@]}" .
+            for IMG in "${IMGS[@]}"; do
+              docker push "$IMG:tmp-amd64"
+              docker push "$IMG:tmp-arm64"
+              for T in "${TAGS[@]}"; do
+                docker manifest create "$IMG:$T" "$IMG:tmp-amd64" "$IMG:tmp-arm64"
+                docker manifest annotate "$IMG:$T" "$IMG:tmp-amd64" --os linux --arch amd64
+                docker manifest annotate "$IMG:$T" "$IMG:tmp-arm64" --os linux --arch arm64
+                docker manifest push "$IMG:$T"
+              done
+            done
+          }
+          build_push deploy/Dockerfile "$REPO-server" "$REPO"
+          build_push deploy/Dockerfile.client "$REPO-client"
 
   release:
     name: 发布 GitHub Release
+    # 仅标签触发;workflow_dispatch 只跑构建与镜像(ci- 前缀标签),不发 Release
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [build, docker]
     runs-on: ubuntu-latest
     steps:

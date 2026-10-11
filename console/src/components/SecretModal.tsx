@@ -1,11 +1,14 @@
 import { CopyOutlined } from '@ant-design/icons';
-import { App, Button, Collapse, Input, Modal, Select, Typography } from 'antd';
-import React, { useState } from 'react';
+import { App, Button, Input, Modal, Select, Typography } from 'antd';
+import React, { useMemo, useState } from 'react';
+
+/** env / toml 模板共用的协议列表(与服务端 bind_protocol 一致)。 */
+const PROTOCOLS = ['tcp', 'tls', 'ws', 'wss', 'quic', 'kcp'];
 
 /**
- * 一次性密钥展示弹窗(新建/轮换后的 secret 仅此一次返回),
- * 内嵌 rh-client.toml 接入模板折叠区(F8):server_addr 可编辑、
- * transport noise/tls 下拉、client_id/secret 已填,一键复制。
+ * 一次性密钥展示弹窗(新建/轮换后的 secret 仅此一次返回)。
+ * 首推 Docker 一键命令(纯环境变量接入,凭据已填);折叠区提供 rh-client.toml
+ * 模板(裸机/高级项场景)。server_addr 按当前访问主机推测,以实际部署为准。
  */
 const SecretModal: React.FC<{
   clientId?: string;
@@ -15,10 +18,9 @@ const SecretModal: React.FC<{
   title?: string;
 }> = ({ open, secret, clientId, onCancel, title = '客户端凭据(仅此一次展示)' }) => {
   const { message } = App.useApp();
-  const [serverAddr, setServerAddr] = useState(
-    `${window.location.hostname}:7000`,
-  );
-  const [transport, setTransport] = useState<'noise' | 'tls'>('noise');
+  const [serverAddr, setServerAddr] = useState(`${window.location.hostname}:7100`);
+  const [protocol, setProtocol] = useState('tcp');
+  const [tab, setTab] = useState<'docker' | 'toml'>('docker');
 
   async function copyText(text: string) {
     try {
@@ -45,15 +47,33 @@ const SecretModal: React.FC<{
     }
   }
 
-  const toml = [
-    `server_addr = "${serverAddr}"`,
-    `protocol = "tcp"`,
-    `transport = "${transport}"`,
-    'multiplex = true',
-    ...(clientId ? [`client_id = "${clientId}"`] : []),
-    `secret = "${secret}"`,
-    'log_level = "info"',
-  ].join('\n');
+  // Docker 纯 env 接入:3 个必填字符串(协议非默认 tcp 时显式带上)
+  const dockerCmd = useMemo(() => {
+    const proto = protocol !== 'tcp' ? ` \\\n  -e RH_PROTOCOL=${protocol}` : '';
+    return [
+      'docker run -d --name rh-client --restart unless-stopped \\',
+      `  -e RH_SERVER=${serverAddr} \\${proto}`,
+      `  -e RH_CLIENT_ID=${clientId ?? '<客户端ID>'} \\`,
+      `  -e RH_SECRET=${secret} \\`,
+      '  ghcr.io/xbclub/rabbithole-client:latest',
+    ].join('\n');
+  }, [serverAddr, protocol, clientId, secret]);
+
+  const toml = useMemo(
+    () =>
+      [
+        `server_addr = "${serverAddr}"`,
+        `protocol = "${protocol}"`,
+        'multiplex = true',
+        ...(clientId ? [`client_id = "${clientId}"`] : []),
+        `secret = "${secret}"`,
+        'log_level = "info"',
+        // 高级项(可选):trusted_ca_file / tls_pin_sha256 / proxy_url / stun_server / dns_server
+      ].join('\n'),
+    [serverAddr, protocol, clientId, secret],
+  );
+
+  const snippet = tab === 'docker' ? dockerCmd : toml;
 
   return (
     <Modal
@@ -65,59 +85,67 @@ const SecretModal: React.FC<{
       onCancel={onCancel}
       open={open}
       title={title}
-      width={560}
+      width={600}
     >
       <Typography.Paragraph type="warning">
         请立即复制密钥并配置到客户端,关闭后无法再次查看:
       </Typography.Paragraph>
       <Input readOnly value={secret} />
-      <Button block icon={<CopyOutlined />} onClick={() => copyText(secret)} style={{ marginTop: 12 }} type="primary" ghost>
+      <Button
+        block
+        icon={<CopyOutlined />}
+        onClick={() => copyText(secret)}
+        style={{ marginTop: 12 }}
+        type="primary"
+        ghost
+      >
         复制密钥
       </Button>
 
-      <Collapse
-        ghost
-        items={[
-          {
-            key: 'snippet',
-            label: 'rh-client.toml 接入模板',
-            children: (
-              <>
-                <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-                  <Input
-                    addonBefore="server_addr"
-                    onChange={(e) => setServerAddr(e.target.value)}
-                    value={serverAddr}
-                  />
-                  <Select
-                    onChange={(v) => setTransport(v)}
-                    options={[
-                      { label: 'noise', value: 'noise' },
-                      { label: 'tls', value: 'tls' },
-                    ]}
-                    style={{ width: 96 }}
-                    value={transport}
-                  />
-                </div>
-                <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-                  默认地址按当前访问主机 + 控制端口 7000 推测,以实际部署为准。
-                </Typography.Paragraph>
-                <Input.TextArea readOnly rows={7} value={toml} />
-                <Button
-                  block
-                  icon={<CopyOutlined />}
-                  onClick={() => copyText(toml)}
-                  size="small"
-                  style={{ marginTop: 8 }}
-                >
-                  复制完整配置
-                </Button>
-              </>
-            ),
-          },
-        ]}
-        style={{ marginTop: 8 }}
+      <div style={{ display: 'flex', gap: 8, margin: '16px 0 8px' }}>
+        <Input
+          addonBefore="server_addr"
+          onChange={(e) => setServerAddr(e.target.value)}
+          style={{ flex: 1 }}
+          value={serverAddr}
+        />
+        <Select
+          onChange={(v) => setProtocol(v)}
+          options={PROTOCOLS.map((p) => ({ label: p, value: p }))}
+          style={{ width: 96 }}
+          value={protocol}
+        />
+      </div>
+      <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+        默认地址按当前访问主机 + 控制端口 7100 推测,协议与服务端 bind_protocol 一致,以实际部署为准。
+      </Typography.Paragraph>
+      <div style={{ marginBottom: 8 }}>
+        <Select
+          onChange={(v) => setTab(v)}
+          options={[
+            { label: 'Docker 一键命令(推荐)', value: 'docker' },
+            { label: 'rh-client.toml 配置模板', value: 'toml' },
+          ]}
+          style={{ width: 220 }}
+          value={tab}
+          variant="borderless"
+        />
+      </div>
+      <Input.TextArea
+        className="rh-mono"
+        readOnly
+        rows={tab === 'docker' ? 6 : 7}
+        value={snippet}
       />
+      <Button
+        block
+        icon={<CopyOutlined />}
+        onClick={() => copyText(snippet)}
+        size="small"
+        style={{ marginTop: 8 }}
+      >
+        {tab === 'docker' ? '复制 Docker 命令' : '复制完整配置'}
+      </Button>
     </Modal>
   );
 };
