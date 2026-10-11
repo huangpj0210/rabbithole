@@ -27,20 +27,44 @@
 
 ## 快速开始
 
-```bash
-# 服务端(需 Rust stable)
-cargo build --release
-./target/release/rh-server --config deploy/server.example.toml
-# 首次启动自动创建 admin,随机密码只在 stdout 横幅展示一次(不再需要 admin create);
-# 首登后请立即在控制台「设置」页修改密码
+### 服务端(公网机器,Linux)
 
-# 客户端(凭据在控制台"客户端"页创建,仅展示一次)
-./target/release/rh-client --config deploy/client.example.toml
+一键脚本:下载 Release 静态二进制(含 sha256 校验)→ 写入默认配置 → 注册 systemd 服务:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xbclub/rabbithole/main/deploy/install-server.sh | sudo bash
+journalctl -u rabbithole-server | grep -A3 'password:'   # 初始 admin 密码,仅首次启动展示一次
 ```
 
-Web 控制台默认 `http://127.0.0.1:8080`。完整配置说明见 `deploy/` 与 `docs/design.md`。
+控制台默认 `http://<本机地址>:8080`(账号 admin,首登后立即改密);配置、数据库与
+自动生成的证书都在 `/etc/rabbithole/`,重复执行脚本 = 升级(配置与数据保留)。
+Docker 方式见下文 [Docker](#docker) 一节;macOS / 手动部署可直接运行脚本
+(自动选对应平台包)或从 [Releases](https://github.com/xbclub/rabbithole/releases) 下载。
 
-控制台两种运行方式:
+### 客户端(内网机器)
+
+先在控制台「客户端」页创建——凭据弹窗直接给出三条可复制命令
+(一键脚本 / Docker / 配置模板,凭据已填好)。手动执行:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xbclub/rabbithole/main/deploy/install-client.sh \
+  | sudo bash -s -- --server <服务端地址:7100> --protocol tls \
+  --id <客户端ID> --secret <密钥>
+# systemd 服务经 /etc/rabbithole/client.env(0600)接入,零配置文件;
+# 轮换密钥后重跑同一命令即可。需 rabbithole v0.2.2+(默认安装最新版)
+```
+
+### 源码构建
+
+```bash
+# 服务端 + 客户端(需 Rust stable)
+cargo build --release
+./target/release/rh-server --config deploy/server.example.toml
+# 首次启动自动创建 admin,随机密码只在 stdout 横幅展示一次;
+# 首登后请立即在控制台「设置」页修改密码
+```
+
+完整配置说明见 `deploy/` 与 `docs/design.md`。控制台两种运行方式:
 
 ```bash
 # A. 生产模式(推荐,单二进制):构建前端产物后重新编译服务端,

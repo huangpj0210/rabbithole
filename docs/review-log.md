@@ -734,3 +734,25 @@ R23 的"继承式"仍保留输入框,用户裁定进一步收敛为纯服务端�
 验证:cargo fmt/clippy 0 警告、test 43/43(env 覆盖层单测);console
 typecheck/build exit 0;e2e 主套 69→71,全量 151/151;浏览器走查创建客户端
 →凭据弹窗 Docker 命令/toml 模板切换/复制全过。
+
+## R26(2026-10-11)一键部署脚本 + README 部署步骤修正 + 网页接入指令更正(用户指令)
+
+- **deploy/install-server.sh**:Linux systemd 一键部署——解析 latest 版本 → 下载
+  musl 静态包并 sha256 校验 → 安装 rh-server → 首次写入 /etc/rabbithole/server.toml
+  (升级保留配置;DB/证书同目录)→ 注册并启动服务;macOS 降级为装二进制+配置并
+  打印手动指引(darwin 包)。重复执行 = 升级。
+- **deploy/install-client.sh**:同框架;凭据经 --server/--id/--secret(缺省交互式
+  询问,secret 不回显)写入 /etc/rabbithole/client.env(0600,重跑备份 .bak =
+  轮换路径),systemd 以 EnvironmentFile 接入(零配置文件)。需 v0.2.2+(env 支持)。
+  实现:哈希直接比对(校验文件记录原始包名,-c 按名找不到改名后的下载文件——
+  实测踩到后修正);--prefix 自定义前缀自动 mkdir。
+- **README**:快速开始改为三条部署路径(服务端一键脚本 + journalctl 取首启密码 /
+  客户端一键脚本 / 源码构建),Docker 段已有,控制台构建说明移入源码构建小节。
+- **网页接入指令(SecretModal)升为三档**:一键安装脚本(推荐,Linux systemd,
+  凭据已填)/ Docker 一键命令 / rh-client.toml 模板;协议默认 tls 与服务端脚本
+  一致(此前默认 tcp 与脚本模板不一致);脚本 tab 附说明(0600、轮换重跑、版本要求)。
+
+验证:双脚本真机(macOS 降级路径)全链路实测——latest 解析、darwin/musl 包
+选择、sha256、安装、配置/凭据落盘、升级备份;脚本产物 end-to-end:server.toml
+直接起服(TLS 自签 + admin 引导)+ client.env 以新二进制接入成功上线;浏览器
+走查凭据弹窗三档命令(真实凭据/协议 tls)全过;console typecheck/build exit 0。
