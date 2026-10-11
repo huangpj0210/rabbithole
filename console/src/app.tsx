@@ -7,13 +7,15 @@ import { App as AntApp } from 'antd';
 import React, { useEffect } from 'react';
 import { userInfoApi } from '@/api/auth';
 import { LOGIN_PATH } from '@/api/request';
-import { AvatarDropdown, Footer, SelectLang, TagsView, TopHeader } from '@/components';
+import { AvatarDropdown, TagsView, TopHeader } from '@/components';
 import { bindFeedback } from '@/components/feedback';
 import { useAuthStore } from '@/stores/auth';
 import defaultSettings from '../config/defaultSettings';
 import './global.less';
 
-const isDev = process.env.NODE_ENV === 'development' || process.env.CI;
+// 仅真实本地开发展示设置抽屉;绝不受构建机环境变量(CI)影响
+// (曾因 define 内联 CI=true 导致 SettingDrawer 泄漏进生产包,§2.1 V3)
+const isDev = process.env.NODE_ENV === 'development';
 
 /** 把 antd App 上下文的 message 绑给模块级出口,供 axios 拦截器在 React 树外弹错。 */
 function FeedbackBinder() {
@@ -84,7 +86,6 @@ export const layout: RunTimeLayoutConfig = ({ initialState, setInitialState }) =
   const currentLayout = settings.layout || 'side';
   const isSideLayout = currentLayout === 'side';
   const showHeader = settings.headerRender !== false;
-  const showFooter = settings.footerRender !== false;
   const showMenu = settings.menuRender !== false;
   const showMenuHeader = settings.menuHeaderRender !== false;
 
@@ -101,7 +102,29 @@ export const layout: RunTimeLayoutConfig = ({ initialState, setInitialState }) =
     siderMenuType: settings.siderMenuType || 'sub',
 
     menuRender: showMenu ? undefined : false,
-    menuHeaderRender: showMenuHeader ? undefined : false,
+    // 侧栏头部固定为产品标识(ProLayout 默认标题是模板字样,显式覆盖)
+    menuHeaderRender: showMenuHeader
+      ? (_logo: React.ReactNode, _title: React.ReactNode, props?: { collapsed?: boolean }) => (
+          <a
+            href="/rabbithole/overview"
+            style={{
+              alignItems: 'center',
+              color: 'inherit',
+              display: 'flex',
+              fontSize: 16,
+              fontWeight: 600,
+              gap: 8,
+              height: '100%',
+              justifyContent: props?.collapsed ? 'center' : 'flex-start',
+              overflow: 'hidden',
+              padding: '0 12px',
+            }}
+          >
+            <img alt="rabbithole" height={26} src="/logo.svg" width={26} />
+            {!props?.collapsed && <span>rabbithole</span>}
+          </a>
+        )
+      : false,
 
     // side 布局:禁用默认 header,使用自定义 TopHeader
     headerRender: isSideLayout ? false : showHeader ? undefined : false,
@@ -110,7 +133,7 @@ export const layout: RunTimeLayoutConfig = ({ initialState, setInitialState }) =
     ...(isSideLayout
       ? {}
       : {
-          actionsRender: () => [<SelectLang key="SelectLang" />],
+          actionsRender: () => [],
           avatarProps: {
             src: initialState?.currentUser?.avatar,
             title: initialState?.currentUser?.name,
@@ -126,11 +149,16 @@ export const layout: RunTimeLayoutConfig = ({ initialState, setInitialState }) =
     },
     collapsedButtonRender: isSideLayout ? false : undefined,
 
-    waterMarkProps: {
-      content: initialState?.currentUser?.name,
-    },
+    // 水印移除(§2.1 V2):对单管理员自托管场景是纯噪音
 
-    footerRender: showFooter ? () => <Footer /> : false,
+    // 版本号入侧栏底部(§5);Footer 独立页脚已移除
+    menuFooterRender: () => (
+      <div style={{ padding: '8px 16px', fontSize: 12, color: 'rgba(0,0,0,0.45)' }}>
+        rabbithole v{String(process.env.APP_VERSION ?? '').replace(/"/g, '')}
+      </div>
+    ),
+
+    footerRender: false,
 
     onPageChange: () => {
       const { location } = history;

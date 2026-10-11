@@ -1,7 +1,7 @@
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import HeaderPairsInput from '@/components/HeaderPairsInput';
 import type { HeaderPairValue } from '@/components/HeaderPairsInput';
-import { Checkbox, Collapse, Form, Input, InputNumber, Modal, Select } from 'antd';
+import { Checkbox, Collapse, Divider, Form, Input, InputNumber, Modal, Select } from 'antd';
 import React, { useMemo, useState } from 'react';
 
 export type ProxyKind = 'http' | 'https' | 'sudp' | 'stcp' | 'tcp' | 'tcpmux' | 'udp' | 'xtcp';
@@ -37,6 +37,7 @@ interface FormValues {
   kind: ProxyKind;
   enabled: boolean;
   bind_ip: string;
+  bind_auto: boolean;
   bind_port: number | null;
   target_host: string;
   target_port: number | null;
@@ -132,7 +133,8 @@ function initialValuesOf(
       kind: defaultKind,
       enabled: true,
       bind_ip: '0.0.0.0',
-      bind_port: 0,
+      bind_auto: true,
+      bind_port: null,
       target_host: '127.0.0.1',
       target_port: 80,
       custom_domains: '',
@@ -191,6 +193,7 @@ function initialValuesOf(
     kind: editing.kind as ProxyKind,
     enabled: editing.enabled,
     bind_ip: editing.bind_ip || '0.0.0.0',
+    bind_auto: false,
     bind_port: editing.bind_port,
     target_host: editing.target_host,
     target_port: editing.target_port,
@@ -298,8 +301,8 @@ const ProxyFormModal: React.FC<{
       form.setFields([{ errors: ['TCPMux 规则需填写自定义域名'], name: 'custom_domains' }]);
       return;
     }
-    if (editing && usesBind && !v.bind_port) {
-      form.setFields([{ errors: ['编辑时监听端口不能为 0(仅创建时支持自动分配)'], name: 'bind_port' }]);
+    if (usesBind && !editing && !v.bind_auto && !v.bind_port) {
+      form.setFields([{ errors: ['请填写监听端口,或改用自动分配'], name: 'bind_port' }]);
       return;
     }
 
@@ -320,7 +323,8 @@ const ProxyFormModal: React.FC<{
     }
     if (usesBind) {
       spec.bind_ip = v.bind_ip;
-      spec.bind_port = v.bind_port ?? 0;
+      // "自动分配"开关替代魔法值 0(§6.5);编辑禁用自动分配
+      spec.bind_port = !editing && v.bind_auto ? 0 : (v.bind_port ?? 0);
     }
     if (kind === 'tcp') spec.pool_size = v.pool_size ?? 0;
     spec.transport = {
@@ -591,10 +595,11 @@ const ProxyFormModal: React.FC<{
     <Modal
       cancelText="取消"
       okButtonProps={{ loading: submitting }}
-      okText="保存"
+      okText={editing ? '保存修改' : '创建规则'}
       onCancel={onCancel}
       onOk={() => form.submit()}
       open={open}
+      styles={{ mask: { backgroundColor: 'rgba(22,35,43,0.45)' } }}
       title={editing ? `编辑规则:${editing.name}` : '新建规则'}
       width={720}
     >
@@ -608,6 +613,9 @@ const ProxyFormModal: React.FC<{
         onFinish={handleFinish}
         wrapperCol={{ span: 18 }}
       >
+        <Divider plain style={{ margin: '4px 0 16px' }} titlePlacement="left">
+          连接
+        </Divider>
         <Form.Item label="所属客户端" name="client_id" rules={[{ required: true, message: '请选择客户端' }]}>
           <Select
             disabled={!!editing}
@@ -623,7 +631,7 @@ const ProxyFormModal: React.FC<{
             { pattern: /^[a-zA-Z0-9_-]{1,64}$/, message: '1-64 位字母/数字/下划线/连字符' },
           ]}
         >
-          <Input placeholder="web" />
+          <Input placeholder="web-nginx" />
         </Form.Item>
         {multiKind && (
           <Form.Item label="类型" name="kind" rules={[{ required: true }]}>
@@ -639,17 +647,33 @@ const ProxyFormModal: React.FC<{
             <Form.Item label="监听 IP" name="bind_ip">
               <Input placeholder="0.0.0.0" />
             </Form.Item>
-            <Form.Item
-              extra={editing ? '编辑时不允许 0(自动分配仅创建时支持)' : '0 = 自动分配'}
-              label="监听端口"
-              name="bind_port"
-            >
-              <InputNumber max={65535} min={0} precision={0} />
-            </Form.Item>
+            {editing ? (
+              <Form.Item label="监听端口" name="bind_port" rules={[{ required: true, message: '请输入监听端口' }]}>
+                <InputNumber className="rh-mono" max={65535} min={1} precision={0} />
+              </Form.Item>
+            ) : (
+              <>
+                <Form.Item extra="开启后由服务端在允许范围内挑选空闲端口" label="自动分配" name="bind_auto" valuePropName="checked">
+                  <Checkbox>自动分配监听端口</Checkbox>
+                </Form.Item>
+                <Form.Item noStyle shouldUpdate={(a, b) => a.bind_auto !== b.bind_auto}>
+                  {({ getFieldValue }) =>
+                    !getFieldValue('bind_auto') ? (
+                      <Form.Item label="监听端口" name="bind_port" rules={[{ required: true, message: '请输入监听端口' }]}>
+                        <InputNumber className="rh-mono" max={65535} min={1} precision={0} />
+                      </Form.Item>
+                    ) : null
+                  }
+                </Form.Item>
+              </>
+            )}
           </>
         )}
         {!pluginOn && (
           <>
+            <Divider plain style={{ margin: '4px 0 16px' }} titlePlacement="left">
+              目标(内网服务)
+            </Divider>
             <Form.Item label="目标地址" name="target_host" rules={[{ required: true, message: '请输入目标地址' }]}>
               <Input placeholder="127.0.0.1" />
             </Form.Item>
@@ -680,6 +704,9 @@ const ProxyFormModal: React.FC<{
             </Form.Item>
           </>
         )}
+        <Divider plain style={{ margin: '4px 0 16px' }} titlePlacement="left">
+          行为
+        </Divider>
         <Form.Item label="启用" name="enabled" valuePropName="checked">
           <Checkbox>创建后立即启用</Checkbox>
         </Form.Item>

@@ -1,5 +1,6 @@
 /**
- * rabbithole 控制台路由(design-parity §8.0 八菜单,扁平结构)。
+ * rabbithole 路由(console-ui-redesign §5:两组 IA,路径全部不变)。
+ * 平台面(总览/客户端) + 转发面(TCP/UDP/域名/密钥/证书) + 设置;
  * wrappers 的 auth 为登录守卫;旧 vben 路由做重定向兼容。
  */
 export default [
@@ -35,39 +36,45 @@ export default [
     wrappers: ['@/wrappers/auth'],
   },
   {
-    name: '域名服务',
-    icon: 'global',
-    path: '/rabbithole/domains',
-    component: './domains',
-    wrappers: ['@/wrappers/auth'],
-  },
-  {
-    name: 'TCP 隧道',
-    icon: 'apartment',
-    path: '/rabbithole/tcp',
-    component: './tcp',
-    wrappers: ['@/wrappers/auth'],
-  },
-  {
-    name: 'UDP 隧道',
-    icon: 'send',
-    path: '/rabbithole/udp',
-    component: './udp',
-    wrappers: ['@/wrappers/auth'],
-  },
-  {
-    name: '密钥访问',
-    icon: 'key',
-    path: '/rabbithole/secret',
-    component: './secret',
-    wrappers: ['@/wrappers/auth'],
-  },
-  {
-    name: '证书',
-    icon: 'safetyCertificate',
-    path: '/rabbithole/certs',
-    component: './certs',
-    wrappers: ['@/wrappers/auth'],
+    name: '转发',
+    icon: 'shareAlt',
+    routes: [
+      {
+        name: 'TCP 隧道',
+        icon: 'apartment',
+        path: '/rabbithole/tcp',
+        component: './tcp',
+        wrappers: ['@/wrappers/auth'],
+      },
+      {
+        name: 'UDP 隧道',
+        icon: 'send',
+        path: '/rabbithole/udp',
+        component: './udp',
+        wrappers: ['@/wrappers/auth'],
+      },
+      {
+        name: '域名服务',
+        icon: 'global',
+        path: '/rabbithole/domains',
+        component: './domains',
+        wrappers: ['@/wrappers/auth'],
+      },
+      {
+        name: '密钥访问',
+        icon: 'key',
+        path: '/rabbithole/secret',
+        component: './secret',
+        wrappers: ['@/wrappers/auth'],
+      },
+      {
+        name: '证书',
+        icon: 'safetyCertificate',
+        path: '/rabbithole/certs',
+        component: './certs',
+        wrappers: ['@/wrappers/auth'],
+      },
+    ],
   },
   {
     name: '设置',

@@ -19,10 +19,10 @@ const SecretPage: React.FC = () => {
             label: '规则',
             children: (
               <ProxyListPage
+                bare
                 defaultKind="stcp"
-                description=""
+                emptyNoun="密钥规则"
                 kinds={['stcp', 'sudp', 'xtcp'] as const}
-                title=""
               />
             ),
           },

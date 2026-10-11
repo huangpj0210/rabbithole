@@ -39,6 +39,7 @@ const HeaderPairsInput: React.FC<{
             value={row.value}
           />
           <Button
+            aria-label={`删除第 ${i + 1} 行 Header`}
             icon={<DeleteOutlined />}
             onClick={() => onChange?.(rows.filter((_, idx) => idx !== i))}
             size="small"

@@ -11,7 +11,7 @@ import {
 import type { ClientRow, VisitorRow } from '@/api/rabbithole';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { PlusOutlined } from '@ant-design/icons';
-import { App, Button, Card, Checkbox, Form, Input, InputNumber, Modal, Popconfirm, Select, Switch, Table, Tag } from 'antd';
+import { App, Button, Card, Checkbox, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Switch, Table, Tag } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import React, { useEffect, useState } from 'react';
 
@@ -174,7 +174,7 @@ const VisitorsPanel: React.FC = () => {
           <Button onClick={() => { setEditId(row.id); setModalOpen(true); }} size="small" type="link">
             编辑
           </Button>
-          <Popconfirm onConfirm={() => deleteMut.mutate(row.id)} title="确认删除该访问器?">
+          <Popconfirm onConfirm={() => deleteMut.mutate(row.id)} title={`删除访问器 ${row.name}?此操作不可恢复。`}>
             <Button danger size="small" type="link">
               删除
             </Button>
@@ -193,7 +193,20 @@ const VisitorsPanel: React.FC = () => {
         columns={columns}
         dataSource={rows}
         loading={visitorsQ.isLoading}
-        pagination={false}
+        locale={{
+          emptyText: (
+            <Empty
+              description="还没有访问器。访问器在另一台机器上打开本地端口,经服务端中继或打洞直达密钥规则的目标。"
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              style={{ padding: '32px 0' }}
+            >
+              <Button onClick={() => { setEditId(null); setModalOpen(true); }} type="primary">
+                新建访问器
+              </Button>
+            </Empty>
+          ),
+        }}
+        pagination={{ pageSize: 50, hideOnSinglePage: true }}
         rowKey="id"
         size="middle"
         style={{ marginTop: 12 }}

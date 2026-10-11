@@ -1,10 +1,11 @@
 import { createCert, deleteCert, listCerts, updateCert } from '@/api/rabbithole';
 import type { CertRow } from '@/api/rabbithole';
 import { fmtTime } from '@/utils/format';
+import { Mono, MonoCopy } from '@/components/ui';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import { PageContainer } from '@ant-design/pro-components';
-import { Alert, App, Button, Card, Form, Input, Modal, Popconfirm, Table, Tag, Upload } from 'antd';
+import { Alert, App, Button, Card, Empty, Form, Input, Modal, Popconfirm, Table, Tag, Upload } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import React, { useState } from 'react';
 
@@ -113,16 +114,18 @@ const CertsPage: React.FC = () => {
         ),
     },
     {
-      title: '到期时间',
+      // 到期倒计时是证书页核心信息(§6.3):<7 天红、<30 天橙
+      title: '到期',
       key: 'expiry',
-      width: 200,
+      width: 210,
       render: (_, row) => {
         if (!row.not_after) return '-';
         const days = Math.floor((row.not_after - Date.now()) / 86400000);
+        const color = days < 7 ? 'red' : days < 30 ? 'orange' : 'green';
         return (
           <>
-            {fmtTime(row.not_after)}
-            {days <= 30 ? <Tag color="orange" style={{ marginLeft: 8 }}>{days} 天</Tag> : null}
+            <Tag color={color}>{days < 0 ? '已过期' : `${days} 天`}</Tag>
+            <Mono style={{ color: 'rgba(0,0,0,0.45)' }}>{fmtTime(row.not_after)}</Mono>
           </>
         );
       },
@@ -131,8 +134,9 @@ const CertsPage: React.FC = () => {
       title: '指纹',
       dataIndex: 'fingerprint',
       key: 'fingerprint',
-      ellipsis: true,
-      render: (v: string) => v?.slice(0, 24) || '-',
+      width: 150,
+      render: (v: string) =>
+        v ? <MonoCopy ariaLabel="复制证书指纹" display={`${v.slice(0, 8)}…`} full={v} /> : '-',
     },
     {
       title: '操作',
@@ -143,7 +147,13 @@ const CertsPage: React.FC = () => {
           <Button onClick={() => openEdit(row)} size="small" type="link">
             编辑
           </Button>
-          <Popconfirm onConfirm={() => deleteMut.mutate(row.id)} title="确认删除该证书?">
+          <Popconfirm
+        cancelText="取消"
+        okButtonProps={{ danger: true }}
+        okText="删除"
+        onConfirm={() => deleteMut.mutate(row.id)}
+        title={`删除证书 ${row.name}?绑定该域名的 HTTPS 将回退为端到端透传。`}
+      >
             <Button danger icon={<DeleteOutlined />} size="small" type="link">
               删除
             </Button>
@@ -166,7 +176,7 @@ const CertsPage: React.FC = () => {
   }
 
   return (
-    <PageContainer subTitle="HTTPS 证书管理(SNI 自动匹配)" title="证书">
+    <PageContainer subTitle="按 SNI 自动匹配、服务端终结 TLS 的 HTTPS 证书" title="证书">
       {notImplemented && (
         <Alert
           message="服务端尚未实现证书管理(M3)"
@@ -184,8 +194,22 @@ const CertsPage: React.FC = () => {
           columns={columns}
           dataSource={certsQ.data ?? []}
           loading={certsQ.isLoading}
-          locale={notImplemented ? { emptyText: '暂无证书(需服务端 M3)' } : undefined}
-          pagination={false}
+          locale={{
+            emptyText: notImplemented ? (
+              '暂无证书(需服务端 M3)'
+            ) : (
+              <Empty
+                description="还没有证书。上传 PEM 证书后,HTTPS 规则将按 SNI 自动匹配并由服务端终结 TLS。"
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                style={{ padding: '32px 0' }}
+              >
+                <Button onClick={openCreate} type="primary">
+                  上传证书
+                </Button>
+              </Empty>
+            ),
+          }}
+          pagination={{ pageSize: 50, hideOnSinglePage: true }}
           rowKey="id"
           size="middle"
           style={{ marginTop: 12 }}

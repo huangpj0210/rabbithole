@@ -2,7 +2,6 @@ import React, { useCallback } from 'react';
 import { MenuFoldOutlined, MenuUnfoldOutlined } from '@ant-design/icons';
 import { useModel } from '@umijs/max';
 import { createStyles } from 'antd-style';
-import { SelectLang } from '../RightContent';
 import { AvatarDropdown, AvatarName } from '../RightContent/AvatarDropdown';
 
 const SIDER_WIDTH = 208;
@@ -108,22 +107,26 @@ const TopHeader: React.FC<TopHeaderProps> = ({ initialState }) => {
     >
       <div className={styles.topHeaderContent}>
         <div className={styles.topHeaderLeft}>
-          {/* 折叠按钮 */}
-          <div className={styles.collapseButton} onClick={handleToggleCollapse}>
+          {/* 折叠按钮(键盘可达,§9) */}
+          <button
+            aria-label={collapsed ? '展开侧栏' : '收起侧栏'}
+            className={styles.collapseButton}
+            onClick={handleToggleCollapse}
+            type="button"
+          >
             {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-          </div>
+          </button>
         </div>
         <div className={styles.topHeaderRight}>
-          <div className={styles.headerAction}>
-            <SelectLang />
-          </div>
-          <AvatarDropdown>
+            <AvatarDropdown>
             <span className={styles.avatar}>
               {initialState?.currentUser?.avatar && (
                 <img
                   src={initialState?.currentUser?.avatar}
                   alt="avatar"
                   className={styles.avatarImg}
+                  width={24}
+                  height={24}
                 />
               )}
               <AvatarName />

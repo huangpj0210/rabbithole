@@ -11,7 +11,7 @@ export interface LogoProps {
 
 const Logo: React.FC<LogoProps> = ({
   collapsed = false,
-  title = 'Ant Design Pro',
+  title = 'rabbithole',
   logo = '/logo.svg',
   theme = 'dark',
 }) => {

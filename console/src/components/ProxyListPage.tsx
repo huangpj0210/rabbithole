@@ -11,33 +11,41 @@ import {
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import ProxyFormModal from '@/components/ProxyFormModal';
 import type { ProxyKind } from '@/components/ProxyFormModal';
+import { Mono, MonoCopy, StatusBadge, proxyStatusSignal } from '@/components/ui';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { DownloadOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import { PageContainer } from '@ant-design/pro-components';
-import { App, Button, Card, Input, Modal, Popconfirm, Select, Switch, Table, Tag, Tooltip } from 'antd';
+import {
+  App,
+  Button,
+  Card,
+  Empty,
+  Input,
+  Modal,
+  Popconfirm,
+  Select,
+  Switch,
+  Table,
+  Tag,
+  Tooltip,
+} from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import React, { useMemo, useState } from 'react';
 
-const STATUS_COLOR: Record<string, string> = {
-  running: 'green',
-  pending: 'blue',
-  offline: 'default',
-  disabled: 'default',
-  bind_error: 'red',
-  apply_error: 'red',
-  unhealthy: 'orange',
-};
-
 /**
- * 参数化类型页:tcp/udp(单 kind,无选择器)、domains(http/https/tcpmux)、
- * secret(stcp/sudp/xtcp)共用;列表按 kinds 过滤,弹窗按 §8.1 矩阵渲染。
+ * 参数化类型页(§6.3):tcp/udp(单 kind)、domains(http/https/tcpmux)、
+ * secret(stcp/sudp/xtcp)共用;列模式/空态按页参数化,路径与数据行为不变。
  */
 const ProxyListPage: React.FC<{
   defaultKind: ProxyKind;
-  description: string;
+  /** bare 模式:作为 Tab 面板等容器子元素嵌入,不渲染 PageContainer 页头(避免与外层页头重复)。 */
+  bare?: boolean;
+  description?: string;
+  /** 空态文案中的规则名词(默认取 title,再退回「转发规则」)。 */
+  emptyNoun?: string;
   kinds: ProxyKind[];
-  title: string;
-}> = ({ title, description, kinds, defaultKind }) => {
+  title?: string;
+}> = ({ title, description, kinds, defaultKind, bare, emptyNoun }) => {
   const queryClient = useQueryClient();
   const { message } = App.useApp();
   const [modal, setModal] = useState<{ editing: null | ServiceRow; open: boolean }>({
@@ -46,7 +54,9 @@ const ProxyListPage: React.FC<{
   });
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchText, setBatchText] = useState('');
-  const [batchResults, setBatchResults] = useState<null | Array<{ code: number; name: string; msg: string }>>(null);
+  const [batchResults, setBatchResults] = useState<
+    null | Array<{ code: number; name: string; msg: string }>
+  >(null);
   const [clientFilter, setClientFilter] = useState<null | string>(null);
   const [batchRunning, setBatchRunning] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
@@ -64,11 +74,7 @@ const ProxyListPage: React.FC<{
     () => (clientFilter ? rows.filter((r) => r.client_id === clientFilter) : rows),
     [rows, clientFilter],
   );
-  // F1 字段(后端 M1 落地前不返回,列不渲染)
-  const hasConns = useMemo(
-    () => !!rows.some((r) => typeof r.conns_current === 'number'),
-    [rows],
-  );
+  const hasConns = useMemo(() => !!rows.some((r) => typeof r.conns_current === 'number'), [rows]);
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['services'] });
 
@@ -104,7 +110,9 @@ const ProxyListPage: React.FC<{
       const results = await batchServices(selectedIds, action);
       const ok = results.filter((r) => r.code === 0).length;
       const bad = results.filter((r) => r.code !== 0);
-      message.success(`批量${action === 'enable' ? '启用' : action === 'disable' ? '停用' : '删除'}:${ok} 成功${bad.length ? `,${bad.length} 失败` : ''}`);
+      message.success(
+        `批量${action === 'enable' ? '启用' : action === 'disable' ? '停用' : '删除'}:${ok} 成功${bad.length ? `,${bad.length} 失败` : ''}`,
+      );
       bad.slice(0, 3).forEach((r) => message.error(`#${r.id}:${r.message}`));
       setSelectedIds([]);
       invalidate();
@@ -130,7 +138,11 @@ const ProxyListPage: React.FC<{
         await createService(item);
         results.push({ code: 0, name: item.name ?? '?', msg: '成功' });
       } catch (e) {
-        results.push({ code: -1, name: item.name ?? '?', msg: e instanceof Error ? e.message : '失败' });
+        results.push({
+          code: -1,
+          name: item.name ?? '?',
+          msg: e instanceof Error ? e.message : '失败',
+        });
       }
     }
     setBatchResults(results);
@@ -142,16 +154,52 @@ const ProxyListPage: React.FC<{
   const isDomain = kinds.every((k) => k === 'http' || k === 'https' || k === 'tcpmux');
   const isSecret = kinds.every((k) => k === 'stcp' || k === 'sudp' || k === 'xtcp');
 
+  // 空态三件套(§6.3):发生了什么 / 该做什么 / 主按钮
+  const noun = emptyNoun ?? title ?? '转发规则';
+  const emptyText = (
+    <Empty
+      description={
+        <span>
+          {clients.length === 0
+            ? `还没有客户端。${noun}需要一个在线客户端承载,先到「客户端」页创建。`
+            : `还没有${noun}。`}
+        </span>
+      }
+      image={Empty.PRESENTED_IMAGE_SIMPLE}
+      style={{ padding: '32px 0' }}
+    >
+      {clients.length === 0 ? (
+        <Button href="#/rabbithole/clients" type="primary">
+          去创建客户端
+        </Button>
+      ) : (
+        <Button onClick={() => setModal({ open: true, editing: null })} type="primary">
+          新建规则
+        </Button>
+      )}
+    </Empty>
+  );
+
   const columns: ColumnsType<ServiceRow> = [
-    { title: '名称', dataIndex: 'name', key: 'name', width: 140 },
+    {
+      title: '名称',
+      dataIndex: 'name',
+      key: 'name',
+      width: 150,
+      render: (v: string) => <span style={{ fontWeight: 500 }}>{v}</span>,
+    },
     ...(isTunnel
       ? [
           {
             title: '监听',
             key: 'bind',
-            width: 150,
+            width: 170,
             render: (_: unknown, row: ServiceRow) =>
-              row.bind_port > 0 ? `${row.bind_ip}:${row.bind_port}` : '共享端口',
+              row.bind_port > 0 ? (
+                <Mono>{`${row.bind_ip}:${row.bind_port}`}</Mono>
+              ) : (
+                <Mono>共享端口</Mono>
+              ),
           },
         ]
       : []),
@@ -166,9 +214,9 @@ const ProxyListPage: React.FC<{
                 s.http?.custom_domains ?? s.https?.custom_domains ?? s.tcpmux?.custom_domains ?? [];
               const sub = s.http?.subdomain ?? s.https?.subdomain;
               const parts: React.ReactNode[] = [];
-              if (ds[0]) parts.push(<Tag key="d0" color="blue">{ds[0]}</Tag>);
+              if (ds[0]) parts.push(<Mono key="d0">{ds[0]}</Mono>);
               if (ds.length > 1) parts.push(<Tag key="dn">+{ds.length - 1}</Tag>);
-              if (sub) parts.push(<Tag key="sub">{`${sub}.*`}</Tag>);
+              if (sub) parts.push(<Mono key="sub">{`${sub}.*`}</Mono>);
               return parts.length ? <>{parts}</> : '-';
             },
           },
@@ -179,19 +227,28 @@ const ProxyListPage: React.FC<{
           {
             title: '密钥',
             key: 'secret',
-            width: 120,
+            width: 140,
             render: (_: unknown, row: ServiceRow) => {
               const k = row.spec?.[row.kind]?.secret_key;
-              return k ? <Tag color="purple">{`${String(k).slice(0, 6)}…`}</Tag> : '-';
+              return k ? (
+                <MonoCopy
+                  ariaLabel="复制访问密钥"
+                  display={`${String(k).slice(0, 8)}…`}
+                  full={String(k)}
+                />
+              ) : (
+                '-'
+              );
             },
           },
           {
             title: '允许访问方',
             key: 'allow_users',
-            width: 110,
-            render: (_: unknown, row: ServiceRow) => row.spec?.[row.kind]?.allow_users?.length
-              ? (row.spec[row.kind].allow_users as string[]).join(',')
-              : '任意',
+            width: 120,
+            render: (_: unknown, row: ServiceRow) =>
+              row.spec?.[row.kind]?.allow_users?.length
+                ? (row.spec[row.kind].allow_users as string[]).join(',')
+                : '任意',
           },
         ]
       : []),
@@ -199,31 +256,43 @@ const ProxyListPage: React.FC<{
       title: '状态',
       dataIndex: 'status',
       key: 'status',
-      width: 130,
-      render: (st: string, row) => (
-        <>
-          <Tag color={STATUS_COLOR[st] ?? 'default'}>{st}</Tag>
-          {row.status_reason ? (
-            <Tooltip title={row.status_reason}>
-              <span style={{ color: '#999', fontSize: 12 }}>{row.status_reason.slice(0, 16)}…</span>
-            </Tooltip>
-          ) : null}
-        </>
-      ),
+      width: 150,
+      render: (st: string, row) => {
+        const sig = proxyStatusSignal(st, row.healthy);
+        return row.status_reason ? (
+          <Tooltip title={row.status_reason}>
+            <StatusBadge signal={sig.signal} text={sig.text} />
+          </Tooltip>
+        ) : (
+          <StatusBadge signal={sig.signal} text={sig.text} />
+        );
+      },
     },
     {
       title: '目标',
       key: 'target',
       render: (_, row) =>
-        row.plugin ? (
-          <Tag color="purple">{row.plugin}</Tag>
-        ) : (
-          `${row.target_host}:${row.target_port}`
-        ),
+        row.plugin ? <Mono>{row.plugin}</Mono> : <Mono>{`${row.target_host}:${row.target_port}`}</Mono>,
     },
-    { title: '池', dataIndex: 'pool_ready', key: 'pool', width: 60 },
+    {
+      title: '池',
+      dataIndex: 'pool_ready',
+      key: 'pool',
+      width: 60,
+      align: 'right' as const,
+      render: (v: number) => <Mono>{v}</Mono>,
+    },
     ...(hasConns
-      ? [{ title: '连接', dataIndex: 'conns_current' as const, key: 'conns', width: 70 }]
+      ? [
+          {
+            title: '连接',
+            dataIndex: 'conns_current' as const,
+            key: 'conns',
+            width: 70,
+            align: 'right' as const,
+            render: (v: number) => <Mono>{v ?? 0}</Mono>,
+          },
+        ]
       : []),
     {
       title: '启用',
@@ -251,7 +320,13 @@ const ProxyListPage: React.FC<{
           <Button onClick={() => setModal({ open: true, editing: row })} size="small" type="link">
             编辑
           </Button>
-          <Popconfirm onConfirm={() => deleteMut.mutate(row.id)} title="确认删除该规则?">
+          <Popconfirm
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+            okText="删除"
+            onConfirm={() => deleteMut.mutate(row.id)}
+            title={`删除规则 ${row.name}?此操作不可恢复。`}
+          >
             <Button danger size="small" type="link">
               删除
             </Button>
@@ -261,8 +336,8 @@ const ProxyListPage: React.FC<{
     },
   ];
 
-  return (
-    <PageContainer subTitle={description} title={title}>
+  const body = (
+    <>
       <Card
         extra={
           <Select
@@ -274,6 +349,7 @@ const ProxyListPage: React.FC<{
             value={clientFilter}
           />
         }
+        style={{ borderRadius: 8 }}
       >
         <Tooltip title={clients.length === 0 ? '请先在「客户端」页创建客户端' : ''}>
           <Button
@@ -296,18 +372,23 @@ const ProxyListPage: React.FC<{
         >
           批量导入
         </Button>
-        <Button icon={<ReloadOutlined />} onClick={() => invalidate()} size="small" style={{ marginLeft: 8 }}>
+        <Button
+          icon={<ReloadOutlined />}
+          onClick={() => invalidate()}
+          size="small"
+          style={{ marginLeft: 8 }}
+        >
           刷新
         </Button>
         {selectedIds.length > 0 && (
           <>
             <Button
+              ghost
               loading={batchOpRunning}
               onClick={() => runBatchOp('enable')}
               size="small"
               style={{ marginLeft: 8 }}
               type="primary"
-              ghost
             >
               批量启用({selectedIds.length})
             </Button>
@@ -321,7 +402,7 @@ const ProxyListPage: React.FC<{
             </Button>
             <Popconfirm
               onConfirm={() => runBatchOp('delete')}
-              title={`确认删除选中的 ${selectedIds.length} 条规则?`}
+              title={`删除选中的 ${selectedIds.length} 条规则?此操作不可恢复。`}
             >
               <Button danger loading={batchOpRunning} size="small" style={{ marginLeft: 8 }}>
                 批量删除
@@ -333,7 +414,8 @@ const ProxyListPage: React.FC<{
           columns={columns}
           dataSource={filtered}
           loading={servicesQ.isLoading}
-          pagination={false}
+          locale={{ emptyText }}
+          pagination={{ pageSize: 50, hideOnSinglePage: true }}
           rowKey="id"
           rowSelection={{
             onChange: (ids) => setSelectedIds(ids as number[]),
@@ -364,11 +446,11 @@ const ProxyListPage: React.FC<{
         onCancel={() => setBatchOpen(false)}
         onOk={runBatch}
         open={batchOpen}
-        title="批量导入规则(JSON 数组)"
+        title="批量导入规则"
         width={680}
       >
-        <p style={{ color: '#999', fontSize: 12 }}>
-          粘贴 ProxySpec JSON 数组(与 POST /api/services 载荷一致),逐条创建并回报结果。
+        <p style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12 }}>
+          粘贴规则 JSON 数组(与单条创建载荷一致),逐条创建并回报每条结果。
         </p>
         <Input.TextArea
           onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setBatchText(e.target.value)}
@@ -377,7 +459,7 @@ const ProxyListPage: React.FC<{
           value={batchText}
         />
         {batchResults && (
-          <div style={{ marginTop: 12, maxHeight: 200, overflow: 'auto' }}>
+          <div className="rh-mono" style={{ fontSize: 12, marginTop: 12, maxHeight: 200, overflow: 'auto' }}>
             {batchResults.map((r, i) => (
               <div key={i} style={{ color: r.code === 0 ? '#3f8600' : '#cf1322' }}>
                 {r.code === 0 ? '✓' : '✗'} {r.name}:{r.msg}
@@ -386,6 +468,12 @@ const ProxyListPage: React.FC<{
           </div>
         )}
       </Modal>
+    </>
+  );
+  if (bare) return body;
+  return (
+    <PageContainer subTitle={description} title={title}>
+      {body}
     </PageContainer>
   );
 };

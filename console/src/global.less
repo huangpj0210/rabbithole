@@ -3,7 +3,7 @@
   font-style: normal;
   font-weight: 300;
   font-display: swap;
-  src: url("//mdn.alipayobjects.com/huamei_iwk9zp/afts/file/A*1GSgSYDD_aIAAAAAQsAAAAgAegCCAQ/AlibabaSans-Light.woff2")
+  src: url("/fonts/AlibabaSans-Light.woff2")
     format("woff2");
 }
 @font-face {
@@ -11,7 +11,7 @@
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url("//mdn.alipayobjects.com/huamei_iwk9zp/afts/file/A*2zEUQqnPNesAAAAAQtAAAAgAegCCAQ/AlibabaSans-Regular.woff2")
+  src: url("/fonts/AlibabaSans-Regular.woff2")
     format("woff2");
 }
 @font-face {
@@ -19,7 +19,7 @@
   font-style: normal;
   font-weight: 500;
   font-display: swap;
-  src: url("//mdn.alipayobjects.com/huamei_iwk9zp/afts/file/A*E_cxRbMlZqUAAAAAQuAAAAgAegCCAQ/AlibabaSans-Medium.woff2")
+  src: url("/fonts/AlibabaSans-Medium.woff2")
     format("woff2");
 }
 @font-face {
@@ -27,7 +27,7 @@
   font-style: normal;
   font-weight: 600;
   font-display: swap;
-  src: url("//mdn.alipayobjects.com/huamei_iwk9zp/afts/file/A*E_cxRbMlZqUAAAAAQuAAAAgAegCCAQ/AlibabaSans-Bold.woff2")
+  src: url("/fonts/AlibabaSans-Bold.woff2")
     format("woff2");
 }
 @font-face {
@@ -35,7 +35,7 @@
   font-style: normal;
   font-weight: 700;
   font-display: swap;
-  src: url("//mdn.alipayobjects.com/huamei_iwk9zp/afts/file/A*E_cxRbMlZqUAAAAAQuAAAAgAegCCAQ/AlibabaSans-Heavy.woff2")
+  src: url("/fonts/AlibabaSans-Heavy.woff2")
     format("woff2");
 }
 
@@ -113,3 +113,37 @@ ol {
   }
 }
 
+
+/* ---- rabbithole 设计系统(§4):mono 数字与触控目标 ---- */
+
+/* 端口/IP/UUID/字节/速率/时间戳一律 mono + tabular-nums(§4.3) */
+.rh-mono,
+.rh-mono input {
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+/* 操作列链接:扩大触控目标(≥44px 视觉密度内尽量放大点击区,§4.6) */
+.ant-table-cell .ant-btn-link {
+  padding: 6px 8px;
+}
+
+/* 图标按钮统一可聚焦轮廓(键盘走查可见,§9) */
+button:focus-visible,
+.ant-btn:focus-visible,
+.ant-switch:focus-visible {
+  outline: 2px solid rgba(24, 144, 255, 0.55);
+  outline-offset: 1px;
+}
+
+/* 尊重系统减动效(§4.5):仅保留必要过渡 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

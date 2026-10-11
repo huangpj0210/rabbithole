@@ -7,6 +7,7 @@ import {
 } from '@/api/rabbithole';
 import type { ClientRow } from '@/api/rabbithole';
 import SecretModal from '@/components/SecretModal';
+import { Mono, MonoCopy, StatusBadge } from '@/components/ui';
 import { fmtBytes } from '@/utils/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -20,6 +21,7 @@ import {
   App,
   Button,
   Card,
+  Empty,
   Form,
   Input,
   InputNumber,
@@ -29,6 +31,7 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import React, { useMemo, useState } from 'react';
@@ -41,6 +44,16 @@ interface ClientForm {
   max_conns: number | null;
   max_services: number | null;
   flow_limit_mb: number | null;
+}
+
+/** 相对时间:"2 分钟前";超过 1h 给绝对时间。 */
+function relTime(ts: null | number): string {
+  if (!ts) return '-';
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  return `${Math.floor(diff / 86_400_000)} 天前`;
 }
 
 /** 客户端管理:列表/新建(一次性密钥)/编辑/轮换/启停/删除。 */
@@ -156,14 +169,35 @@ const ClientsPage: React.FC = () => {
   }
 
   const columns: ColumnsType<ClientRow> = [
-    { title: '名称', dataIndex: 'name', key: 'name' },
-    { title: 'ID', dataIndex: 'id', key: 'id', width: 240, ellipsis: true },
+    {
+      title: '名称',
+      dataIndex: 'name',
+      key: 'name',
+      render: (v: string) => <span style={{ fontWeight: 500 }}>{v}</span>,
+    },
+    {
+      title: 'ID',
+      dataIndex: 'id',
+      key: 'id',
+      width: 150,
+      // UUID 后 8 位 + 一键复制,悬停 title 展示全量(§6.4)
+      render: (_: unknown, row: ClientRow) => (
+        <MonoCopy ariaLabel="复制客户端 ID" display={row.id.slice(-8)} full={row.id} />
+      ),
+    },
     {
       title: '在线',
       dataIndex: 'online',
       key: 'online',
-      width: 76,
-      render: (v: boolean) => <Tag color={v ? 'green' : 'default'}>{v ? '在线' : '离线'}</Tag>,
+      width: 150,
+      render: (v: boolean, row: ClientRow) =>
+        v ? (
+          <StatusBadge signal="ok" text="在线" />
+        ) : (
+          <Tooltip title={row.last_online_at ? `最近在线 ${relTime(row.last_online_at)}` : '从未上线'}>
+            <StatusBadge signal="off" text={`离线 · ${relTime(row.last_online_at)}`} />
+          </Tooltip>
+        ),
     },
     {
       title: '启用',
@@ -186,8 +220,10 @@ const ClientsPage: React.FC = () => {
     {
       title: '版本 / 主机',
       key: 'meta',
-      width: 190,
-      render: (_, row: ClientRow) => `${row.client_version || '-'} / ${row.hostname || '-'}`,
+      width: 210,
+      render: (_, row: ClientRow) => (
+        <Mono>{`${row.client_version || '-'} / ${row.hostname || '-'}`}</Mono>
+      ),
     },
     ...(hasMeter
       ? [
@@ -244,7 +280,7 @@ const ClientsPage: React.FC = () => {
           </Popover>
           <Popconfirm
             onConfirm={() => deleteMut.mutate(row.id)}
-            title="确认删除该客户端及其全部规则?"
+            title={`删除客户端 ${row.name} 及其全部规则?此操作不可恢复。`}
           >
             <Button danger size="small" type="link">
               删除
@@ -270,8 +306,43 @@ const ClientsPage: React.FC = () => {
         <Table
           columns={columns}
           dataSource={rows}
+          expandable={{
+            expandedRowRender: (row: ClientRow) => (
+              <div style={{ display: 'flex', gap: 40, flexWrap: 'wrap', padding: '4px 8px' }}>
+                <div>
+                  <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12 }}>连接 / 并发上限</div>
+                  <Mono style={{ fontSize: 15 }}>{`${row.conns_current ?? 0}${row.max_conns ? ` / ${row.max_conns}` : ''}`}</Mono>
+                </div>
+                <div>
+                  <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12 }}>流量(入 / 出)</div>
+                  <Mono style={{ fontSize: 15 }}>{`${fmtBytes(row.bytes_in)} / ${fmtBytes(row.bytes_out)}`}</Mono>
+                </div>
+                <div>
+                  <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12 }}>规则数上限</div>
+                  <Mono style={{ fontSize: 15 }}>{row.max_services || '不限'}</Mono>
+                </div>
+                <div>
+                  <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12 }}>限速</div>
+                  <Mono style={{ fontSize: 15 }}>{row.rate_limit || '不限'}</Mono>
+                </div>
+              </div>
+            ),
+          }}
           loading={isLoading}
-          pagination={false}
+          locale={{
+            emptyText: (
+              <Empty
+                description="还没有客户端。创建客户端后,控制台会给出接入配置,客户端进程上线即可承载转发规则。"
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                style={{ padding: '32px 0' }}
+              >
+                <Button onClick={openCreate} type="primary">
+                  新建客户端
+                </Button>
+              </Empty>
+            ),
+          }}
+          pagination={{ pageSize: 50, hideOnSinglePage: true }}
           rowKey="id"
           size="middle"
           style={{ marginTop: 12 }}

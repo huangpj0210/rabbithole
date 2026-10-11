@@ -620,3 +620,37 @@ resilience 19 / embed 9 —— 共 145 项全绿。
 已知限制(如实):配额与计量均为进程内存量(重启归零,持久化未做);客户端级
 rate_limit 仅在 TCP 族转发执行;SSH 网关流量未计量;HTTPS 证书命中即服务端终结
 (与同名 https 规则的 passthrough 语义按"证书优先"裁决)。
+
+## R22(2026-10-11)console UI 重设计执行(用户指令"docs/console-ui-redesign.md 按照这个的要求修改前端")
+
+按设计文档 P0–P4 全量落地(配色不动,§4.2 明示另行立项):
+
+- **P0 去模板脸**:isDev 收缩为纯 NODE_ENV、config.ts 移除 `process.env.CI` 内联
+  (V3 生产齿轮根因);删 waterMarkProps;Logo 默认标题 'rabbithole'。
+- **P1 Token 与资产**:AlibabaSans 五字重自托管进 public/fonts(+preload,离线零外域);
+  antd token {borderRadius:6, borderRadiusLG:8};`.rh-mono` 工具类
+  (ui-monospace 栈 + tabular-nums)用于端口/IP/UUID/字节/速率/时间;TopHeader 折叠
+  div→button(aria-label)、HeaderPairsInput 删除钮 aria-label;登录页 autocomplete;
+  IA 分组(总览/客户端 + 转发组 + 设置,路径全不变)、TagsView 关、Footer 删、侧栏底
+  menuFooterRender 显示 `rabbithole v{APP_VERSION}`。
+- **P2 页面重排**:总览单卡分格指标条 + 渐变面积图(当前值标注)+ 隧道健康面板 +
+  事件表(默认 5 条/展开);ProxyListPage 参数化(信号点徽章 StatusBadge、mono 列、
+  空态三件套、分页);ProxyFormModal「自动分配」开关替代魔法值 0、连接/目标/行为
+  分组、遮罩加深 rgba(22,35,43,.45)、按钮动词化「创建规则」;客户端页 UUID 后 8 位
+  +复制、相对时间、行展开(连接/流量/规则上限/限速);证书页到期倒计时
+  (<7 红/<30 橙)+指纹前 8 位复制;设置页服务器配置标题去括号。
+- **P3 文案与 i18n 决策 A**:删 SelectLang 与 7×2 locale 文件、oneapi.json,明确
+  中文单语;删除确认全部具体对象+后果;登录按钮「进入控制台」。
+- **P4 验收(浏览器逐页走查 + 产物审计)**,走查中修复三处:①密钥页规则 Tab 内层
+  PageContainer 回退路由名致「密钥访问」同屏两次 → ProxyListPage 增 bare 模式;
+  ②证书页空态裸「暂无数据」→ 三件套(上传 PEM 后 SNI 自动匹配说明+主按钮)+分页;
+  ③访问器删除确认具体化。
+
+验证:console typecheck/build exit 0;dist 审计无 `process.env.CI`、无外域 woff2、
+无水印/SettingDrawer 运行时渲染(ProLayout 库内 "Ant Design Pro" 为被覆盖的死代码,
+运行时侧栏实证为 rabbithole);浏览器走查登录/总览/TCP(含弹窗遮罩与自动分配开关)/
+客户端(展开行)/密钥(双 Tab)/域名/证书(自签证书实测 89 天倒计时)/设置
+(autocomplete current-password/new-password)全过。
+
+已知限制(如实):<768px 卡片降级与触控目标未专项设计(§4.6 部分保留现状);
+暗色模式未做(文档明确不在本次范围)。

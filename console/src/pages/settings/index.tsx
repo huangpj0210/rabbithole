@@ -92,7 +92,13 @@ const ServerConfigCard: React.FC = () => {
   const restartNote = hot ? undefined : '加载中…';
 
   return (
-    <Card loading={cfgQ.isLoading} style={{ marginTop: 16 }} title="服务器配置(保存即热生效)">
+    <Card
+      loading={cfgQ.isLoading}
+      style={{ marginTop: 16 }}
+      title="服务器配置"
+      styles={{ header: { borderBottom: 'none' } }}
+      extra={<span style={{ fontSize: 12, color: 'rgba(0,0,0,0.45)' }}>保存后立即生效,无需重启</span>}
+    >
       <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
         {restartNote ??
           '以下配置保存后立即生效并写回配置文件(原文件备份为 *.toml.bak,注释会丢失)。vhost 端口、主监听等其余配置仍需修改文件并重启。'}
@@ -226,11 +232,15 @@ const SettingsPage: React.FC = () => {
       <Card style={{ maxWidth: 560, marginTop: 16 }} title="监控指标">
         <Typography.Paragraph>
           Prometheus 抓取地址:
-          <Typography.Text copyable>{metricsUrl}</Typography.Text>
+          <Typography.Text aria-label="复制 Prometheus 地址" className="rh-mono" copyable={{ tooltips: ['复制', '已复制'] }}>
+            {metricsUrl}
+          </Typography.Text>
         </Typography.Paragraph>
-        <Typography.Paragraph type="secondary">
-          需在服务端启用 metrics(enable_prometheus)后可用;抓取时携带管理台 Bearer 令牌。
-        </Typography.Paragraph>
+        <ol style={{ paddingLeft: 20, color: 'rgba(0,0,0,0.55)', fontSize: 13, lineHeight: 2 }}>
+          <li>服务端配置 <span className="rh-mono">enable_prometheus = true</span> 并重启;</li>
+          <li>Prometheus 抓取任务携带与管理台相同的 Bearer 令牌;</li>
+          <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
+        </ol>
       </Card>
 
       <ServerConfigCard />

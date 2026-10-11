@@ -20,8 +20,10 @@ const Settings: ProLayoutProps & {
   pwa: false,
   logo: '/logo.svg',
   iconfontUrl: '',
-  multiTabs: true,
+  // TagsView 默认关闭(§5):8 页小控制台不需要多标签 chrome
+  multiTabs: false,
   siderWidth: 208,
+  footerRender: false,
 };
 
 export default Settings;
