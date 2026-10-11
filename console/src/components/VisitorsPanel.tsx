@@ -147,12 +147,12 @@ const VisitorsPanel: React.FC<{ seed?: VisitorSeed | null; onSeedUsed?: () => vo
   }, [modalOpen, editId]);
 
   const columns: ColumnsType<VisitorRow> = [
-    { title: '名称', dataIndex: 'name', key: 'name', width: 140 },
-    { title: '类型', dataIndex: 'kind', key: 'kind', width: 80, render: (v: string) => <Tag>{v.toUpperCase()}</Tag> },
-    { title: '本地监听', key: 'bind', width: 150, render: (_, row) => <span className="rh-mono">{`${row.bind_addr}:${row.bind_port}`}</span> },
-    { title: '目标代理', dataIndex: 'target_proxy_name', key: 'target' },
+    { title: <InfoLabel info="访问器标识" title="名称" />, dataIndex: 'name', key: 'name', width: 140 },
+    { title: <InfoLabel info="STCP/SUDP/XTCP,创建后不可改" title="类型" />, dataIndex: 'kind', key: 'kind', width: 80, render: (v: string) => <Tag>{v.toUpperCase()}</Tag> },
+    { title: <InfoLabel info="访问端本地绑定,连接它即经隧道进入目标规则" title="本地监听" />, key: 'bind', width: 150, render: (_, row) => <span className="rh-mono">{`${row.bind_addr}:${row.bind_port}`}</span> },
+    { title: <InfoLabel info="要访问的密钥访问规则;凭据自动继承" title="目标代理" />, dataIndex: 'target_proxy_name', key: 'target' },
     {
-      title: '压缩',
+      title: <InfoLabel info="中继通道启用 snappy 压缩" title="压缩" />,
       key: 'compress',
       width: 70,
       render: (_, row) => (

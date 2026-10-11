@@ -176,7 +176,7 @@ const ClientsPage: React.FC = () => {
       render: (v: string) => <span style={{ fontWeight: 500 }}>{v}</span>,
     },
     {
-      title: 'ID',
+      title: <InfoLabel info="客户端 UUID,末 8 位展示,可复制完整值" title="ID" />,
       dataIndex: 'id',
       key: 'id',
       width: 150,
@@ -186,7 +186,7 @@ const ClientsPage: React.FC = () => {
       ),
     },
     {
-      title: '在线',
+      title: <InfoLabel info="客户端会话是否连着服务端;离线规则不再承载流量" title="在线" />,
       dataIndex: 'online',
       key: 'online',
       width: 150,
@@ -218,7 +218,7 @@ const ClientsPage: React.FC = () => {
       },
     },
     {
-      title: '版本 / 主机',
+      title: <InfoLabel info="客户端上报的版本与主机信息" title="版本 / 主机" />,
       key: 'meta',
       width: 210,
       render: (_, row: ClientRow) => (
@@ -228,7 +228,7 @@ const ClientsPage: React.FC = () => {
     ...(hasMeter
       ? [
           {
-            title: '流量(入/出)',
+            title: <InfoLabel info="该客户端名下全部规则的入站/出站累计字节(进程内计量,重启归零)" title="流量(入/出)" />,
             key: 'bytes',
             width: 170,
             render: (_: unknown, row: ClientRow) => `${fmtBytes(row.bytes_in)} / ${fmtBytes(row.bytes_out)}`,
@@ -238,7 +238,7 @@ const ClientsPage: React.FC = () => {
     ...(hasConns
       ? [
           {
-            title: '连接',
+            title: <InfoLabel info="当前并发连接数" title="连接" />,
             key: 'conns',
             width: 90,
             render: (_: unknown, row: ClientRow) =>
@@ -314,7 +314,7 @@ const ClientsPage: React.FC = () => {
                   <Mono style={{ fontSize: 15 }}>{`${row.conns_current ?? 0}${row.max_conns ? ` / ${row.max_conns}` : ''}`}</Mono>
                 </div>
                 <div>
-                  <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12 }}>流量(入 / 出)</div>
+                  <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12 }}><InfoLabel info="进程内累计,重启归零" title="流量(入 / 出)" /></div>
                   <Mono style={{ fontSize: 15 }}>{`${fmtBytes(row.bytes_in)} / ${fmtBytes(row.bytes_out)}`}</Mono>
                 </div>
                 <div>
