@@ -2,10 +2,10 @@ import { changePassword, getServerConfig, putServerConfig } from '@/api/rabbitho
 import type { ServerConfigUpdate } from '@/api/rabbithole';
 import { useAuthStore } from '@/stores/auth';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { history } from '@umijs/max';
+import { history, useLocation } from '@umijs/max';
 import { PageContainer } from '@ant-design/pro-components';
 import { InfoLabel } from '@/components/ui';
-import { Alert, App, Button, Card, Checkbox, Form, Input, InputNumber, Select, theme, Typography } from 'antd';
+import { Alert, App, Button, Card, Checkbox, Form, Input, InputNumber, Select, Tabs, theme, Typography } from 'antd';
 import React from 'react';
 
 interface PasswordForm {
@@ -25,7 +25,7 @@ interface PortsForm {
   max_services_per_client: number | null;
 }
 
-/** 同页三张卡统一最大宽度(设置页评审 P1:此前「服务器配置」独占 992px 与窄卡混排)。 */
+/** tab 面板内卡片统一最大宽度(表单/说明类窄卡,避免随内容区整行拉伸)。 */
 const CARD_MAX_WIDTH = 560;
 
 /** 服务器配置(热生效子集):SSH 网关 / 端口策略 / 日志级别 / 公钥白名单。 */
@@ -95,13 +95,7 @@ const ServerConfigCard: React.FC = () => {
   const hot = cfgQ.data?.hot;
 
   return (
-    <Card
-      loading={cfgQ.isLoading}
-      style={{ maxWidth: CARD_MAX_WIDTH, marginTop: 16 }}
-
-      styles={{ header: { borderBottom: 'none' } }}
-      title={<InfoLabel info="保存后立即生效,无需重启;同时写回配置文件(原文件备份为 .bak,注释会丢失)" title="服务器配置" />}
-    >
+    <Card loading={cfgQ.isLoading} style={{ maxWidth: CARD_MAX_WIDTH }}>
       {cfgQ.isError ? (
         // 加载失败不渲染表单:空表单点「保存配置」会把端口策略清空(P0 同源风险)
         <Alert
@@ -182,11 +176,10 @@ const ServerConfigCard: React.FC = () => {
   );
 };
 
-/** 设置页:修改密码(成功后强制重登)+ 服务器配置 + Prometheus 地址展示。 */
-const SettingsPage: React.FC = () => {
+/** 修改密码:成功后服务端轮换 JWT 密钥,所有会话失效需重登。 */
+const PasswordCard: React.FC = () => {
   const [form] = Form.useForm<PasswordForm>();
   const { message } = App.useApp();
-  const { token } = theme.useToken();
 
   const changeMut = useMutation({
     mutationFn: (v: PasswordForm) => changePassword(v.oldPassword, v.newPassword),
@@ -198,78 +191,103 @@ const SettingsPage: React.FC = () => {
     },
   });
 
-  const metricsUrl = `${window.location.origin}/metrics`;
-
   return (
-    <PageContainer subTitle="修改密码与部署信息" title="设置">
-      <Card style={{ maxWidth: CARD_MAX_WIDTH }} title="修改密码">
-        <Alert
-          message="修改成功后所有会话将立即失效,需重新登录"
-          showIcon
-          style={{ marginBottom: 16 }}
-          type="warning"
-        />
-        <Form
-          form={form}
-          labelCol={{ span: 6 }}
-          layout="horizontal"
-          onFinish={(values) => changeMut.mutate(values)}
-          wrapperCol={{ span: 16 }}
+    <Card style={{ maxWidth: CARD_MAX_WIDTH }}>
+      <Alert
+        message="修改成功后所有会话将立即失效,需重新登录"
+        showIcon
+        style={{ marginBottom: 16 }}
+        type="warning"
+      />
+      <Form
+        form={form}
+        labelCol={{ span: 6 }}
+        layout="horizontal"
+        onFinish={(values) => changeMut.mutate(values)}
+        wrapperCol={{ span: 16 }}
+      >
+        <Form.Item label="当前密码" name="oldPassword" rules={[{ required: true, message: '请输入当前密码' }]}>
+          <Input.Password autoComplete="current-password" placeholder="输入当前密码" />
+        </Form.Item>
+        <Form.Item
+          label="新密码"
+          name="newPassword"
+          rules={[
+            { required: true, message: '请输入新密码' },
+            { min: 8, message: '新密码至少 8 位' },
+          ]}
         >
-          <Form.Item label="当前密码" name="oldPassword" rules={[{ required: true, message: '请输入当前密码' }]}>
-            <Input.Password autoComplete="current-password" placeholder="输入当前密码" />
-          </Form.Item>
-          <Form.Item
-            label="新密码"
-            name="newPassword"
-            rules={[
-              { required: true, message: '请输入新密码' },
-              { min: 8, message: '新密码至少 8 位' },
-            ]}
-          >
-            <Input.Password autoComplete="new-password" placeholder="至少 8 位" />
-          </Form.Item>
-          <Form.Item
-            dependencies={['newPassword']}
-            label="确认新密码"
-            name="confirmPassword"
-            rules={[
-              { required: true, message: '请再次输入新密码' },
-              ({ getFieldValue }) => ({
-                validator(_, value) {
-                  if (!value || getFieldValue('newPassword') === value) {
-                    return Promise.resolve();
-                  }
-                  return Promise.reject(new Error('两次输入的新密码不一致'));
-                },
-              }),
-            ]}
-          >
-            <Input.Password autoComplete="new-password" placeholder="再次输入新密码" />
-          </Form.Item>
-          <Form.Item style={{ marginBottom: 0 }} wrapperCol={{ offset: 6 }}>
-            <Button htmlType="submit" loading={changeMut.isPending} type="primary">
-              修改密码
-            </Button>
-          </Form.Item>
-        </Form>
-      </Card>
+          <Input.Password autoComplete="new-password" placeholder="至少 8 位" />
+        </Form.Item>
+        <Form.Item
+          dependencies={['newPassword']}
+          label="确认新密码"
+          name="confirmPassword"
+          rules={[
+            { required: true, message: '请再次输入新密码' },
+            ({ getFieldValue }) => ({
+              validator(_, value) {
+                if (!value || getFieldValue('newPassword') === value) {
+                  return Promise.resolve();
+                }
+                return Promise.reject(new Error('两次输入的新密码不一致'));
+              },
+            }),
+          ]}
+        >
+          <Input.Password autoComplete="new-password" placeholder="再次输入新密码" />
+        </Form.Item>
+        <Form.Item style={{ marginBottom: 0 }} wrapperCol={{ offset: 6 }}>
+          <Button htmlType="submit" loading={changeMut.isPending} type="primary">
+            修改密码
+          </Button>
+        </Form.Item>
+      </Form>
+    </Card>
+  );
+};
 
-      <Card style={{ maxWidth: CARD_MAX_WIDTH, marginTop: 16 }} title="监控指标">
-        <Typography.Paragraph>
-          Prometheus 抓取地址:
-          <Typography.Text aria-label="复制 Prometheus 地址" className="rh-mono" copyable={{ tooltips: ['复制', '已复制'] }}>
-            {metricsUrl}
-          </Typography.Text>
-        </Typography.Paragraph>
-        <ol style={{ paddingLeft: 20, color: token.colorTextTertiary, fontSize: 13, lineHeight: 2 }}>
-          <li>服务端配置 <span className="rh-mono">enable_prometheus = true</span> 并重启;</li>
-          <li>Prometheus 抓取任务携带与管理台相同的 Bearer 令牌;</li>
-          <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
-        </ol>
-      </Card>
+/** 监控指标:Prometheus 抓取地址与接入前提。 */
+const MetricsCard: React.FC = () => {
+  const { token } = theme.useToken();
+  const metricsUrl = `${window.location.origin}/metrics`;
+  return (
+    <Card style={{ maxWidth: CARD_MAX_WIDTH }}>
+      <Typography.Paragraph>
+        Prometheus 抓取地址:
+        <Typography.Text aria-label="复制 Prometheus 地址" className="rh-mono" copyable={{ tooltips: ['复制', '已复制'] }}>
+          {metricsUrl}
+        </Typography.Text>
+      </Typography.Paragraph>
+      <ol style={{ paddingLeft: 20, color: token.colorTextTertiary, fontSize: 13, lineHeight: 2 }}>
+        <li>服务端配置 <span className="rh-mono">enable_prometheus = true</span> 并重启;</li>
+        <li>Prometheus 抓取任务携带与管理台相同的 Bearer 令牌;</li>
+        <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
+      </ol>
+    </Card>
+  );
+};
 
-      <ServerConfigCard />
+const SETTINGS_TABS = ['server', 'metrics', 'password'] as const;
+
+/** 设置页:服务器配置 / 监控指标 / 修改密码 三 tab,tab 状态写 query 持久化(同密钥访问页)。 */
+const SettingsPage: React.FC = () => {
+  const location = useLocation();
+  const tabParam = new URLSearchParams(location.search).get('tab');
+  const tab = (SETTINGS_TABS as readonly string[]).includes(tabParam ?? '')
+    ? (tabParam as (typeof SETTINGS_TABS)[number])
+    : 'server';
+  return (
+    <PageContainer subTitle="服务器配置、监控指标与修改密码" title="设置">
+      <Tabs
+        activeKey={tab}
+        items={[
+          { key: 'server', label: '服务器配置', children: <ServerConfigCard /> },
+          { key: 'metrics', label: '监控指标', children: <MetricsCard /> },
+          { key: 'password', label: '修改密码', children: <PasswordCard /> },
+        ]}
+        onChange={(key) => history.replace(`/rabbithole/settings?tab=${key}`)}
+      />
     </PageContainer>
   );
 };
