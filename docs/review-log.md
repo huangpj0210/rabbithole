@@ -847,3 +847,18 @@ typecheck/build exit 0;e2e 主套 69→71,全量 151/151;浏览器走查创建�
 - 验证:fmt/clippy/test(12 通过)、typecheck 全绿;浏览器实测——新建规则弹窗
   无该字段、规则列表无该列、无 allow_users 的 payload 创建 STCP 规则成功、
   「创建访问器」seed 带出目标并成功落库。secret_key 比对(显式双写兼容)保留。
+
+## R33(2026-10-12)登录页密码错误无提示修复(用户反馈)
+
+- 根因:错误提示由 axios 响应拦截器统一弹出(feedback.ts 模块级出口),
+  但绑定者 FeedbackBinder 挂在布局 childrenRender 里;登录路由 layout:false
+  不渲染布局 → 直接落地登录页(登出/token 失效整页跳转)时 api 恒为 null,
+  报错只进 console。经布局页后再 SPA 跳到登录页的路径碰巧可用(绑定残留),
+  掩盖了问题。
+- 修复:登录页挂载时补绑同一 FeedbackApi(useEffect),登录页上的所有
+  拦截器报错(密码错误/网络错误/5xx)恢复可见;布局挂载后重绑同一实例,无冲突。
+- 验证:pnpm build 生产包 + rh-server static_dir 直连,清空 storage 直接
+  落地 /user/login,错误密码提交 → 「用户名或密码错误」toast 出现。
+  (过程教训:antd v6 message DOM 结构已变,内容节点类名为
+  .ant-message-notice-title,按 v5 的 -notice-content 断言"无提示"会误判,
+  dev 与 prod 的 toast 实际一直正常。)

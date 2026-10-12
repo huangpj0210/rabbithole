@@ -7,6 +7,7 @@ import React, { useEffect, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { codesApi, loginApi, userInfoApi } from '@/api/auth';
 import { safeRedirect } from '@/api/request';
+import { bindFeedback } from '@/components/feedback';
 import { useAuthStore } from '@/stores/auth';
 
 const useStyles = createStyles(({ token }) => ({
@@ -113,6 +114,16 @@ const Login: React.FC = () => {
       history.push('/rabbithole/overview');
     }
   }, [token, initialState?.currentUser]);
+
+  // 登录路由 layout:false,布局 childrenRender 里的 FeedbackBinder 不挂载;
+  // 不补绑的话,直接落地登录页时 axios 拦截器的报错(密码错误/网络错误)只进 console,界面无提示
+  useEffect(() => {
+    bindFeedback({
+      error: (c) => message.error(c),
+      success: (c) => message.success(c),
+      warning: (c) => message.warning(c),
+    });
+  }, [message]);
 
   const handleSubmit = async (values: { username: string; password: string }) => {
     setSubmitting(true);
