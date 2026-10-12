@@ -38,6 +38,11 @@ export default [
   {
     name: '转发',
     icon: 'shareAlt',
+    // key 必须非空:ProLayout 计算 selectedKeys 用的 menuData 不过滤 redirect,
+    // "/rabbithole" 重定向项会以路径前缀匹配所有子页混入 selectedKeys;rc-menu
+    // 对这种未注册 key 的 keyPath 退化为 [''],若父菜单 eventKey 恰为空串
+    // (无 path 的父级默认如此)会被误判为"子级选中"而常亮。
+    key: 'forward',
     routes: [
       {
         name: 'TCP 隧道',
