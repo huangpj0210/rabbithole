@@ -25,9 +25,6 @@ interface PortsForm {
   max_services_per_client: number | null;
 }
 
-/** tab 面板内卡片统一最大宽度(表单/说明类窄卡,避免随内容区整行拉伸)。 */
-const CARD_MAX_WIDTH = 560;
-
 /** 服务器配置(热生效子集):SSH 网关 / 端口策略 / 日志级别 / 公钥白名单。 */
 const ServerConfigCard: React.FC = () => {
   const queryClient = useQueryClient();
@@ -95,7 +92,7 @@ const ServerConfigCard: React.FC = () => {
   const hot = cfgQ.data?.hot;
 
   return (
-    <Card loading={cfgQ.isLoading} style={{ maxWidth: CARD_MAX_WIDTH }}>
+    <Card loading={cfgQ.isLoading}>
       {cfgQ.isError ? (
         // 加载失败不渲染表单:空表单点「保存配置」会把端口策略清空(P0 同源风险)
         <Alert
@@ -192,7 +189,7 @@ const PasswordCard: React.FC = () => {
   });
 
   return (
-    <Card style={{ maxWidth: CARD_MAX_WIDTH }}>
+    <Card>
       <Alert
         message="修改成功后所有会话将立即失效,需重新登录"
         showIcon
@@ -252,7 +249,7 @@ const MetricsCard: React.FC = () => {
   const { token } = theme.useToken();
   const metricsUrl = `${window.location.origin}/metrics`;
   return (
-    <Card style={{ maxWidth: CARD_MAX_WIDTH }}>
+    <Card>
       <Typography.Paragraph>
         Prometheus 抓取地址:
         <Typography.Text aria-label="复制 Prometheus 地址" className="rh-mono" copyable={{ tooltips: ['复制', '已复制'] }}>
