@@ -12,7 +12,8 @@
 #   cross build --release --target x86_64-unknown-linux-musl -p rh-server
 #   mkdir -p bin/amd64 && cp target/x86_64-unknown-linux-musl/release/rh-server bin/amd64/
 #   docker build -f deploy/Dockerfile --build-arg BIN_DIR=bin/amd64 -t rabbithole-server:local .
-FROM debian:bookworm-slim
+# 基础镜像 alpine:二进制为 musl 全静态,不依赖 glibc;入口脚本是纯 POSIX sh(busybox 兼容)。
+FROM alpine:3.24
 ARG BIN_DIR=bin/amd64
 COPY --chmod=755 ${BIN_DIR}/rh-server /usr/local/bin/
 COPY deploy/docker-server.toml /etc/rabbithole/server.toml

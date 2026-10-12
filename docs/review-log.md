@@ -774,3 +774,14 @@ typecheck/build exit 0;e2e 主套 69→71,全量 151/151;浏览器走查创建�
 "已连接服务端的客户端数 / 注册总数"、规则弹窗「允许访问方」悬停弹出凭据托管
 说明、点按触发同效;弹窗内 ℹ 图标 9 处渲染正常。(过程中一度误判"弹窗无图标":
 实为空环境无客户端时新建按钮 disabled,属正确空态引导。)
+
+## R28(2026-10-12)Docker 基础镜像 debian:bookworm-slim → alpine:3.24(用户指令)
+
+- 两个镜像(server/client)统一换 `alpine:3.24`(当前稳定版,支持至 2028-06)。
+- 可行性依据:二进制为 musl 全静态,不依赖 glibc;入口脚本是纯 POSIX sh
+  (mkdir/cp/echo/exec 均为 busybox 内建),无 bashism;Dockerfile 本就无 RUN
+  步骤,基础镜像不含 ca-certificates 的现状与换基前后一致(TLS 信任走
+  rustls 内建根/自签 pin,不读系统证书库)。
+- 收益:镜像体积约 75MB → 10MB 级(base 层),拉取更快。
+- 验证:workflow_dispatch 触发 docker job 构建成功,ci-<sha> 镜像层内出现
+  /etc/alpine-release,二进制与 entrypoint 权限 -rwxr-xr-x 不变。
