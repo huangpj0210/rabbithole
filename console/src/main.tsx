@@ -1,6 +1,7 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
+import { App } from '@/App';
 import './index.css';
 
 const container = document.getElementById('root');
@@ -10,8 +11,9 @@ if (!container) {
 
 createRoot(container).render(
   <StrictMode>
-    <div className="p-6 text-sm text-muted-foreground">脚手架就位,待接入应用外壳。</div>
+    <App />
   </StrictMode>,
 );
 
+// 首屏占位移除(见 index.html 的 #rh-boot)
 document.getElementById('rh-boot')?.remove();
