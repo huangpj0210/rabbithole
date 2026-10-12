@@ -1,5 +1,5 @@
 import { InfoCircleOutlined } from '@ant-design/icons';
-import { Tooltip, Typography } from 'antd';
+import { theme, Tooltip, Typography } from 'antd';
 import React from 'react';
 
 /**
@@ -108,14 +108,18 @@ export const Mono: React.FC<{ children: React.ReactNode; style?: React.CSSProper
 export const InfoLabel: React.FC<{ info: React.ReactNode; title: React.ReactNode }> = ({
   title,
   info,
-}) => (
-  <span>
-    {title}
-    <Tooltip title={info} trigger={['hover', 'click']}>
-      <InfoCircleOutlined
-        aria-label={typeof title === 'string' ? `${title} 说明` : '说明'}
-        style={{ color: 'rgba(0,0,0,0.45)', cursor: 'help', marginInlineStart: 4 }}
-      />
-    </Tooltip>
-  </span>
-);
+}) => {
+  // 图标颜色走 token:暗色主题下固定黑色透明度会不可读
+  const { token } = theme.useToken();
+  return (
+    <span>
+      {title}
+      <Tooltip title={info} trigger={['hover', 'click']}>
+        <InfoCircleOutlined
+          aria-label={typeof title === 'string' ? `${title} 说明` : '说明'}
+          style={{ color: token.colorTextTertiary, cursor: 'help', marginInlineStart: 4 }}
+        />
+      </Tooltip>
+    </span>
+  );
+};

@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { history } from '@umijs/max';
 import { PageContainer } from '@ant-design/pro-components';
 import { InfoLabel } from '@/components/ui';
-import { Alert, App, Button, Card, Checkbox, Form, Input, InputNumber, Select, Typography } from 'antd';
+import { Alert, App, Button, Card, Checkbox, Form, Input, InputNumber, Select, theme, Typography } from 'antd';
 import React from 'react';
 
 interface PasswordForm {
@@ -24,6 +24,9 @@ interface PortsForm {
   allow_ports: string;
   max_services_per_client: number | null;
 }
+
+/** 同页三张卡统一最大宽度(设置页评审 P1:此前「服务器配置」独占 992px 与窄卡混排)。 */
+const CARD_MAX_WIDTH = 560;
 
 /** 服务器配置(热生效子集):SSH 网关 / 端口策略 / 日志级别 / 公钥白名单。 */
 const ServerConfigCard: React.FC = () => {
@@ -90,75 +93,90 @@ const ServerConfigCard: React.FC = () => {
   }
 
   const hot = cfgQ.data?.hot;
-  const restartNote = hot ? undefined : '加载中…';
 
   return (
     <Card
       loading={cfgQ.isLoading}
-      style={{ marginTop: 16 }}
-      
+      style={{ maxWidth: CARD_MAX_WIDTH, marginTop: 16 }}
+
       styles={{ header: { borderBottom: 'none' } }}
       title={<InfoLabel info="保存后立即生效,无需重启;同时写回配置文件(原文件备份为 .bak,注释会丢失)" title="服务器配置" />}
     >
-      <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-        {restartNote ??
-          '以下配置保存后立即生效并写回配置文件(原文件备份为 *.toml.bak,注释会丢失)。vhost 端口、主监听等其余配置仍需修改文件并重启。'}
-      </Typography.Paragraph>
-      <Form form={sshForm} labelCol={{ span: 6 }} layout="horizontal" wrapperCol={{ span: 14 }}>
-        <Typography.Title level={5}>SSH Tunnel Gateway</Typography.Title>
-        <Form.Item label={<InfoLabel info="开启后可用 ssh -R 在服务端开临时转发端口,凭据与客户端一致" title="启用" />} name="enabled" valuePropName="checked">
-          <Checkbox>开启 ssh -R 隧道入口</Checkbox>
-        </Form.Item>
-        <Form.Item label={<InfoLabel info="SSH 网关绑定地址,留空 = 0.0.0.0" title="监听地址" />} name="bind_addr">
-          <Input placeholder="0.0.0.0" />
-        </Form.Item>
-        <Form.Item label={<InfoLabel info="SSH 网关端口" title="监听端口" />} name="bind_port">
-          <InputNumber max={65535} min={1} precision={0} />
-        </Form.Item>
-        <Form.Item label={<InfoLabel info="每行一个公钥,用户名须为已启用客户端 ID;密码认证(客户端密钥)始终可用" title="公钥白名单" />}>
-          <Input.TextArea
-            onChange={(e) => setKeys(e.target.value)}
-            placeholder={'ssh-ed25519 AAAA... client-id\nssh-ed25519 AAAA... edge-2'}
-            rows={4}
-            value={keys}
-          />
-        </Form.Item>
-      </Form>
-      <Form form={portsForm} labelCol={{ span: 6 }} layout="horizontal" wrapperCol={{ span: 14 }}>
-        <Typography.Title level={5}>端口策略</Typography.Title>
-        <Form.Item label={<InfoLabel info="逗号分隔,支持范围如 10000-20000,30000;空 = 不限制" title="允许端口" />}>
-          <Input placeholder="10000-40000" />
-        </Form.Item>
-        <Form.Item label={<InfoLabel info="全局默认上限;单个客户端可在「客户端」页覆盖,0 = 不限" title="每客户端最大规则数" />}>
-          <InputNumber max={10000} min={0} precision={0} />
-        </Form.Item>
-        <Typography.Title level={5}>日志</Typography.Title>
-        <Form.Item label={<InfoLabel info="服务端日志级别,保存立即生效" title="级别" />}>
-          <Select
-            onChange={(v) => setLogLevel(v)}
-            options={['trace', 'debug', 'info', 'warn', 'error'].map((v) => ({ label: v, value: v }))}
-            style={{ width: 160 }}
-            value={logLevel}
-          />
-        </Form.Item>
-      </Form>
-      <Button
-        htmlType="button"
-        loading={saveMut.isPending}
-        onClick={saveAll}
-        style={{ marginTop: 8 }}
-        type="primary"
-      >
-        保存配置
-      </Button>
-      {saveMut.data && !saveMut.data.persisted && (
+      {cfgQ.isError ? (
+        // 加载失败不渲染表单:空表单点「保存配置」会把端口策略清空(P0 同源风险)
         <Alert
-          description={saveMut.data.error}
-          message="写回配置文件失败(运行时已生效,重启后会回退)"
+          action={
+            <Button loading={cfgQ.isFetching} onClick={() => cfgQ.refetch()} size="small">
+              重试
+            </Button>
+          }
+          description={cfgQ.error?.message ?? '未知错误'}
+          message="加载服务器配置失败"
           showIcon
-          style={{ marginTop: 12 }}
-          type="warning"
+          type="error"
         />
+      ) : (
+        <>
+          <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+            以下配置保存后立即生效并写回配置文件(原文件备份为 *.toml.bak,注释会丢失)。vhost 端口、主监听等其余配置仍需修改文件并重启。
+          </Typography.Paragraph>
+          <Form form={sshForm} labelCol={{ span: 6 }} layout="horizontal" wrapperCol={{ span: 14 }}>
+            <Typography.Title level={5}>SSH Tunnel Gateway</Typography.Title>
+            <Form.Item label={<InfoLabel info="开启后可用 ssh -R 在服务端开临时转发端口,凭据与客户端一致" title="启用" />} name="enabled" valuePropName="checked">
+              <Checkbox>开启 ssh -R 隧道入口</Checkbox>
+            </Form.Item>
+            <Form.Item label={<InfoLabel info="SSH 网关绑定地址,留空 = 0.0.0.0" title="监听地址" />} name="bind_addr">
+              <Input placeholder="0.0.0.0" />
+            </Form.Item>
+            <Form.Item label={<InfoLabel info="SSH 网关端口" title="监听端口" />} name="bind_port">
+              <InputNumber max={65535} min={1} precision={0} />
+            </Form.Item>
+            <Form.Item label={<InfoLabel info="每行一个公钥,用户名须为已启用客户端 ID;密码认证(客户端密钥)始终可用" title="公钥白名单" />}>
+              <Input.TextArea
+                onChange={(e) => setKeys(e.target.value)}
+                placeholder={'ssh-ed25519 AAAA... client-id\nssh-ed25519 AAAA... edge-2'}
+                rows={4}
+                value={keys}
+              />
+            </Form.Item>
+          </Form>
+          <Form form={portsForm} labelCol={{ span: 6 }} layout="horizontal" wrapperCol={{ span: 14 }}>
+            <Typography.Title level={5}>端口策略</Typography.Title>
+            <Form.Item label={<InfoLabel info="逗号分隔,支持范围如 10000-20000,30000;空 = 不限制" title="允许端口" />} name="allow_ports">
+              <Input placeholder="10000-40000" />
+            </Form.Item>
+            <Form.Item label={<InfoLabel info="全局默认上限;单个客户端可在「客户端」页覆盖,0 = 不限" title="每客户端最大规则数" />} name="max_services_per_client">
+              <InputNumber max={10000} min={0} precision={0} />
+            </Form.Item>
+            <Typography.Title level={5}>日志</Typography.Title>
+            <Form.Item label={<InfoLabel info="服务端日志级别,保存立即生效" title="级别" />}>
+              <Select
+                onChange={(v) => setLogLevel(v)}
+                options={['trace', 'debug', 'info', 'warn', 'error'].map((v) => ({ label: v, value: v }))}
+                style={{ width: 160 }}
+                value={logLevel}
+              />
+            </Form.Item>
+          </Form>
+          <Button
+            htmlType="button"
+            loading={saveMut.isPending}
+            onClick={saveAll}
+            style={{ marginTop: 8 }}
+            type="primary"
+          >
+            保存配置
+          </Button>
+          {saveMut.data && !saveMut.data.persisted && (
+            <Alert
+              description={saveMut.data.error}
+              message="写回配置文件失败(运行时已生效,重启后会回退)"
+              showIcon
+              style={{ marginTop: 12 }}
+              type="warning"
+            />
+          )}
+        </>
       )}
     </Card>
   );
@@ -168,6 +186,7 @@ const ServerConfigCard: React.FC = () => {
 const SettingsPage: React.FC = () => {
   const [form] = Form.useForm<PasswordForm>();
   const { message } = App.useApp();
+  const { token } = theme.useToken();
 
   const changeMut = useMutation({
     mutationFn: (v: PasswordForm) => changePassword(v.oldPassword, v.newPassword),
@@ -183,7 +202,13 @@ const SettingsPage: React.FC = () => {
 
   return (
     <PageContainer subTitle="修改密码与部署信息" title="设置">
-      <Card style={{ maxWidth: 560 }} title="修改密码">
+      <Card style={{ maxWidth: CARD_MAX_WIDTH }} title="修改密码">
+        <Alert
+          message="修改成功后所有会话将立即失效,需重新登录"
+          showIcon
+          style={{ marginBottom: 16 }}
+          type="warning"
+        />
         <Form
           form={form}
           labelCol={{ span: 6 }}
@@ -230,14 +255,14 @@ const SettingsPage: React.FC = () => {
         </Form>
       </Card>
 
-      <Card style={{ maxWidth: 560, marginTop: 16 }} title="监控指标">
+      <Card style={{ maxWidth: CARD_MAX_WIDTH, marginTop: 16 }} title="监控指标">
         <Typography.Paragraph>
           Prometheus 抓取地址:
           <Typography.Text aria-label="复制 Prometheus 地址" className="rh-mono" copyable={{ tooltips: ['复制', '已复制'] }}>
             {metricsUrl}
           </Typography.Text>
         </Typography.Paragraph>
-        <ol style={{ paddingLeft: 20, color: 'rgba(0,0,0,0.55)', fontSize: 13, lineHeight: 2 }}>
+        <ol style={{ paddingLeft: 20, color: token.colorTextTertiary, fontSize: 13, lineHeight: 2 }}>
           <li>服务端配置 <span className="rh-mono">enable_prometheus = true</span> 并重启;</li>
           <li>Prometheus 抓取任务携带与管理台相同的 Bearer 令牌;</li>
           <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
