@@ -234,19 +234,6 @@ const ProxyListPage: React.FC<{
           },
         ]
       : []),
-    ...(isSecret
-      ? [
-          {
-            title: <InfoLabel info="逗号分隔客户端名,空 = 任意;凭据由服务端托管" title="允许访问方" />,
-            key: 'allow_users',
-            width: 120,
-            render: (_: unknown, row: ServiceRow) =>
-              row.spec?.[row.kind]?.allow_users?.length
-                ? (row.spec[row.kind].allow_users as string[]).join(',')
-                : '任意',
-          },
-        ]
-      : []),
     {
       title: <InfoLabel info="running=监听中;offline=承载客户端离线;pending=等待发布;bind/apply_error=发布失败;未启用=仅保存" title="状态" />,
       dataIndex: 'status',

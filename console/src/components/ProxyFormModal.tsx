@@ -44,7 +44,6 @@ interface FormValues {
   target_port: number | null;
   custom_domains: string;
   subdomain: string;
-  allow_users: string;
   use_compression: boolean;
   pool_size: number | null;
   bandwidth_limit: string;
@@ -139,7 +138,6 @@ function initialValuesOf(
       target_port: 80,
       custom_domains: '',
       subdomain: '',
-      allow_users: '',
       use_compression: false,
       pool_size: 0,
       bandwidth_limit: '',
@@ -198,7 +196,6 @@ function initialValuesOf(
     target_port: editing.target_port,
     custom_domains: csv(section?.custom_domains),
     subdomain: section?.subdomain ?? '',
-    allow_users: csv(section?.allow_users),
     use_compression: !!s.transport?.use_compression,
     pool_size: s.pool_size ?? 0,
     bandwidth_limit: s.transport?.bandwidth_limit ?? '',
@@ -264,7 +261,6 @@ const ProxyFormModal: React.FC<{
   const multiKind = kinds.length > 1;
   const usesBind = kind === 'tcp' || kind === 'udp';
   const usesDomain = kind === 'http' || kind === 'https' || kind === 'tcpmux';
-  const usesSecret = kind === 'stcp' || kind === 'sudp' || kind === 'xtcp';
   const supportsGroup = usesBind || kind === 'http' || kind === 'https';
   const supportsHc = supportsGroup;
   const pluginOn = pluginKind !== 'none';
@@ -428,11 +424,9 @@ const ProxyFormModal: React.FC<{
         } else if (k === 'tcpmux') {
           spec.tcpmux = { ...(spec.tcpmux ?? {}), custom_domains: domains.list };
         } else {
-          spec[k] = {
-            ...(spec[k] ?? {}),
-            // secret_key 服务端管理:创建时生成、编辑时保留原值,表单不触碰
-            allow_users: (v.allow_users ?? '').split(',').map((x) => x.trim()).filter(Boolean),
-          };
+          // secret_key 服务端管理:创建时生成、编辑时保留原值,表单不触碰;
+          // 访问授权由访问器记录本身保证,规则侧无白名单字段
+          spec[k] = spec[k] ?? {};
         }
       } else {
         delete spec[k];
@@ -691,11 +685,6 @@ const ProxyFormModal: React.FC<{
               </Form.Item>
             )}
           </>
-        )}
-        {usesSecret && (
-          <Form.Item label={<InfoLabel info="逗号分隔客户端名,空 = 任意客户端的访问器可中继;中继凭据由服务端自动生成托管,列表中可轮换" title="允许访问方" />} name="allow_users">
-            <Input placeholder="visitor-a,visitor-b" />
-          </Form.Item>
         )}
         <Divider plain style={{ margin: '4px 0 16px' }} titlePlacement="left">
           行为

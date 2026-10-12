@@ -28,7 +28,7 @@
 | F8 | 接入引导(客户端配置片段)、总览图表、分规则连接数 | 体验缺失 | 复制启动命令、仪表盘图表 |
 | F9 | 前端基座重写(React + Ant Design v6,新顶层 console/ 工程) | 基座替换(自驱需求) | —(超出 nps 对标;承接 F6/F7/F8 的前端交付) |
 
-**不在本档范围**(后端已实现且与本档正交):stcp/sudp/xtcp 的 `allow_users`、`route_by_http_user`、批量 API、Prometheus 端点——它们的缺口同属 F7 表单暴露,随 F7 一并落地。
+**不在本档范围**(后端已实现且与本档正交):`route_by_http_user`、批量 API、Prometheus 端点——它们的缺口同属 F7 表单暴露,随 F7 一并落地。(原列于此的 `allow_users` 已整体移除:访问授权以管理员配置的访问器记录为准——记录绑定客户端与目标规则且客户端无上行注册通道——规则侧客户端白名单冗余且易自堵。)
 
 ---
 
@@ -321,7 +321,7 @@ CREATE TABLE certs (
 | route_by_http_user | — | — | ✅ | — | — | — | |
 | not_found_html | — | — | ✅(§5) | — | — | — | |
 | cache(§6) | — | — | ✅ | — | — | — | 子表单四项 |
-| secret_key / allow_users | — | — | — | — | ✅(key 现有) | — | allow_users 多值 |
+| secret_key | — | — | — | — | ✅(key 现有) | — | allow_users 已移除(授权由访问器记录承担) |
 | plugin(9 种) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 见 §8.2;启用后 target 区按插件替换 |
 
 ### 8.2 插件子表单

@@ -41,7 +41,7 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
         warn!(visitor = vspec.name, "target proxy not found/enabled");
         return;
     };
-    if !secret_and_allow_ok(state, sess, &pspec, &vspec).await {
+    if !secret_ok(&pspec, &vspec) {
         return;
     }
     let Some(target_sess) = state.sessions.get(&v_target_client) else {
@@ -92,12 +92,9 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
     .await;
 }
 
-async fn secret_and_allow_ok(
-    state: &Arc<AppState>,
-    sess: &Arc<Session>,
-    pspec: &ProxySpec,
-    vspec: &rh_protocol::VisitorSpec,
-) -> bool {
+/// 密钥校验。访问授权由访问器记录本身保证(仅管理员可建,记录绑定客户端与
+/// 目标规则,协议无客户端上行注册通道),不再比对规则侧客户端白名单。
+fn secret_ok(pspec: &ProxySpec, vspec: &rh_protocol::VisitorSpec) -> bool {
     let Some(secret_cfg) = pspec.secret_cfg() else {
         return false;
     };
@@ -110,20 +107,6 @@ async fn secret_and_allow_ok(
     {
         warn!(visitor = vspec.name, "visitor secret mismatch");
         return false;
-    }
-    if !secret_cfg.allow_users.is_empty() {
-        let my_name = state
-            .db
-            .get_client(&sess.client_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|c| c.name)
-            .unwrap_or_default();
-        if !secret_cfg.allow_users.contains(&my_name) {
-            warn!(visitor = vspec.name, "visitor client not allowed");
-            return false;
-        }
     }
     true
 }

@@ -833,3 +833,17 @@ typecheck/build exit 0;e2e 主套 69→71,全量 151/151;浏览器走查创建�
 - 验证:fmt/clippy/test、typecheck 全绿;实测——占用端口保存报 500 且
   旧监听恢复(200)、非法 IP 报 1002、热改端口即时切换(旧关新开)、
   UI 改端口保存后端联动 + toml 写回 + 页面地址更新。
+
+## R32(2026-10-12)移除密钥规则 allow_users 白名单(用户拍板"访问器都配置了,可以自动 allow")
+
+- 依据:访问器仅管理员可建(DB 表 + 管理 API 单一入口),协议 ClientMessage
+  无客户端上行注册通道,同步单向(服务端 DB → 客户端);访问器记录本身绑定
+  「哪个客户端跑、中继到哪个客户端的哪条规则」——建访问器即授权,规则侧
+  allow_users 是第二份事实源,零安全增益,只会自堵(建了访问器忘加白名单即拒)。
+- 删除范围:SecretProxyConfig.allow_users 字段(serde 不开 deny_unknown_fields,
+  存量 DB JSON 中的旧键反序列化时安全忽略)、visitor.rs 白名单校验块
+  (secret_and_allow_ok → secret_ok,改同步函数)、控制台表单项/初始值/回填/
+  payload/列表列/死变量 usesSecret;design-parity.md 两处提及改为"已移除"并注明理由。
+- 验证:fmt/clippy/test(12 通过)、typecheck 全绿;浏览器实测——新建规则弹窗
+  无该字段、规则列表无该列、无 allow_users 的 payload 创建 STCP 规则成功、
+  「创建访问器」seed 带出目标并成功落库。secret_key 比对(显式双写兼容)保留。

@@ -320,11 +320,10 @@ pub struct HttpsProxyConfig {
 pub struct SecretProxyConfig {
     /// 访问密钥(密钥访问的唯一事实源,访问器留空即继承此值);
     /// 空 = 不校验密钥,任何访问器都可中继(控制台会警示)。
+    /// 访问授权由访问器记录本身保证(仅管理员可建,记录绑定客户端与目标规则,
+    /// 客户端无上行注册通道),不设规则侧客户端白名单。
     #[serde(default)]
     pub secret_key: String,
-    /// 允许持有 visitor 的客户端名列表;空 = 任意。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow_users: Vec<String>,
 }
 
 pub type StcpProxyConfig = SecretProxyConfig;
