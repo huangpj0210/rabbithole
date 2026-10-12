@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { history, useLocation } from '@umijs/max';
 import { PageContainer } from '@ant-design/pro-components';
 import { InfoLabel } from '@/components/ui';
-import { Alert, App, Button, Card, Checkbox, Form, Input, InputNumber, Select, Tabs, theme, Typography } from 'antd';
+import { Alert, App, Button, Card, Checkbox, Form, Input, InputNumber, Select, Switch, Tabs, theme, Typography } from 'antd';
 import React from 'react';
 
 interface PasswordForm {
@@ -244,23 +244,76 @@ const PasswordCard: React.FC = () => {
   );
 };
 
-/** 监控指标:Prometheus 抓取地址与接入前提。 */
+/** 监控指标:Prometheus 开关(热生效,写回配置文件)与抓取地址。 */
 const MetricsCard: React.FC = () => {
   const { token } = theme.useToken();
+  const { message } = App.useApp();
+  const queryClient = useQueryClient();
   const metricsUrl = `${window.location.origin}/metrics`;
+
+  // 与 ServerConfigCard 共用 query key:同页切 tab 不重复请求
+  const cfgQ = useQuery({
+    queryKey: ['server-config'],
+    queryFn: getServerConfig,
+  });
+  const enabled = !!cfgQ.data?.hot.metrics.enable_prometheus;
+
+  const toggleMut = useMutation({
+    mutationFn: (v: boolean) => putServerConfig({ metrics: { enable_prometheus: v } }),
+    onSuccess: (r) => {
+      if (r.persisted) {
+        message.success(r.applied.length ? `已生效:${r.applied.join(', ')}` : '配置未变更');
+      } else {
+        message.warning(`已生效但写回文件失败:${r.error ?? '未知错误'}`);
+      }
+      queryClient.invalidateQueries({ queryKey: ['server-config'] });
+    },
+  });
+
   return (
-    <Card>
-      <Typography.Paragraph>
-        Prometheus 抓取地址:
-        <Typography.Text aria-label="复制 Prometheus 地址" className="rh-mono" copyable={{ tooltips: ['复制', '已复制'] }}>
-          {metricsUrl}
-        </Typography.Text>
-      </Typography.Paragraph>
-      <ol style={{ paddingLeft: 20, color: token.colorTextTertiary, fontSize: 13, lineHeight: 2 }}>
-        <li>服务端配置 <span className="rh-mono">enable_prometheus = true</span> 并重启;</li>
-        <li>Prometheus 抓取任务携带与管理台相同的 Bearer 令牌;</li>
-        <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
-      </ol>
+    <Card loading={cfgQ.isLoading}>
+      {cfgQ.isError ? (
+        <Alert
+          action={
+            <Button loading={cfgQ.isFetching} onClick={() => cfgQ.refetch()} size="small">
+              重试
+            </Button>
+          }
+          description={cfgQ.error?.message ?? '未知错误'}
+          message="加载服务器配置失败"
+          showIcon
+          type="error"
+        />
+      ) : (
+        <>
+          <Form labelCol={{ span: 6 }} layout="horizontal" wrapperCol={{ span: 14 }}>
+            <Form.Item
+              label={
+                <InfoLabel
+                  info="开启后暴露 /metrics 抓取端点(仍需 Bearer 认证),即时生效并写回配置文件;关闭后访问返回 404"
+                  title="启用 Prometheus"
+                />
+              }
+            >
+              <Switch
+                checked={enabled}
+                loading={toggleMut.isPending || cfgQ.isFetching}
+                onChange={(v) => toggleMut.mutate(v)}
+              />
+            </Form.Item>
+          </Form>
+          <Typography.Paragraph>
+            Prometheus 抓取地址:
+            <Typography.Text aria-label="复制 Prometheus 地址" className="rh-mono" copyable={{ tooltips: ['复制', '已复制'] }}>
+              {metricsUrl}
+            </Typography.Text>
+          </Typography.Paragraph>
+          <ol style={{ paddingLeft: 20, color: token.colorTextTertiary, fontSize: 13, lineHeight: 2 }}>
+            <li>抓取任务需携带与管理台相同的 Bearer 令牌(未携带返回 401);</li>
+            <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
+          </ol>
+        </>
+      )}
     </Card>
   );
 };

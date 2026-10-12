@@ -65,10 +65,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(services)
         .merge(visitors)
         .merge(misc);
-    // Prometheus 指标端点:仅在显式开启时注册,并要求与管理 API 相同的 Bearer 认证
-    if state.cfg.metrics.enable_prometheus {
-        r = r.route("/metrics", get(prometheus_metrics));
-    }
+    // Prometheus 指标端点:路由常驻注册,是否响应由处理器按热配置判定(控制台可即时开关),
+    // 并要求与管理 API 相同的 Bearer 认证
+    r = r.route("/metrics", get(prometheus_metrics));
     r.with_state(state)
 }
 
@@ -1822,6 +1821,7 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
             "max_services_per_client": hot.max_services_per_client,
             "log_level": hot.log_level,
             "ssh_gateway": serde_json::to_value(&hot.ssh_gateway).unwrap_or(serde_json::Value::Null),
+            "metrics": { "enable_prometheus": hot.enable_prometheus },
         },
         "authorized_keys": authorized_keys,
     }))
@@ -1836,6 +1836,8 @@ struct ServerConfigUpdate {
     log: Option<LogUpdate>,
     #[serde(default)]
     ssh_gateway: Option<SshGatewayUpdate>,
+    #[serde(default)]
+    metrics: Option<MetricsUpdate>,
     /// authorized_keys 文件全文(空串 = 清空;null = 不动)。
     #[serde(default)]
     authorized_keys: Option<String>,
@@ -1860,6 +1862,12 @@ struct SshGatewayUpdate {
     enabled: Option<bool>,
     bind_port: Option<u16>,
     bind_addr: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct MetricsUpdate {
+    enable_prometheus: Option<bool>,
 }
 
 /// PUT:仅接受热生效子集;应用后回写 toml(原文件备份 .bak 一次,注释会丢失)。
@@ -1970,6 +1978,13 @@ async fn put_server_config(
                 applied.push("ssh_gateway.bind_addr".into());
             }
         }
+        // metrics:Prometheus 端点开关,/metrics 处理器按此即时判定,无需重启
+        if let Some(m) = req.metrics {
+            if let Some(v) = m.enable_prometheus {
+                hot.enable_prometheus = v;
+                applied.push("metrics.enable_prometheus".into());
+            }
+        }
         // authorized_keys:写入(或初始化默认)文件路径
         if let Some(keys) = &req.authorized_keys {
             if hot.ssh_gateway.authorized_keys_file.is_none() {
@@ -2005,6 +2020,7 @@ async fn put_server_config(
         disk.ports.max_services_per_client = hot.max_services_per_client;
         disk.log.level = hot.log_level.clone();
         disk.ssh_gateway = hot.ssh_gateway.clone();
+        disk.metrics.enable_prometheus = hot.enable_prometheus;
         disk.web.jwt_secret = state.cfg.web.jwt_secret.clone(); // 保留原值(未脱敏源)
         persist_err = match toml::to_string_pretty(&disk) {
             Ok(text) => {
@@ -2178,6 +2194,10 @@ async fn delete_cert_api(
 }
 
 async fn prometheus_metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    // 未开启时按不存在处理(404),不暴露端点存在性;开启与否读热配置,支持控制台即时开关
+    if !state.hot.read().await.enable_prometheus {
+        return (StatusCode::NOT_FOUND, "metrics disabled\n").into_response();
+    }
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }

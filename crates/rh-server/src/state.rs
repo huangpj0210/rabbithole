@@ -65,6 +65,7 @@ pub struct HotConfig {
     pub max_services_per_client: usize,
     pub log_level: String,
     pub ssh_gateway: crate::config::SshGatewayConfig,
+    pub enable_prometheus: bool,
 }
 
 impl HotConfig {
@@ -74,6 +75,7 @@ impl HotConfig {
             max_services_per_client: cfg.ports.max_services_per_client,
             log_level: cfg.log.level.clone(),
             ssh_gateway: cfg.ssh_gateway.clone(),
+            enable_prometheus: cfg.metrics.enable_prometheus,
         }
     }
 

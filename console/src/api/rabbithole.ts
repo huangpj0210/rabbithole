@@ -224,6 +224,7 @@ export interface ServerConfigView {
       bind_addr: string;
       bind_port: number;
     };
+    metrics: { enable_prometheus: boolean };
   };
   authorized_keys: null | string;
 }
@@ -232,6 +233,7 @@ export interface ServerConfigUpdate {
   ports?: { allow_ports?: string[]; max_services_per_client?: number };
   log?: { level?: string };
   ssh_gateway?: { enabled?: boolean; bind_addr?: string; bind_port?: number };
+  metrics?: { enable_prometheus?: boolean };
   authorized_keys?: string;
 }
 

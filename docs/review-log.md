@@ -785,3 +785,18 @@ typecheck/build exit 0;e2e 主套 69→71,全量 151/151;浏览器走查创建�
 - 收益:镜像体积约 75MB → 10MB 级(base 层),拉取更快。
 - 验证:workflow_dispatch 触发 docker job 构建成功,ci-<sha> 镜像层内出现
   /etc/alpine-release,二进制与 entrypoint 权限 -rwxr-xr-x 不变。
+
+## R29(2026-10-12)Prometheus 开关进设置页 + /metrics 开发代理(用户反馈)
+
+- 问题一「没有开关」:enable_prometheus 原本只在启动时决定是否注册 /metrics
+  路由,控制台只能提示用户改文件重启。现改为路由常驻、处理器按热配置判定
+  (未开启 404,不暴露端点存在性),enable_prometheus 进 HotConfig 与
+  GET/PUT /api/server/config 热子集,即时生效并写回 toml;设置页「监控指标」
+  卡新增 Switch(复用 ['server-config'] query 与 ServerConfigCard 去重,
+  失败态沿用 T2 的 Alert+重试模式)。
+- 问题二「地址访问走前端页面」:开发模式下 umi(8000)只代理 /api,
+  /metrics 打到 dev server 返回 SPA。proxy.ts 三个环境补 /metrics →
+  8080;生产本就同源(rh-server 托管控制台)不受影响。
+- 验证:cargo fmt/clippy/test、pnpm typecheck 全绿;实测——关:404;开:
+  无令牌 401/带令牌 200 指标文本;UI 点开关双向翻转后端热配置并写回
+  server.toml;8000 端口经代理访问 /metrics 行为与 8080 一致。
