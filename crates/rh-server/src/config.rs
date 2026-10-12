@@ -169,7 +169,7 @@ impl Default for NatholeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     pub enable_prometheus: bool,

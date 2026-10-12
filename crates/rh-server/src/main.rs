@@ -252,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
     state.rebuild_certs().await;
     // Prometheus 指标独立监听(热开关;启动绑定失败仅告警,不阻断主服务)
     if cfg.metrics.enable_prometheus {
-        if let Err(e) = state.metrics_listen_start().await {
+        if let Err(e) = state.metrics_listen_start(&cfg.metrics).await {
             warn!(error = %e, "prometheus metrics listener failed to start");
         }
     }

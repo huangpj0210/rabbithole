@@ -67,7 +67,8 @@ pub struct HotConfig {
     pub max_services_per_client: usize,
     pub log_level: String,
     pub ssh_gateway: crate::config::SshGatewayConfig,
-    pub enable_prometheus: bool,
+    /// Prometheus 指标端点(独立监听;地址/端口均可热改,保存时热重启监听器)。
+    pub metrics: crate::config::MetricsConfig,
 }
 
 impl HotConfig {
@@ -77,7 +78,7 @@ impl HotConfig {
             max_services_per_client: cfg.ports.max_services_per_client,
             log_level: cfg.log.level.clone(),
             ssh_gateway: cfg.ssh_gateway.clone(),
-            enable_prometheus: cfg.metrics.enable_prometheus,
+            metrics: cfg.metrics.clone(),
         }
     }
 
@@ -302,13 +303,17 @@ impl AppState {
         }
     }
 
-    /// 启动 Prometheus 独立监听(热开关;幂等)。绑定失败返回错误,由调用方决定是否落配置。
-    pub async fn metrics_listen_start(self: &Arc<Self>) -> anyhow::Result<()> {
+    /// 启动 Prometheus 独立监听(幂等)。地址由调用方传入(热更新时取自 HotConfig,
+    /// 启动时取自启动配置),本方法不读 hot——避免与持有 hot 写锁的调用方互锁。
+    /// 绑定失败返回错误,由调用方决定是否落配置。
+    pub async fn metrics_listen_start(
+        self: &Arc<Self>,
+        m: &crate::config::MetricsConfig,
+    ) -> anyhow::Result<()> {
         let mut guard = self.metrics_task.lock().await;
         if guard.is_some() {
             return Ok(());
         }
-        let m = &self.cfg.metrics;
         let addr: SocketAddr = format!("{}:{}", m.bind_addr, m.port)
             .parse()
             .map_err(|e| anyhow::anyhow!("metrics bind_addr/port 非法:{e}"))?;
@@ -330,12 +335,19 @@ impl AppState {
         Ok(())
     }
 
-    /// 停止 Prometheus 独立监听(热开关;幂等)。
+    /// 停止 Prometheus 独立监听(幂等)。abort 后等待任务真正退出,
+    /// 确保监听 fd 已释放再返回(否则立即按新/旧地址重绑会 Address already in use)。
     pub async fn metrics_listen_stop(&self) {
         if let Some(t) = self.metrics_task.lock().await.take() {
             t.abort();
+            let _ = t.await;
             tracing::info!("prometheus metrics down");
         }
+    }
+
+    /// Prometheus 独立监听是否在运行。
+    pub async fn metrics_listening(&self) -> bool {
+        self.metrics_task.lock().await.is_some()
     }
 
     /// 认证窗口进入:超过每 IP 上限返回 false。

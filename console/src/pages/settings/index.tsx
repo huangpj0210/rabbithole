@@ -244,7 +244,7 @@ const PasswordCard: React.FC = () => {
   );
 };
 
-/** 监控指标:Prometheus 开关(热启停独立监听,写回配置文件)与抓取地址。 */
+/** 监控指标:Prometheus 开关(热启停)与监听地址/端口(保存热重启),均写回配置文件。 */
 const MetricsCard: React.FC = () => {
   const { token } = theme.useToken();
   const { message } = App.useApp();
@@ -257,6 +257,16 @@ const MetricsCard: React.FC = () => {
   });
   const metrics = cfgQ.data?.hot.metrics;
   const enabled = !!metrics?.enable_prometheus;
+  const [addr, setAddr] = React.useState('');
+  const [port, setPort] = React.useState<number | null>(null);
+  React.useEffect(() => {
+    if (!metrics) return;
+    setAddr(metrics.bind_addr);
+    setPort(metrics.port);
+    // 仅在服务端值变化时回填,避免打字过程中被刷新覆盖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [metrics?.bind_addr, metrics?.port]);
+
   // 抓取地址:独立端口。绑定 0.0.0.0 时展示当前主机名(实际可达地址),其余原样
   const bindHost =
     metrics && (metrics.bind_addr === '0.0.0.0' || metrics.bind_addr === '::')
@@ -264,16 +274,26 @@ const MetricsCard: React.FC = () => {
       : (metrics?.bind_addr ?? '');
   const metricsUrl = metrics ? `http://${bindHost}:${metrics.port}/metrics` : '';
 
+  // 统一的保存反馈:成功提示生效项,写回失败提示但运行时已生效
+  function onSaved(r: { applied: string[]; error?: string; persisted: boolean }) {
+    if (r.persisted) {
+      message.success(r.applied.length ? `已生效:${r.applied.join(', ')}` : '配置未变更');
+    } else {
+      message.warning(`已生效但写回文件失败:${r.error ?? '未知错误'}`);
+    }
+    queryClient.invalidateQueries({ queryKey: ['server-config'] });
+  }
+
   const toggleMut = useMutation({
     mutationFn: (v: boolean) => putServerConfig({ metrics: { enable_prometheus: v } }),
-    onSuccess: (r) => {
-      if (r.persisted) {
-        message.success(r.applied.length ? `已生效:${r.applied.join(', ')}` : '配置未变更');
-      } else {
-        message.warning(`已生效但写回文件失败:${r.error ?? '未知错误'}`);
-      }
-      queryClient.invalidateQueries({ queryKey: ['server-config'] });
-    },
+    onSuccess: onSaved,
+  });
+  const addrMut = useMutation({
+    mutationFn: () =>
+      putServerConfig({
+        metrics: { bind_addr: addr.trim(), ...(port != null ? { port } : {}) },
+      }),
+    onSuccess: onSaved,
   });
 
   return (
@@ -307,8 +327,46 @@ const MetricsCard: React.FC = () => {
                 onChange={(v) => toggleMut.mutate(v)}
               />
             </Form.Item>
+            <Form.Item
+              label={
+                <InfoLabel
+                  info="监听网卡地址:127.0.0.1 仅本机抓取;0.0.0.0 对外暴露(端口无鉴权,注意防火墙)。保存即热重启监听器,绑定失败自动回滚"
+                  title="监听地址"
+                />
+              }
+            >
+              <Input
+                placeholder="127.0.0.1"
+                style={{ width: 200 }}
+                value={addr}
+                onChange={(e) => setAddr(e.target.value)}
+              />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="独立监听端口,不与管理面共口" title="监听端口" />}
+            >
+              <InputNumber
+                max={65535}
+                min={1}
+                precision={0}
+                style={{ width: 120 }}
+                value={port}
+                onChange={(v) => setPort(v)}
+              />
+            </Form.Item>
+            <Form.Item style={{ marginBottom: 0 }} wrapperCol={{ offset: 6 }}>
+              <Button
+                disabled={!metrics || (addr.trim() === metrics.bind_addr && port === metrics.port)}
+                htmlType="button"
+                loading={addrMut.isPending}
+                onClick={() => addrMut.mutate()}
+                type="primary"
+              >
+                保存监听配置
+              </Button>
+            </Form.Item>
           </Form>
-          <Typography.Paragraph>
+          <Typography.Paragraph style={{ marginTop: 16 }}>
             Prometheus 抓取地址:
             <Typography.Text aria-label="复制 Prometheus 地址" className="rh-mono" copyable={{ tooltips: ['复制', '已复制'] }}>
               {metricsUrl}
@@ -316,7 +374,7 @@ const MetricsCard: React.FC = () => {
           </Typography.Paragraph>
           <ol style={{ paddingLeft: 20, color: token.colorTextTertiary, fontSize: 13, lineHeight: 2 }}>
             <li>默认仅监听 127.0.0.1:Prometheus 与服务端同机部署,或经内网 / SSH 隧道抓取;</li>
-            <li>远程直抓需将配置文件中 metrics.bind_addr 改为 0.0.0.0 并重启(端口无鉴权,注意防火墙);</li>
+            <li>远程直抓把上方监听地址改为 0.0.0.0 保存即可(端口无鉴权,注意防火墙);</li>
             <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
           </ol>
         </>

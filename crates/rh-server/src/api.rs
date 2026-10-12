@@ -1817,11 +1817,7 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
             "max_services_per_client": hot.max_services_per_client,
             "log_level": hot.log_level,
             "ssh_gateway": serde_json::to_value(&hot.ssh_gateway).unwrap_or(serde_json::Value::Null),
-            "metrics": {
-                "enable_prometheus": hot.enable_prometheus,
-                "bind_addr": state.cfg.metrics.bind_addr,
-                "port": state.cfg.metrics.port,
-            },
+            "metrics": serde_json::to_value(&hot.metrics).unwrap_or(serde_json::Value::Null),
         },
         "authorized_keys": authorized_keys,
     }))
@@ -1868,6 +1864,8 @@ struct SshGatewayUpdate {
 #[serde(deny_unknown_fields)]
 struct MetricsUpdate {
     enable_prometheus: Option<bool>,
+    bind_addr: Option<String>,
+    port: Option<u16>,
 }
 
 /// PUT:仅接受热生效子集;应用后回写 toml(原文件备份 .bak 一次,注释会丢失)。
@@ -1911,6 +1909,19 @@ async fn put_server_config(
             if p == 0 {
                 return err(1002, "bind_port 不能为 0");
             }
+        }
+    }
+    if let Some(m) = &req.metrics {
+        if let Some(a) = &m.bind_addr {
+            if a.trim().parse::<std::net::IpAddr>().is_err() {
+                return err(
+                    1002,
+                    "metrics.bind_addr 须为合法 IP(如 127.0.0.1 / 0.0.0.0)",
+                );
+            }
+        }
+        if m.port == Some(0) {
+            return err(1002, "metrics.port 须为 1-65535");
         }
     }
     if let Some(keys) = &req.authorized_keys {
@@ -1978,20 +1989,46 @@ async fn put_server_config(
                 applied.push("ssh_gateway.bind_addr".into());
             }
         }
-        // metrics:Prometheus 独立监听热启停;启动(绑定)失败直接报错,不落配置
+        // metrics:独立监听热启停;地址/端口变更热重启监听器,绑定失败回滚不落配置
         if let Some(m) = req.metrics {
+            let old = hot.metrics.clone();
+            let mut new = old.clone();
             if let Some(v) = m.enable_prometheus {
-                if v != hot.enable_prometheus {
-                    if v {
-                        if let Err(e) = state.metrics_listen_start().await {
-                            return err(500, &format!("Prometheus 监听启动失败:{e}"));
+                new.enable_prometheus = v;
+            }
+            if let Some(v) = m.bind_addr.as_deref() {
+                new.bind_addr = v.trim().to_string();
+            }
+            if let Some(v) = m.port {
+                new.port = v;
+            }
+            if new != old {
+                let was_running = state.metrics_listening().await;
+                if was_running {
+                    state.metrics_listen_stop().await;
+                }
+                hot.metrics = new.clone();
+                if new.enable_prometheus {
+                    if let Err(e) = state.metrics_listen_start(&new).await {
+                        // 回滚:恢复旧值;旧监听原本在跑则尽力按旧地址拉回
+                        hot.metrics = old.clone();
+                        if was_running {
+                            if let Err(e2) = state.metrics_listen_start(&old).await {
+                                tracing::error!(error = %e2, "prometheus 回滚重启失败,当前无监听");
+                            }
                         }
-                    } else {
-                        state.metrics_listen_stop().await;
+                        return err(500, &format!("Prometheus 监听启动失败:{e}"));
                     }
                 }
-                hot.enable_prometheus = v;
-                applied.push("metrics.enable_prometheus".into());
+                if new.enable_prometheus != old.enable_prometheus {
+                    applied.push("metrics.enable_prometheus".into());
+                }
+                if new.bind_addr != old.bind_addr {
+                    applied.push("metrics.bind_addr".into());
+                }
+                if new.port != old.port {
+                    applied.push("metrics.port".into());
+                }
             }
         }
         // authorized_keys:写入(或初始化默认)文件路径
@@ -2029,7 +2066,7 @@ async fn put_server_config(
         disk.ports.max_services_per_client = hot.max_services_per_client;
         disk.log.level = hot.log_level.clone();
         disk.ssh_gateway = hot.ssh_gateway.clone();
-        disk.metrics.enable_prometheus = hot.enable_prometheus;
+        disk.metrics = hot.metrics.clone();
         disk.web.jwt_secret = state.cfg.web.jwt_secret.clone(); // 保留原值(未脱敏源)
         persist_err = match toml::to_string_pretty(&disk) {
             Ok(text) => {

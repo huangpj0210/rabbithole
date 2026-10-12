@@ -817,3 +817,19 @@ typecheck/build exit 0;e2e 主套 69→71,全量 151/151;浏览器走查创建�
   本地 dist 缺失导致 embed_ui 关闭,CI 先建 dist 不受影响);实测——开关热启停
   9100(200/拒连)、8080/metrics 404、端口占用时 PUT 报 500 且热配置不落、
   UI 双向翻转 + 写回 toml。
+
+## R31(2026-10-12)Prometheus 监听地址/端口进设置页,热重启生效(用户反馈"配置监听地址的地方呢")
+
+- R30 遗留:bind_addr/port 只能改配置文件重启,界面无入口。现整个
+  MetricsConfig 进 HotConfig(含 PartialEq),PUT /api/server/config 的
+  metrics 子集扩展为 enable_prometheus/bind_addr/port;地址/端口变更时
+  热重启监听器,绑定失败回滚旧值并按旧地址恢复监听(不再静默吞错)。
+- 修复实测发现的竞态:metrics_listen_stop 原 abort 后立即返回,旧任务 fd
+  未释放就重绑同端口必失败(Address already in use)——补 await 等任务
+  真正退出;metrics_listen_start 改为地址由调用方传入,避免与持有 hot
+  写锁的调用方互锁。
+- 控制台「监控指标」卡新增监听地址/端口表单 + 保存按钮(无改动时禁用),
+  保存后抓取地址文本同步;校验:bind_addr 须为合法 IP、port 1-65535。
+- 验证:fmt/clippy/test、typecheck 全绿;实测——占用端口保存报 500 且
+  旧监听恢复(200)、非法 IP 报 1002、热改端口即时切换(旧关新开)、
+  UI 改端口保存后端联动 + toml 写回 + 页面地址更新。
