@@ -25,5 +25,11 @@ default_pool_size = 2
 [ssh_gateway]
 enabled = false
 
+[metrics]
+# Prometheus 独立端口(无鉴权,默认仅本机可达)
+enable_prometheus = false
+bind_addr = "127.0.0.1"
+port = 9100
+
 [log]
 level = "info"

@@ -50,8 +50,10 @@ udp_packet_size = 65536
 # stun_server = ""             # XTCP 打洞;空 = 本机地址候选
 
 [metrics]
-# /metrics 端点(默认关闭;开启后需与管理 API 相同的 Bearer 认证)
+# Prometheus 抓取端点(独立端口,不与管理面共口,无鉴权——靠监听地址控制暴露面)
 enable_prometheus = false
+bind_addr = "127.0.0.1"        # 默认仅本机抓取;远程直抓改 0.0.0.0(注意防火墙)
+port = 9100
 
 [log]
 level = "info"

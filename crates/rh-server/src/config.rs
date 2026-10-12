@@ -169,10 +169,24 @@ impl Default for NatholeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     pub enable_prometheus: bool,
+    /// 独立监听地址:默认仅本机抓取;改 0.0.0.0 对外暴露(端口无鉴权,靠网络边界保护)。
+    pub bind_addr: String,
+    /// 独立监听端口(不与管理面共口,变更需重启)。
+    pub port: u16,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enable_prometheus: false,
+            bind_addr: "127.0.0.1".into(),
+            port: 9100,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

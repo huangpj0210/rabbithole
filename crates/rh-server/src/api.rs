@@ -60,15 +60,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/certs/{id}",
             put(update_cert_api).delete(delete_cert_api),
         );
-    let mut r = auth
-        .merge(clients)
+    auth.merge(clients)
         .merge(services)
         .merge(visitors)
-        .merge(misc);
-    // Prometheus 指标端点:路由常驻注册,是否响应由处理器按热配置判定(控制台可即时开关),
-    // 并要求与管理 API 相同的 Bearer 认证
-    r = r.route("/metrics", get(prometheus_metrics));
-    r.with_state(state)
+        .merge(misc)
+        .with_state(state)
 }
 
 async fn menu_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1821,7 +1817,11 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
             "max_services_per_client": hot.max_services_per_client,
             "log_level": hot.log_level,
             "ssh_gateway": serde_json::to_value(&hot.ssh_gateway).unwrap_or(serde_json::Value::Null),
-            "metrics": { "enable_prometheus": hot.enable_prometheus },
+            "metrics": {
+                "enable_prometheus": hot.enable_prometheus,
+                "bind_addr": state.cfg.metrics.bind_addr,
+                "port": state.cfg.metrics.port,
+            },
         },
         "authorized_keys": authorized_keys,
     }))
@@ -1978,9 +1978,18 @@ async fn put_server_config(
                 applied.push("ssh_gateway.bind_addr".into());
             }
         }
-        // metrics:Prometheus 端点开关,/metrics 处理器按此即时判定,无需重启
+        // metrics:Prometheus 独立监听热启停;启动(绑定)失败直接报错,不落配置
         if let Some(m) = req.metrics {
             if let Some(v) = m.enable_prometheus {
+                if v != hot.enable_prometheus {
+                    if v {
+                        if let Err(e) = state.metrics_listen_start().await {
+                            return err(500, &format!("Prometheus 监听启动失败:{e}"));
+                        }
+                    } else {
+                        state.metrics_listen_stop().await;
+                    }
+                }
                 hot.enable_prometheus = v;
                 applied.push("metrics.enable_prometheus".into());
             }
@@ -2193,14 +2202,10 @@ async fn delete_cert_api(
     ok(json!({"deleted": true}))
 }
 
-async fn prometheus_metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    // 未开启时按不存在处理(404),不暴露端点存在性;开启与否读热配置,支持控制台即时开关
-    if !state.hot.read().await.enable_prometheus {
-        return (StatusCode::NOT_FOUND, "metrics disabled\n").into_response();
-    }
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+/// Prometheus 抓取端点:独立端口(metrics.bind_addr:port)上的无鉴权输出。
+/// 暴露面由监听地址控制(默认仅 127.0.0.1,靠网络边界保护),
+/// 不与管理面共口;启停由 AppState::metrics_listen_start/stop 热开关。
+pub(crate) async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> Response {
     use prometheus::TextEncoder;
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();

@@ -56,6 +56,8 @@ pub struct AppState {
         tokio::sync::watch::Sender<u64>,
         Arc<tokio::sync::watch::Receiver<u64>>,
     ),
+    /// Prometheus 独立监听任务(热开关启停;None = 未监听)。
+    pub metrics_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// 网页可管且即时生效的配置子集;其余字段改动标记需重启。
@@ -201,6 +203,7 @@ impl Clone for AppState {
             client_usage: self.client_usage.clone(),
             certs: self.certs.clone(),
             ssh_watch: (self.ssh_watch.0.clone(), self.ssh_watch.1.clone()),
+            metrics_task: self.metrics_task.clone(),
         }
     }
 }
@@ -287,6 +290,7 @@ impl AppState {
             client_usage: Arc::new(dashmap::DashMap::new()),
             certs: Arc::new(RwLock::new(Vec::new())),
             ssh_watch: (ssh_tx, Arc::new(ssh_rx)),
+            metrics_task: Arc::new(Mutex::new(None)),
             relay_pairs: Arc::new(Mutex::new(HashMap::new())),
             udp_relays: Arc::new(Mutex::new(std::collections::HashSet::new())),
             nathole: Arc::new(crate::nathole::NatCoordinator::new()),
@@ -295,6 +299,42 @@ impl AppState {
             ))),
             web_jwt_secret: Arc::new(Mutex::new(Some(jwt_secret))),
             unauth_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// 启动 Prometheus 独立监听(热开关;幂等)。绑定失败返回错误,由调用方决定是否落配置。
+    pub async fn metrics_listen_start(self: &Arc<Self>) -> anyhow::Result<()> {
+        let mut guard = self.metrics_task.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let m = &self.cfg.metrics;
+        let addr: SocketAddr = format!("{}:{}", m.bind_addr, m.port)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("metrics bind_addr/port 非法:{e}"))?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("metrics 端口监听失败 {addr}:{e}"))?;
+        tracing::info!(%addr, "prometheus metrics up");
+        let app = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(crate::api::prometheus_metrics),
+            )
+            .with_state(self.clone());
+        *guard = Some(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::warn!(error = %e, "prometheus metrics serve stopped");
+            }
+        }));
+        Ok(())
+    }
+
+    /// 停止 Prometheus 独立监听(热开关;幂等)。
+    pub async fn metrics_listen_stop(&self) {
+        if let Some(t) = self.metrics_task.lock().await.take() {
+            t.abort();
+            tracing::info!("prometheus metrics down");
         }
     }
 

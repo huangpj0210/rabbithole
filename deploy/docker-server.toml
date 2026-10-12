@@ -35,7 +35,10 @@ default_pool_size = 4
 udp_packet_size = 65536
 
 [metrics]
+# 容器内需 0.0.0.0 才能经端口映射抓取(-p 9100:9100);端口无鉴权,仅在内网/加固后暴露
 enable_prometheus = false
+bind_addr = "0.0.0.0"
+port = 9100
 
 [log]
 level = "info"

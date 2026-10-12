@@ -250,6 +250,12 @@ async fn main() -> anyhow::Result<()> {
     // F2:加载客户端配额缓存;M3:加载证书表
     state.refresh_client_quotas().await;
     state.rebuild_certs().await;
+    // Prometheus 指标独立监听(热开关;启动绑定失败仅告警,不阻断主服务)
+    if cfg.metrics.enable_prometheus {
+        if let Err(e) = state.metrics_listen_start().await {
+            warn!(error = %e, "prometheus metrics listener failed to start");
+        }
+    }
     // SSH Tunnel Gateway(supervisor 常驻,跟随热配置启停)
     {
         let st = state.clone();

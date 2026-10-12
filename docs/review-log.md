@@ -800,3 +800,20 @@ typecheck/build exit 0;e2e 主套 69→71,全量 151/151;浏览器走查创建�
 - 验证:cargo fmt/clippy/test、pnpm typecheck 全绿;实测——关:404;开:
   无令牌 401/带令牌 200 指标文本;UI 点开关双向翻转后端热配置并写回
   server.toml;8000 端口经代理访问 /metrics 行为与 8080 一致。
+
+## R30(2026-10-12)Prometheus 端点与管理面解耦:独立端口、无鉴权(用户拍板)
+
+- 结论路径:共享管理台 JWT 做抓取鉴权对监控不可用(默认 12h 过期、改密即废);
+  指标内容本身仅为规则级连接数/在线客户端数/累计字节(label 是数字 ID),
+  无名称无凭据——不需要令牌,需要的是把暴露面从公网管理口挪开。
+- 实现:[metrics] 新增 bind_addr(默认 127.0.0.1)/port(默认 9100),
+  /metrics 改为独立 TcpListener 上的无鉴权输出,路由从管理口撤下;
+  enable_prometheus 热启停监听器(AppState::metrics_listen_start/stop,
+  绑定失败报错且不落配置),写回保持 bind/port 原值;控制台开关与抓取地址
+  (按 bind_addr/port 拼接,0.0.0.0 时展示当前主机名)同步更新,
+  上轮为共口加的 umi dev /metrics 代理随之撤销。
+- deploy 三个示例 toml 补 [metrics] 段(docker 版 bind 0.0.0.0 + 端口映射说明)。
+- 验证:cargo fmt/clippy/test、pnpm typecheck 全绿(mime_of 死代码警告系
+  本地 dist 缺失导致 embed_ui 关闭,CI 先建 dist 不受影响);实测——开关热启停
+  9100(200/拒连)、8080/metrics 404、端口占用时 PUT 报 500 且热配置不落、
+  UI 双向翻转 + 写回 toml。

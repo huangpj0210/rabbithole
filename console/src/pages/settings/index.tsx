@@ -244,19 +244,25 @@ const PasswordCard: React.FC = () => {
   );
 };
 
-/** 监控指标:Prometheus 开关(热生效,写回配置文件)与抓取地址。 */
+/** 监控指标:Prometheus 开关(热启停独立监听,写回配置文件)与抓取地址。 */
 const MetricsCard: React.FC = () => {
   const { token } = theme.useToken();
   const { message } = App.useApp();
   const queryClient = useQueryClient();
-  const metricsUrl = `${window.location.origin}/metrics`;
 
   // 与 ServerConfigCard 共用 query key:同页切 tab 不重复请求
   const cfgQ = useQuery({
     queryKey: ['server-config'],
     queryFn: getServerConfig,
   });
-  const enabled = !!cfgQ.data?.hot.metrics.enable_prometheus;
+  const metrics = cfgQ.data?.hot.metrics;
+  const enabled = !!metrics?.enable_prometheus;
+  // 抓取地址:独立端口。绑定 0.0.0.0 时展示当前主机名(实际可达地址),其余原样
+  const bindHost =
+    metrics && (metrics.bind_addr === '0.0.0.0' || metrics.bind_addr === '::')
+      ? window.location.hostname
+      : (metrics?.bind_addr ?? '');
+  const metricsUrl = metrics ? `http://${bindHost}:${metrics.port}/metrics` : '';
 
   const toggleMut = useMutation({
     mutationFn: (v: boolean) => putServerConfig({ metrics: { enable_prometheus: v } }),
@@ -290,7 +296,7 @@ const MetricsCard: React.FC = () => {
             <Form.Item
               label={
                 <InfoLabel
-                  info="开启后暴露 /metrics 抓取端点(仍需 Bearer 认证),即时生效并写回配置文件;关闭后访问返回 404"
+                  info="开启后启动独立端口的 /metrics 监听(无鉴权,默认仅本机可达),即时生效并写回配置文件;关闭即停止监听"
                   title="启用 Prometheus"
                 />
               }
@@ -309,7 +315,8 @@ const MetricsCard: React.FC = () => {
             </Typography.Text>
           </Typography.Paragraph>
           <ol style={{ paddingLeft: 20, color: token.colorTextTertiary, fontSize: 13, lineHeight: 2 }}>
-            <li>抓取任务需携带与管理台相同的 Bearer 令牌(未携带返回 401);</li>
+            <li>默认仅监听 127.0.0.1:Prometheus 与服务端同机部署,或经内网 / SSH 隧道抓取;</li>
+            <li>远程直抓需将配置文件中 metrics.bind_addr 改为 0.0.0.0 并重启(端口无鉴权,注意防火墙);</li>
             <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
           </ol>
         </>

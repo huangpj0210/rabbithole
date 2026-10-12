@@ -224,7 +224,7 @@ export interface ServerConfigView {
       bind_addr: string;
       bind_port: number;
     };
-    metrics: { enable_prometheus: boolean };
+    metrics: { enable_prometheus: boolean; bind_addr: string; port: number };
   };
   authorized_keys: null | string;
 }
