@@ -1,5 +1,4 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { ColumnDef } from '@tanstack/react-table';
 import { KeyRound, Plus, RefreshCw, Trash2, Upload } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router';
@@ -18,6 +17,7 @@ import {
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { DataTable, DataTableColumnHeader } from '@/components/data-table';
+import type { RhColumnDef } from '@/components/data-table';
 import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono } from '@/components/mono';
@@ -157,8 +157,8 @@ export function ProxyListPage({
 
   const noun = emptyNoun ?? title ?? '转发规则';
 
-  const columns = useMemo<ColumnDef<ServiceRow, unknown>[]>(() => {
-    const list: ColumnDef<ServiceRow, unknown>[] = [
+  const columns = useMemo<RhColumnDef<ServiceRow>[]>(() => {
+    const list: RhColumnDef<ServiceRow>[] = [
       {
         id: 'name',
         meta: { label: '名称' },
@@ -286,7 +286,7 @@ export function ProxyListPage({
       },
       {
         id: 'actions',
-        meta: { label: '操作' },
+        meta: { label: '操作', headerClassName: 'w-[1%]' },
         enableHiding: false,
         header: '操作',
         cell: ({ row }) => {
@@ -516,15 +516,25 @@ export function ProxyListPage({
               <RefreshCw className={`size-4 ${servicesQuery.isFetching ? 'animate-spin' : ''}`} />
               刷新
             </Button>
-            <Button
-              size="sm"
-              disabled={clients.length === 0}
-              title={clients.length === 0 ? '先创建并接入一个客户端' : undefined}
-              onClick={() => setModal({ open: true, editing: null })}
-            >
-              <Plus className="size-4" />
-              新建规则
-            </Button>
+            {clients.length === 0 ? (
+              // 禁用按钮不触发指针事件,故把 Tooltip 挂在外层 span 上
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex">
+                    <Button size="sm" disabled>
+                      <Plus className="size-4" />
+                      新建规则
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>先创建并接入一个客户端</TooltipContent>
+              </Tooltip>
+            ) : (
+              <Button size="sm" onClick={() => setModal({ open: true, editing: null })}>
+                <Plus className="size-4" />
+                新建规则
+              </Button>
+            )}
           </>
         }
       />

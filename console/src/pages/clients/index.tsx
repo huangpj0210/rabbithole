@@ -1,6 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { ColumnDef } from '@tanstack/react-table';
 import { ChevronDown, KeyRound, Loader2, Plus, RefreshCw, Trash2, Users } from 'lucide-react';
 import { useState } from 'react';
 import { useForm } from 'react-hook-form';
@@ -16,6 +15,7 @@ import {
 import type { ClientRow } from '@/api/rabbithole';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { DataTable, DataTableColumnHeader } from '@/components/data-table';
+import type { RhColumnDef } from '@/components/data-table';
 import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono, MonoCopy } from '@/components/mono';
@@ -45,6 +45,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { FieldInfoKey } from '@/features/field-info';
 import { feedbackSuccess } from '@/lib/feedback';
 import { bytesToMb, fmtBytes, fmtRelative, mbToBytes } from '@/lib/format';
@@ -213,9 +214,16 @@ export default function ClientsPage() {
       return <StatusBadge signal="ok" text="在线" />;
     }
     return (
-      <span title={row.last_online_at ? `最近在线 ${fmtRelative(row.last_online_at)}` : '从未上线'}>
-        <StatusBadge signal="off" text={`离线 · ${fmtRelative(row.last_online_at)}`} />
-      </span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span>
+            <StatusBadge signal="off" text={`离线 · ${fmtRelative(row.last_online_at)}`} />
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>
+          {row.last_online_at ? `最近在线 ${fmtRelative(row.last_online_at)}` : '从未上线'}
+        </TooltipContent>
+      </Tooltip>
     );
   }
 
@@ -288,7 +296,7 @@ export default function ClientsPage() {
     );
   }
 
-  const columns: ColumnDef<ClientRow, unknown>[] = [
+  const columns: RhColumnDef<ClientRow>[] = [
     {
       accessorKey: 'name',
       meta: { label: '名称' },
@@ -410,15 +418,21 @@ export default function ClientsPage() {
       accessorKey: 'remark',
       meta: { label: '备注' },
       header: ({ column }) => <DataTableColumnHeader column={column} title="备注" />,
-      cell: ({ row }) => (
-        <span className="block max-w-64 truncate" title={row.original.remark}>
-          {row.original.remark || '-'}
-        </span>
-      ),
+      cell: ({ row }) =>
+        row.original.remark ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="block max-w-64 truncate">{row.original.remark}</span>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-96 break-all">{row.original.remark}</TooltipContent>
+          </Tooltip>
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        ),
     },
     {
       id: 'action',
-      meta: { label: '操作' },
+      meta: { label: '操作', headerClassName: 'w-[1%]' },
       enableHiding: false,
       header: '操作',
       cell: ({ row }) => renderRowActions(row.original),

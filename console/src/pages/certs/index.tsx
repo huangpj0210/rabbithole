@@ -1,6 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { ColumnDef } from '@tanstack/react-table';
 import { Eye, EyeOff, Plus, ShieldCheck, TriangleAlert, Upload } from 'lucide-react';
 import { useRef, useState } from 'react';
 import type { ChangeEvent } from 'react';
@@ -11,12 +10,14 @@ import { createCert, deleteCert, listCerts, updateCert } from '@/api/rabbithole'
 import type { CertRow } from '@/api/rabbithole';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { DataTable, DataTableColumnHeader } from '@/components/data-table';
+import type { RhColumnDef } from '@/components/data-table';
 import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono, MonoCopy } from '@/components/mono';
 import { PageHeader } from '@/components/page-header';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import {
@@ -100,9 +101,12 @@ function DomainsCell({ domains }: { domains: string[] }) {
         </Badge>
       ))}
       {domains.length > 2 ? (
-        <Badge variant="outline" title={domains.slice(2).join(', ')}>
-          +{domains.length - 2}
-        </Badge>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="outline">+{domains.length - 2}</Badge>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-96">{domains.slice(2).join(', ')}</TooltipContent>
+        </Tooltip>
       ) : null}
     </div>
   );
@@ -197,7 +201,7 @@ export default function CertsPage() {
     event.target.value = '';
   }
 
-  const columns: ColumnDef<CertRow, unknown>[] = [
+  const columns: RhColumnDef<CertRow>[] = [
     {
       accessorKey: 'name',
       meta: { label: '名称' },
@@ -235,7 +239,7 @@ export default function CertsPage() {
     },
     {
       id: 'actions',
-      meta: { label: '操作' },
+      meta: { label: '操作', headerClassName: 'w-[1%]' },
       header: '操作',
       enableHiding: false,
       enableSorting: false,

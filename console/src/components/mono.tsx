@@ -2,6 +2,7 @@ import { Check, Copy } from 'lucide-react';
 import { useState } from 'react';
 
 import { Button } from '@/components/ui/button';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 
 /** 纯 mono 展示:端口/IP/UUID/字节/速率/时间戳等。 */
@@ -56,9 +57,16 @@ export function MonoCopy({
 
   return (
     <span className={cn('group inline-flex min-w-0 items-center gap-1', className)}>
-      <span className="rh-mono truncate text-[13px]" title={full}>
-        {display ?? full}
-      </span>
+      {display !== undefined && display !== full ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="rh-mono truncate text-[13px]">{display}</span>
+          </TooltipTrigger>
+          <TooltipContent className="rh-mono max-w-96 text-xs break-all">{full}</TooltipContent>
+        </Tooltip>
+      ) : (
+        <span className="rh-mono truncate text-[13px]">{full}</span>
+      )}
       <Button
         type="button"
         variant="ghost"

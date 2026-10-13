@@ -1,6 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { ColumnDef } from '@tanstack/react-table';
 import { Cable, Plus } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
@@ -20,6 +19,7 @@ import {
 import type { ClientRow, VisitorRow } from '@/api/rabbithole';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { DataTable } from '@/components/data-table';
+import type { RhColumnDef } from '@/components/data-table';
 import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono } from '@/components/mono';
@@ -306,7 +306,7 @@ export function VisitorsPanel({
 
   // 表头带 InfoLabel(名词 + ℹ 说明),故不使用可排序表头:DataTableColumnHeader 的
   // 排序按钮会与 InfoLabel 的浮层触发按钮形成嵌套 button 并互相抢点击。
-  const columns: ColumnDef<VisitorRow, unknown>[] = [
+  const columns: RhColumnDef<VisitorRow>[] = [
     {
       accessorKey: 'name',
       meta: { label: '名称' },
@@ -354,7 +354,7 @@ export function VisitorsPanel({
     },
     {
       id: 'action',
-      meta: { label: '操作' },
+      meta: { label: '操作', headerClassName: 'w-[1%]' },
       enableHiding: false,
       header: '操作',
       cell: ({ row }) => renderActions(row.original),

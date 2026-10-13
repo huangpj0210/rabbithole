@@ -8,7 +8,6 @@ import {
 import type {
   Column,
   ColumnDef,
-  RowData,
   RowSelectionState,
   SortingState,
   VisibilityState,
@@ -16,12 +15,38 @@ import type {
 import { ArrowDown, ArrowUp, ChevronsUpDown, Columns3 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
-declare module '@tanstack/react-table' {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  interface ColumnMeta<TData extends RowData, TValue> {
-    /** 「列」下拉里显示的中文名;不填则退回字符串 header,再退回列 id。 */
-    label?: string;
-  }
+/**
+ * 本表格封装在 TanStack `ColumnDef.meta` 上追加的字段。
+ *
+ * 不能用模块增强:`ColumnMeta` 是空接口且声明在 `@tanstack/table-core`
+ * (react-table 只是再导出,该包在本工程不可直接解析),增强 react-table 不会
+ * 作用到 `ColumnDef.meta`。因此这里显式声明自己的 meta 类型与列定义类型,
+ * 调用点用 `RhColumnDef<T>` 声明列表即可获得类型检查,无需断言。
+ */
+export interface RhColumnMeta {
+  /** 「列」下拉里显示的中文名;不填则退回字符串 header,再退回列 id。 */
+  label?: string;
+  /**
+   * 加到该列表头 th 上的类名。自动布局下 `w-[1%]` 可让该列按内容收紧,
+   * 避免表格 w-full 把富余宽度摊给操作列(按钮右对齐后左边会留大片空白)。
+   */
+  headerClassName?: string;
+}
+
+/**
+ * 分配式 Omit:ColumnDef 是联合类型,直接 `Omit<ColumnDef, 'meta'>` 会把联合塌成
+ * 单个对象类型,`accessorKey` / `accessorFn` 等成员随之丢失。
+ */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/** 列表页使用的列定义类型(在 ColumnDef 上补 RhColumnMeta)。 */
+export type RhColumnDef<TData> = DistributiveOmit<ColumnDef<TData, unknown>, 'meta'> & {
+  meta?: RhColumnMeta;
+};
+
+/** 读取列上的 meta(列定义来自 TanStack,meta 为未知形状,这里收口一次转换)。 */
+function rhMeta<TData>(column: Column<TData, unknown>): RhColumnMeta {
+  return (column.columnDef.meta ?? {}) as RhColumnMeta;
 }
 
 import { Button } from '@/components/ui/button';
@@ -48,8 +73,9 @@ import { cn } from '@/lib/utils';
 
 /** 「列」下拉里的列名:优先 meta.label(中文),否则字符串 header,最后退回列 id。 */
 function columnLabel<TData>(column: Column<TData, unknown>): string {
-  if (column.columnDef.meta?.label) {
-    return column.columnDef.meta.label;
+  const label = rhMeta(column).label;
+  if (label) {
+    return label;
   }
   if (typeof column.columnDef.header === 'string') {
     return column.columnDef.header;
@@ -93,7 +119,7 @@ export function DataTableColumnHeader<TData, TValue>({
 }
 
 export interface DataTableProps<TData> {
-  columns: ColumnDef<TData, unknown>[];
+  columns: RhColumnDef<TData>[];
   data: TData[];
   loading?: boolean;
   /** 无数据时展示(空态三件套);缺省给一句朴素占位。 */
@@ -158,13 +184,18 @@ export function DataTable<TData>({
       ),
       enableSorting: false,
       enableHiding: false,
+      meta: { headerClassName: 'w-[1%]' },
     }),
     [],
   );
 
   const table = useReactTable({
     data,
-    columns: enableRowSelection ? [selectionColumn, ...columns] : columns,
+    // 收口一次转换:RhColumnDef 只是给 meta 补了类型,运行时形状就是 ColumnDef
+    columns: (enableRowSelection ? [selectionColumn, ...columns] : columns) as ColumnDef<
+      TData,
+      unknown
+    >[],
     state: { sorting, columnVisibility, rowSelection },
     onSortingChange: setSorting,
     onColumnVisibilityChange: setColumnVisibility,
@@ -252,7 +283,10 @@ export function DataTable<TData>({
               {table.getHeaderGroups().map((headerGroup) => (
                 <TableRow key={headerGroup.id}>
                   {headerGroup.headers.map((header) => (
-                    <TableHead key={header.id} className="whitespace-nowrap">
+                    <TableHead
+                      key={header.id}
+                      className={cn('whitespace-nowrap', rhMeta(header.column).headerClassName)}
+                    >
                       {header.isPlaceholder
                         ? null
                         : flexRender(header.column.columnDef.header, header.getContext())}

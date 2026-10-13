@@ -1,7 +1,7 @@
 import { Info } from 'lucide-react';
 import { useRef, useState } from 'react';
 
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { fieldInfo } from '@/features/field-info';
 import type { FieldInfoKey } from '@/features/field-info';
 import { cn } from '@/lib/utils';
@@ -11,7 +11,10 @@ import { cn } from '@/lib/utils';
  * 替代「括号补充说明」式文案 —— 界面只留名词本身。
  *
  * 说明文案不在本组件里,而是按 key 取自 @/features/field-info(旧版 89 条文案逐字平移)。
- * 不用 Radix Tooltip:它显式忽略 touch 指针,触屏点按不会弹出。
+ *
+ * 用 shadcn 的 Tooltip(Radix Tooltip)。Radix Tooltip 会**忽略 touch 指针**,
+ * 因此触屏点按由这里受控 open 手动开合(记录最后一次指针类型,只对触屏生效);
+ * 桌面仍由 Radix 的 hover/focus 逻辑驱动。
  */
 export function InfoLabel({
   title,
@@ -28,8 +31,7 @@ export function InfoLabel({
   className?: string;
 }) {
   const [open, setOpen] = useState(false);
-  // 悬停已由指针事件自行开合;此时 Radix 的点击 toggle 不应把浮层关掉
-  const hoveringRef = useRef(false);
+  const lastPointerTypeRef = useRef('');
 
   const content = infoKey ? fieldInfo(infoKey) : info;
   const label = typeof title === 'string' ? title : '该项';
@@ -41,52 +43,30 @@ export function InfoLabel({
   return (
     <span className={cn('inline-flex items-center gap-1', className)}>
       {iconOnly ? null : <span>{title}</span>}
-      <Popover
-        open={open}
-        onOpenChange={(next) => {
-          if (hoveringRef.current) {
-            return;
-          }
-          setOpen(next);
-        }}
-      >
-        <PopoverTrigger asChild>
+      <Tooltip open={open} onOpenChange={setOpen}>
+        <TooltipTrigger asChild>
           <button
             type="button"
             aria-label={`${label} 说明`}
             // p-1.5 + -m-1.5:图标视觉尺寸不变,但命中区从 14×14 撑到 26×26,
-            // 满足 WCAG 2.2 AA 的 24×24 最小目标(纯图标按钮在触屏上尤其需要)
+            // 满足 WCAG 2.2 AA 的 24×24 最小目标
             className="-m-1.5 inline-flex shrink-0 cursor-help items-center rounded-sm p-1.5 text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
-            onPointerEnter={(event) => {
-              if (event.pointerType === 'touch') return;
-              hoveringRef.current = true;
-              setOpen(true);
+            onPointerDown={(event) => {
+              lastPointerTypeRef.current = event.pointerType;
             }}
-            onPointerLeave={(event) => {
-              if (event.pointerType === 'touch') return;
-              hoveringRef.current = false;
-              setOpen(false);
-            }}
-            // 刻意不在 onFocus 里自动弹出:Radix Dialog 打开时会自动聚焦首个可聚焦元素
-            // (往往就是这个 ℹ 按钮),那样会一开弹窗就弹出第一个字段的说明浮层,
-            // 并且第一次 Esc 只关掉浮层。键盘用户 Tab 到 ℹ 后按 Enter/Space 触发原生 click 即可。
-            onBlur={() => {
-              hoveringRef.current = false;
-              setOpen(false);
+            onClick={() => {
+              if (lastPointerTypeRef.current === 'touch') {
+                setOpen((prev) => !prev);
+              }
             }}
           >
             <Info className="size-3.5" aria-hidden="true" />
           </button>
-        </PopoverTrigger>
-        <PopoverContent
-          side="top"
-          align="start"
-          className="max-w-72 text-xs leading-relaxed text-popover-foreground"
-          onOpenAutoFocus={(event) => event.preventDefault()}
-        >
+        </TooltipTrigger>
+        <TooltipContent side="top" align="start" className="max-w-72 text-xs leading-relaxed">
           {content}
-        </PopoverContent>
-      </Popover>
+        </TooltipContent>
+      </Tooltip>
     </span>
   );
 }
