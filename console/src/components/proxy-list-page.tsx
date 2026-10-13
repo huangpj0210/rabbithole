@@ -156,6 +156,7 @@ export function ProxyListPage({
     const list: ColumnDef<ServiceRow, unknown>[] = [
       {
         id: 'name',
+        meta: { label: '名称' },
         accessorKey: 'name',
         header: ({ column }) => <DataTableColumnHeader column={column} title="名称" />,
         cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
@@ -165,6 +166,7 @@ export function ProxyListPage({
     if (isTunnel) {
       list.push({
         id: 'bind',
+        meta: { label: '监听' },
         header: '监听',
         cell: ({ row }) =>
           row.original.bind_port > 0 ? (
@@ -178,6 +180,7 @@ export function ProxyListPage({
     if (isDomain) {
       list.push({
         id: 'domains',
+        meta: { label: '域名' },
         header: '域名',
         cell: ({ row }) => {
           const spec = row.original.spec ?? {};
@@ -205,6 +208,7 @@ export function ProxyListPage({
     list.push(
       {
         id: 'status',
+        meta: { label: '状态' },
         accessorKey: 'status',
         header: () => <InfoLabel title="状态" infoKey="service.list.status" />,
         cell: ({ row }) => {
@@ -221,6 +225,7 @@ export function ProxyListPage({
       },
       {
         id: 'target',
+        meta: { label: '目标' },
         header: '目标',
         cell: ({ row }) =>
           row.original.plugin ? (
@@ -239,18 +244,21 @@ export function ProxyListPage({
       },
       {
         id: 'pool',
+        meta: { label: '池' },
         accessorKey: 'pool_ready',
         header: () => <InfoLabel title="池" infoKey="service.list.pool" />,
         cell: ({ row }) => <Mono>{row.original.pool_ready}</Mono>,
       },
       {
         id: 'conns',
+        meta: { label: '连接' },
         accessorKey: 'conns_current',
         header: () => <InfoLabel title="连接" infoKey="service.list.conns" />,
         cell: ({ row }) => <Mono>{row.original.conns_current ?? 0}</Mono>,
       },
       {
         id: 'enabled',
+        meta: { label: '启用' },
         accessorKey: 'enabled',
         header: '启用',
         cell: ({ row }) => {
@@ -273,6 +281,8 @@ export function ProxyListPage({
       },
       {
         id: 'actions',
+        meta: { label: '操作' },
+        enableHiding: false,
         header: () => <span className="sr-only">操作</span>,
         cell: ({ row }) => (
           <div className="flex items-center justify-end gap-1">

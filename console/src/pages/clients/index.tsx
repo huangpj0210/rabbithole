@@ -29,6 +29,7 @@ import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono, MonoCopy } from '@/components/mono';
 import { PageHeader } from '@/components/page-header';
+import { RowActionsMenu } from '@/components/row-actions';
 import { SecretModal } from '@/components/secret-modal';
 import { StatusBadge } from '@/components/status-badge';
 import { Button } from '@/components/ui/button';
@@ -41,6 +42,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import {
   Form,
   FormControl,
@@ -89,6 +91,9 @@ export default function ClientsPage() {
     open: boolean;
     secret: string;
   }>({ open: false, secret: '' });
+  // 行操作收进 ⋯ 下拉后,确认框改为受控:由菜单项设置目标行
+  const [rotateTarget, setRotateTarget] = useState<ClientRow | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ClientRow | null>(null);
 
   const form = useForm<ClientForm>({
     resolver: zodResolver(clientSchema),
@@ -265,57 +270,28 @@ export default function ClientsPage() {
     );
   }
 
-  /** 行操作:编辑 / 轮换客户端密钥 / 删除(桌面列与移动卡片共用)。 */
+  /**
+   * 行操作:编辑 / 轮换客户端密钥 / 删除(桌面列与移动卡片共用)。
+   * 收敛为「⋯」下拉:触发器悬停该行才显现(小屏常显),确认框由菜单项受控打开。
+   */
   function renderRowActions(row: ClientRow) {
     return (
-      <div className="flex flex-wrap items-center gap-1">
-        <Button type="button" variant="ghost" size="sm" onClick={() => openEdit(row)}>
-          <Pencil className="size-3.5" aria-hidden="true" />
-          编辑
-        </Button>
-        <ConfirmDialog
-          destructive
-          confirmText="确认轮换"
-          title={`轮换 ${row.name} 的客户端密钥?`}
-          description="服务端将生成新的随机客户端密钥;旧客户端密钥立即失效,客户端需更新配置后重连。"
-          trigger={
-            <Button type="button" variant="ghost" size="sm">
-              <KeyRound className="size-3.5" aria-hidden="true" />
-              轮换客户端密钥
-            </Button>
-          }
-          onConfirm={async () => {
-            try {
-              await rotateMut.mutateAsync(row.id);
-            } catch {
-              // 失败提示由响应拦截器统一弹出
-            }
-          }}
-        />
-        <ConfirmDialog
-          destructive
-          confirmText="删除"
-          title={`删除客户端 ${row.name}?`}
-          description="此操作不可恢复,该客户端下的转发规则将失效。"
-          trigger={
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="text-destructive hover:text-destructive"
-            >
-              <Trash2 className="size-3.5" aria-hidden="true" />
-              删除
-            </Button>
-          }
-          onConfirm={async () => {
-            try {
-              await deleteMut.mutateAsync(row.id);
-            } catch {
-              // 失败提示由响应拦截器统一弹出
-            }
-          }}
-        />
+      <div className="flex justify-end">
+        <RowActionsMenu label={`${row.name} 的操作`}>
+          <DropdownMenuItem onSelect={() => openEdit(row)}>
+            <Pencil className="size-4" aria-hidden="true" />
+            编辑
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setRotateTarget(row)}>
+            <KeyRound className="size-4" aria-hidden="true" />
+            轮换客户端密钥
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem variant="destructive" onSelect={() => setDeleteTarget(row)}>
+            <Trash2 className="size-4" aria-hidden="true" />
+            删除
+          </DropdownMenuItem>
+        </RowActionsMenu>
       </div>
     );
   }
@@ -323,6 +299,7 @@ export default function ClientsPage() {
   const columns: ColumnDef<ClientRow, unknown>[] = [
     {
       accessorKey: 'name',
+      meta: { label: '名称' },
       header: ({ column }) => <DataTableColumnHeader column={column} title="名称" />,
       cell: ({ row }) => {
         const client = row.original;
@@ -356,6 +333,7 @@ export default function ClientsPage() {
     },
     {
       accessorKey: 'id',
+      meta: { label: '客户端 ID' },
       header: ({ column }) => (
         <DataTableColumnHeader
           column={column}
@@ -372,6 +350,7 @@ export default function ClientsPage() {
     },
     {
       accessorKey: 'online',
+      meta: { label: '在线' },
       header: ({ column }) => (
         <DataTableColumnHeader
           column={column}
@@ -382,11 +361,13 @@ export default function ClientsPage() {
     },
     {
       accessorKey: 'enabled',
+      meta: { label: '启用' },
       header: ({ column }) => <DataTableColumnHeader column={column} title="启用" />,
       cell: ({ row }) => renderEnabledSwitch(row.original),
     },
     {
       id: 'meta',
+      meta: { label: '版本 / 主机' },
       accessorFn: (row) => `${row.client_version || '-'} ${row.hostname || '-'}`,
       header: ({ column }) => (
         <DataTableColumnHeader
@@ -400,6 +381,7 @@ export default function ClientsPage() {
     },
     {
       id: 'bytes',
+      meta: { label: '流量(入/出)' },
       accessorFn: (row) => row.bytes_in ?? 0,
       header: ({ column }) => (
         <DataTableColumnHeader
@@ -413,6 +395,7 @@ export default function ClientsPage() {
     },
     {
       id: 'conns',
+      meta: { label: '连接' },
       accessorFn: (row) => row.conns_current ?? 0,
       header: ({ column }) => (
         <DataTableColumnHeader
@@ -433,6 +416,7 @@ export default function ClientsPage() {
     },
     {
       accessorKey: 'remark',
+      meta: { label: '备注' },
       header: ({ column }) => <DataTableColumnHeader column={column} title="备注" />,
       cell: ({ row }) => (
         <span className="block max-w-64 truncate" title={row.original.remark}>
@@ -442,6 +426,8 @@ export default function ClientsPage() {
     },
     {
       id: 'action',
+      meta: { label: '操作' },
+      enableHiding: false,
       header: '操作',
       cell: ({ row }) => renderRowActions(row.original),
     },
@@ -689,6 +675,44 @@ export default function ClientsPage() {
           // 关闭即不可再看:连同 secret 一起清掉,不存在重新打开的路径
           if (!open) {
             setSecretState({ open: false, secret: '' });
+          }
+        }}
+      />
+
+      {/* 行操作的二次确认:全页各一份,由 ⋯ 菜单项设置目标行后受控打开 */}
+      <ConfirmDialog
+        destructive
+        open={rotateTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setRotateTarget(null);
+        }}
+        confirmText="确认轮换"
+        title={`轮换 ${rotateTarget?.name ?? ''} 的客户端密钥?`}
+        description="服务端将生成新的随机客户端密钥;旧客户端密钥立即失效,客户端需更新配置后重连。"
+        onConfirm={async () => {
+          if (!rotateTarget) return;
+          try {
+            await rotateMut.mutateAsync(rotateTarget.id);
+          } catch {
+            // 失败提示由响应拦截器统一弹出
+          }
+        }}
+      />
+      <ConfirmDialog
+        destructive
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
+        }}
+        confirmText="删除"
+        title={`删除客户端 ${deleteTarget?.name ?? ''}?`}
+        description="此操作不可恢复,该客户端下的转发规则将失效。"
+        onConfirm={async () => {
+          if (!deleteTarget) return;
+          try {
+            await deleteMut.mutateAsync(deleteTarget.id);
+          } catch {
+            // 失败提示由响应拦截器统一弹出
           }
         }}
       />

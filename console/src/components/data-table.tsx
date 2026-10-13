@@ -8,12 +8,21 @@ import {
 import type {
   Column,
   ColumnDef,
+  RowData,
   RowSelectionState,
   SortingState,
   VisibilityState,
 } from '@tanstack/react-table';
 import { ArrowDown, ArrowUp, ChevronsUpDown, Columns3 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+
+declare module '@tanstack/react-table' {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  interface ColumnMeta<TData extends RowData, TValue> {
+    /** 「列」下拉里显示的中文名;不填则退回字符串 header,再退回列 id。 */
+    label?: string;
+  }
+}
 
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -36,6 +45,17 @@ import {
 } from '@/components/ui/table';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { cn } from '@/lib/utils';
+
+/** 「列」下拉里的列名:优先 meta.label(中文),否则字符串 header,最后退回列 id。 */
+function columnLabel<TData>(column: Column<TData, unknown>): string {
+  if (column.columnDef.meta?.label) {
+    return column.columnDef.meta.label;
+  }
+  if (typeof column.columnDef.header === 'string') {
+    return column.columnDef.header;
+  }
+  return column.id;
+}
 
 /** 可排序列头(升/降/取消三态)。 */
 export function DataTableColumnHeader<TData, TValue>({
@@ -199,9 +219,7 @@ export function DataTable<TData>({
                   onCheckedChange={(value) => column.toggleVisibility(!!value)}
                   onSelect={(event) => event.preventDefault()}
                 >
-                  {typeof column.columnDef.header === 'string'
-                    ? column.columnDef.header
-                    : column.id}
+                  {columnLabel(column)}
                 </DropdownMenuCheckboxItem>
               ))}
             </DropdownMenuContent>
@@ -244,8 +262,9 @@ export function DataTable<TData>({
               ))}
             </TableHeader>
             <TableBody>
+              {/* group/row:供行内操作按钮做「悬停该行才显现」 */}
               {rows.map((row) => (
-                <TableRow key={row.id}>
+                <TableRow key={row.id} className="group/row">
                   {row.getVisibleCells().map((cell) => (
                     <TableCell key={cell.id}>
                       {flexRender(cell.column.columnDef.cell, cell.getContext())}

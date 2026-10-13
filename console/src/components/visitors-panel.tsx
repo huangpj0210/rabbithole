@@ -309,29 +309,34 @@ export function VisitorsPanel({
   const columns: ColumnDef<VisitorRow, unknown>[] = [
     {
       accessorKey: 'name',
+      meta: { label: '名称' },
       enableHiding: false,
       header: () => <InfoLabel title="名称" infoKey="visitor.name" />,
       cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
     },
     {
       accessorKey: 'kind',
+      meta: { label: '类型' },
       enableHiding: false,
       header: () => <InfoLabel title="类型" infoKey="visitor.kind" />,
       cell: ({ row }) => <Badge variant="outline">{row.original.kind.toUpperCase()}</Badge>,
     },
     {
       id: 'bind',
+      meta: { label: '本地监听' },
       enableHiding: false,
       header: () => <InfoLabel title="本地监听" infoKey="visitor.bind" />,
       cell: ({ row }) => <Mono>{`${row.original.bind_addr}:${row.original.bind_port}`}</Mono>,
     },
     {
       accessorKey: 'target_proxy_name',
+      meta: { label: '目标代理' },
       enableHiding: false,
       header: () => <InfoLabel title="目标代理" infoKey="visitor.target_proxy_name" />,
     },
     {
       id: 'compress',
+      meta: { label: '压缩' },
       enableHiding: false,
       header: () => <InfoLabel title="压缩" infoKey="visitor.compression" />,
       cell: ({ row }) => (
@@ -342,12 +347,14 @@ export function VisitorsPanel({
     },
     {
       id: 'enabled',
+      meta: { label: '启用' },
       enableHiding: false,
       header: '启用',
       cell: ({ row }) => renderEnabledSwitch(row.original),
     },
     {
       id: 'action',
+      meta: { label: '操作' },
       enableHiding: false,
       header: '操作',
       cell: ({ row }) => renderActions(row.original),

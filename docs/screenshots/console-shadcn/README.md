@@ -18,7 +18,9 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 8. 390px 小屏(表格卡片降级 + 侧栏抽屉);
 9. 登出(二次确认)→ 回登录页 → 重新登录并核对后端审计事件里出现「已登出」;
 10. 深链直接刷新、旧路径重定向(`/rabbithole/services`、`/rabbithole/visitors`)、404 兜底;
-11. 侧栏收起为图标态:断言品牌文字块不可见、底部版本号不可见、header 内无元素越出 48px 轨道。
+11. 侧栏收起为图标态:断言品牌文字块不可见、底部版本号不可见、header 内无元素越出 48px 轨道;
+12. 行操作与列名:断言「⋯」未悬停时 opacity=0、悬停该行后为 1、菜单含三项;
+   并逐页断言「列」下拉里的列名都是中文(客户端 / TCP 隧道 / 证书)。
 
 结果:**功能问题 0,控制台错误 0**。
 
@@ -54,6 +56,9 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 | `33-settings-deeplink-refresh.png` | 深链直接刷新 |
 | `34-not-found.png` | 404 兜底页 |
 | `35-sidebar-collapsed.png` | 侧栏收起为图标态(品牌区只留标记) |
+| `36-clients-row-actions.png` | 客户端行操作「⋯」:悬停该行才显现 |
+| `37-clients-row-actions-menu.png` | 「⋯」展开的操作列表(编辑 / 轮换客户端密钥 / 删除) |
+| `38-clients-column-menu.png` | 「列」下拉:中文列名 |
 
 ## 可编程视觉审计
 

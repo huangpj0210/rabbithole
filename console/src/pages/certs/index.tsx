@@ -200,23 +200,27 @@ export default function CertsPage() {
   const columns: ColumnDef<CertRow, unknown>[] = [
     {
       accessorKey: 'name',
+      meta: { label: '名称' },
       header: ({ column }) => <DataTableColumnHeader column={column} title="名称" />,
       cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
     },
     {
       id: 'domains',
+      meta: { label: '域名' },
       header: '域名',
       enableSorting: false,
       cell: ({ row }) => <DomainsCell domains={row.original.domains ?? []} />,
     },
     {
       id: 'not_after',
+      meta: { label: '到期' },
       accessorFn: (row) => row.not_after ?? 0,
       header: ({ column }) => <DataTableColumnHeader column={column} title="到期" />,
       cell: ({ row }) => <ExpiryCell notAfter={row.original.not_after} />,
     },
     {
       accessorKey: 'fingerprint',
+      meta: { label: '指纹' },
       header: ({ column }) => <DataTableColumnHeader column={column} title="指纹" />,
       cell: ({ row }) =>
         row.original.fingerprint ? (
@@ -231,6 +235,7 @@ export default function CertsPage() {
     },
     {
       id: 'actions',
+      meta: { label: '操作' },
       header: '操作',
       enableHiding: false,
       enableSorting: false,
