@@ -33,7 +33,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { DropdownMenuItem } from '@/components/ui/dropdown-menu';
+import { MenubarItem } from '@/components/ui/menubar';
 import {
   Form,
   FormControl,
@@ -272,14 +272,17 @@ export default function ClientsPage() {
           编辑
         </Button>
         <RowActionsMenu label={`${row.name} 的操作`}>
-          <DropdownMenuItem onSelect={() => setRotateTarget(row)}>
+          <MenubarItem onSelect={() => setRotateTarget(row)}>
             <KeyRound className="size-4" aria-hidden="true" />
             轮换客户端密钥
-          </DropdownMenuItem>
-          <DropdownMenuItem variant="destructive" onSelect={() => setDeleteTarget(row)}>
+          </MenubarItem>
+          <MenubarItem
+            className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+            onSelect={() => setDeleteTarget(row)}
+          >
             <Trash2 className="size-4" aria-hidden="true" />
             删除
-          </DropdownMenuItem>
+          </MenubarItem>
         </RowActionsMenu>
       </div>
     );

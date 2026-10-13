@@ -19,10 +19,11 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 9. 登出(二次确认)→ 回登录页 → 重新登录并核对后端审计事件里出现「已登出」;
 10. 深链直接刷新、旧路径重定向(`/rabbithole/services`、`/rabbithole/visitors`)、404 兜底;
 11. 侧栏收起为图标态:断言品牌文字块不可见、底部版本号不可见、header 内无元素越出 48px 轨道;
-12. 行操作与列名:断言「⋯」未悬停该行时 opacity=0、悬停后为 1、悬停「⋯」直接弹出菜单、
-   主操作「编辑」留在主位;≤2 个动作的页面(TCP 隧道 / 证书)不出现「⋯」;
-   密钥访问页(4 个动作)「⋯」含创建访问器/轮换密钥/删除;
-   并逐页断言「列」下拉里的列名都是中文。
+12. 行操作与列名:断言「⋯」**常显**(未悬停该行时 opacity=1)、悬停「⋯」直接展开菜单、
+   主操作「编辑」留在主位;并做**抗闪烁采样**(悬停期间连续 15 次 × 100ms 检查菜单
+   可见性,要求 0 次翻转、末态可见),鼠标移开后自动关闭;
+   ≤2 个动作的页面(TCP 隧道 / 证书)不出现「⋯」;密钥访问页(4 个动作)「⋯」含
+   创建访问器/轮换密钥/删除;并逐页断言「列」下拉里的列名都是中文。
 
 结果:**功能问题 0,控制台错误 0**。
 
@@ -50,7 +51,11 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 | `19-rule-form-http-kind-selector.png` | 域名服务页的多 kind 选择器 |
 | `20-rule-form-plugin-socks5.png` | 插件子表单(socks5) |
 | `21-command-palette.png` | ⌘K 命令面板 |
-| `22-overview-dark.png` … `26-rule-form-dark.png` | 暗色主题:总览 / 客户端 / TCP / 设置 / 规则弹窗 |
+| `22-overview-dark.png` | 暗色主题 · 总览 |
+| `23-clients-dark.png` | 暗色主题 · 客户端 |
+| `24-tcp-dark.png` | 暗色主题 · TCP 隧道 |
+| `25-settings-dark.png` | 暗色主题 · 设置 |
+| `26-rule-form-dark.png` | 暗色主题 · 规则弹窗 |
 | `27-mobile-tcp.png` / `28-mobile-clients.png` | 390px 小屏表格降级为卡片 |
 | `29-mobile-sidebar.png` | 小屏侧栏抽屉 |
 | `30-logout-confirm.png` / `31-login-after-logout.png` | 登出二次确认与回登录页 |
@@ -58,8 +63,8 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 | `33-settings-deeplink-refresh.png` | 深链直接刷新 |
 | `34-not-found.png` | 404 兜底页 |
 | `35-sidebar-collapsed.png` | 侧栏收起为图标态(品牌区只留标记) |
-| `36-clients-row-actions.png` | 客户端行操作:主操作「编辑」+ 悬停该行才显现的「⋯」 |
-| `37-clients-row-actions-menu.png` | 悬停「⋯」直接弹出的操作列表(轮换客户端密钥 / 删除) |
+| `36-clients-row-actions.png` | 客户端行操作:主操作「编辑」+ 常显的「⋯」 |
+| `37-clients-row-actions-menu.png` | 悬停「⋯」直接展开的操作列表(轮换客户端密钥 / 删除) |
 | `38-clients-column-menu.png` | 「列」下拉:中文列名 |
 
 ## 可编程视觉审计

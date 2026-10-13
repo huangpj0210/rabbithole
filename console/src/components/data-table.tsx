@@ -262,9 +262,8 @@ export function DataTable<TData>({
               ))}
             </TableHeader>
             <TableBody>
-              {/* group/row:供行内操作按钮做「悬停该行才显现」 */}
               {rows.map((row) => (
-                <TableRow key={row.id} className="group/row">
+                <TableRow key={row.id}>
                   {row.getVisibleCells().map((cell) => (
                     <TableCell key={cell.id}>
                       {flexRender(cell.column.columnDef.cell, cell.getContext())}

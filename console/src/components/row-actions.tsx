@@ -1,25 +1,25 @@
 import { MoreHorizontal } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
-import { Button } from '@/components/ui/button';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+import { Menubar, MenubarContent, MenubarMenu, MenubarTrigger } from '@/components/ui/menubar';
 import { cn } from '@/lib/utils';
 
-/** 鼠标离开后延迟关闭,给「从 ⋯ 移向菜单内容」留出时间,避免闪关。 */
+/** 鼠标离开触发器/菜单后延迟关闭,给「从 ⋯ 移向菜单内容」留出时间。 */
 const CLOSE_DELAY_MS = 180;
 
 /**
  * 行操作的「⋯」:列表行超过 2 个动作时,主操作留在主位,其余收进这里。
  *
+ * 用 shadcn 的 Menubar(底层 Radix Menubar)而不是 DropdownMenu,原因是后者
+ * 默认 modal:打开时会给页面其余部分加 `pointer-events: none`,导致触发器收到
+ * pointerleave → 关 → 再开,悬停展开时反复闪烁。Radix Menubar 的菜单根是
+ * `modal: false`,结构上不会出现这个循环。
+ *
  * 交互:
- * - 触发器只在**悬停该行**或键盘聚焦时显现(小屏常显,触屏没有 hover);
- * - **悬停触发器即弹出**菜单,不用点(Radix 的 DropdownMenu 本身只支持点击,
- *   这里用受控 open + 指针事件实现;键盘仍可 Tab 到 ⋯ 后按 Enter/Space);
- * - 菜单内容也参与「离开才关」的判定,鼠标移进菜单不会把它关掉。
+ * - 触发器**常显**(不再随行悬停隐现),键盘可 Tab 到后按 Enter/Space;
+ * - **悬停触发器即展开**菜单(Radix 只在「已有菜单打开」时响应悬停切换,
+ *   从关闭态展开由这里受控 value 完成);
+ * - 鼠标移进菜单内容不会关(内容也参与「离开才关」判定,并带 180ms 宽限)。
  */
 export function RowActionsMenu({
   label,
@@ -31,9 +31,7 @@ export function RowActionsMenu({
   children: React.ReactNode;
   className?: string;
 }) {
-  const [open, setOpen] = useState(false);
-  // 悬停已自行开合时,Radix 的点击 toggle 不应把它关掉
-  const hoveringRef = useRef(false);
+  const [value, setValue] = useState('');
   const closeTimerRef = useRef<number | null>(null);
 
   const cancelClose = () => {
@@ -45,54 +43,43 @@ export function RowActionsMenu({
 
   const scheduleClose = () => {
     cancelClose();
-    closeTimerRef.current = window.setTimeout(() => setOpen(false), CLOSE_DELAY_MS);
+    closeTimerRef.current = window.setTimeout(() => setValue(''), CLOSE_DELAY_MS);
   };
 
   useEffect(() => cancelClose, []);
 
   return (
-    <DropdownMenu
-      open={open}
-      onOpenChange={(next) => {
-        if (hoveringRef.current) {
-          return;
-        }
-        setOpen(next);
-      }}
+    <Menubar
+      aria-label={label}
+      value={value}
+      onValueChange={setValue}
+      className={cn('h-auto gap-0 rounded-none border-0 bg-transparent p-0 shadow-none', className)}
     >
-      <DropdownMenuTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
+      <MenubarMenu value="actions">
+        <MenubarTrigger
           aria-label={label}
-          className={cn(
-            'opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 max-md:opacity-100',
-            className,
-          )}
+          className="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none data-[state=open]:bg-accent data-[state=open]:text-accent-foreground"
           onPointerEnter={(event) => {
             if (event.pointerType === 'touch') return;
-            hoveringRef.current = true;
             cancelClose();
-            setOpen(true);
+            setValue('actions');
           }}
           onPointerLeave={(event) => {
             if (event.pointerType === 'touch') return;
-            hoveringRef.current = false;
             scheduleClose();
           }}
         >
           <MoreHorizontal className="size-4" aria-hidden="true" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="end"
-        className="w-48"
-        onPointerEnter={cancelClose}
-        onPointerLeave={scheduleClose}
-      >
-        {children}
-      </DropdownMenuContent>
-    </DropdownMenu>
+        </MenubarTrigger>
+        <MenubarContent
+          align="end"
+          className="w-48"
+          onPointerEnter={cancelClose}
+          onPointerLeave={scheduleClose}
+        >
+          {children}
+        </MenubarContent>
+      </MenubarMenu>
+    </Menubar>
   );
 }

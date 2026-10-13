@@ -26,7 +26,7 @@ import { ProxyFormModal } from '@/components/proxy-form-modal';
 import { RowActionsMenu } from '@/components/row-actions';
 import { StatusBadge, proxyStatusSignal } from '@/components/status-badge';
 import { Badge } from '@/components/ui/badge';
-import { DropdownMenuItem } from '@/components/ui/dropdown-menu';
+import { MenubarItem } from '@/components/ui/menubar';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -349,21 +349,24 @@ export function ProxyListPage({
               {overflow ? (
                 <RowActionsMenu label={`${service.name} 的操作`}>
                   {visitorAction ? (
-                    <DropdownMenuItem onSelect={() => onCreateVisitor(service)}>
+                    <MenubarItem onSelect={() => onCreateVisitor(service)}>
                       <KeyRound className="size-4" aria-hidden="true" />
                       创建访问器
-                    </DropdownMenuItem>
+                    </MenubarItem>
                   ) : null}
                   {isSecret ? (
-                    <DropdownMenuItem onSelect={() => setRotateTarget(service)}>
+                    <MenubarItem onSelect={() => setRotateTarget(service)}>
                       <RefreshCw className="size-4" aria-hidden="true" />
                       轮换密钥
-                    </DropdownMenuItem>
+                    </MenubarItem>
                   ) : null}
-                  <DropdownMenuItem variant="destructive" onSelect={() => setDeleteTarget(service)}>
+                  <MenubarItem
+                    className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+                    onSelect={() => setDeleteTarget(service)}
+                  >
                     <Trash2 className="size-4" aria-hidden="true" />
                     删除
-                  </DropdownMenuItem>
+                  </MenubarItem>
                 </RowActionsMenu>
               ) : null}
             </div>
