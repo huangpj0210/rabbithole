@@ -41,6 +41,18 @@ export default defineConfig({
     sourcemap: false,
     chunkSizeWarningLimit: 900,
     rollupOptions: {
+      /**
+       * zod 4.6.6 的产物里有两处 `@__PURE__` 注释的位置 Rollup 无法解析(第三方依赖,
+       * 与本工程代码无关;Rollup 会去掉这些注释后继续,不影响产物)。
+       * 只静音这一种来源为依赖的警告,其余警告照常输出。
+       */
+      onwarn(warning, defaultHandler) {
+        const fromDependency = warning.id?.includes('node_modules') ?? false;
+        if (warning.code === 'INVALID_ANNOTATION' && fromDependency) {
+          return;
+        }
+        defaultHandler(warning);
+      },
       output: {
         /**
          * 拆 vendor:内嵌产物没有 CDN,拆包主要是让浏览器并行解析、
