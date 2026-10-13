@@ -288,7 +288,7 @@ export function ProxyListPage({
         id: 'actions',
         meta: { label: '操作' },
         enableHiding: false,
-        header: () => <span className="sr-only">操作</span>,
+        header: '操作',
         cell: ({ row }) => {
           const service = row.original;
           const visitorAction = isSecret && onCreateVisitor;

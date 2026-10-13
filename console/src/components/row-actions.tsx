@@ -58,7 +58,7 @@ export function RowActionsMenu({
       <MenubarMenu value="actions">
         <MenubarTrigger
           aria-label={label}
-          className="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none data-[state=open]:bg-accent data-[state=open]:text-accent-foreground"
+          className="flex size-9 items-center justify-center rounded-md p-0 text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none data-[state=open]:bg-accent data-[state=open]:text-accent-foreground"
           onPointerEnter={(event) => {
             if (event.pointerType === 'touch') return;
             cancelClose();
@@ -69,7 +69,7 @@ export function RowActionsMenu({
             scheduleClose();
           }}
         >
-          <MoreHorizontal className="size-4" aria-hidden="true" />
+          <MoreHorizontal className="size-5 shrink-0" aria-hidden="true" />
         </MenubarTrigger>
         <MenubarContent
           align="end"
