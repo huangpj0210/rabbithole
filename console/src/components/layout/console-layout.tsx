@@ -113,8 +113,9 @@ export function ConsoleLayout() {
             仅小屏可见的入口,否则 <768px 无法打开侧栏。
           */}
           <SidebarTrigger className="-ml-1 md:hidden" aria-label="打开侧栏菜单" />
-          <CommandPaletteTrigger />
+          {/* 搜索框保持在右侧、紧挨主题切换(用户要求) */}
           <div className="ml-auto flex items-center gap-1.5">
+            <CommandPaletteTrigger />
             <ThemeToggle />
             <UserMenu />
           </div>
