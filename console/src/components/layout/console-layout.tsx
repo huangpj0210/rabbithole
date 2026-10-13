@@ -126,7 +126,8 @@ export function ConsoleLayout() {
       <AppSidebar />
       <SidebarInset>
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
-          <SidebarTrigger className="-ml-1" />
+          {/* aria-label 覆盖生成组件里的英文 sr-only 文案「Toggle Sidebar」 */}
+          <SidebarTrigger className="-ml-1" aria-label="切换侧栏" />
           <Separator orientation="vertical" className="mr-1 h-4" />
           <Breadcrumb className="min-w-0">
             <BreadcrumbList>

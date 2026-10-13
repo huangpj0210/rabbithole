@@ -17,7 +17,8 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 7. 切暗色主题,重走总览/客户端/TCP/设置 + 规则弹窗;
 8. 390px 小屏(表格卡片降级 + 侧栏抽屉);
 9. 登出(二次确认)→ 回登录页 → 重新登录并核对后端审计事件里出现「已登出」;
-10. 深链直接刷新、旧路径重定向(`/rabbithole/services`、`/rabbithole/visitors`)、404 兜底。
+10. 深链直接刷新、旧路径重定向(`/rabbithole/services`、`/rabbithole/visitors`)、404 兜底;
+11. 侧栏收起为图标态:断言品牌文字块不可见、底部版本号不可见、header 内无元素越出 48px 轨道。
 
 结果:**功能问题 0,控制台错误 0**。
 
@@ -52,6 +53,7 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 | `32-overview-events.png` | 审计事件(含「已登出」) |
 | `33-settings-deeplink-refresh.png` | 深链直接刷新 |
 | `34-not-found.png` | 404 兜底页 |
+| `35-sidebar-collapsed.png` | 侧栏收起为图标态(品牌区只留标记) |
 
 ## 可编程视觉审计
 
