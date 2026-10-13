@@ -41,12 +41,42 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { feedbackSuccess } from '@/lib/feedback';
 import { daysUntil, fmtTime } from '@/lib/format';
+import { cn } from '@/lib/utils';
 import { qk } from '@/lib/query-keys';
 
-/** PEM 结构粗校验(拦截明显误贴,最终以服务端解析为准)。 */
-function looksLikePem(text: string, kind: 'CERTIFICATE' | 'PRIVATE KEY'): boolean {
+/**
+ * 私钥 PEM 的合法头。除 PKCS#8 的 `PRIVATE KEY`,还必须接受实际最常见的
+ * PKCS#1(`RSA PRIVATE KEY`)与 SEC1(`EC PRIVATE KEY`)—— 旧版只认 PKCS#8,
+ * 会把 openssl/nginx 导出的 `*.key` 直接判非法。
+ */
+const PRIVATE_KEY_KINDS = ['PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY', 'DSA PRIVATE KEY'];
+
+function hasPemBlock(text: string, kind: string): boolean {
   return text.includes(`-----BEGIN ${kind}-----`) && text.includes(`-----END ${kind}-----`);
 }
+
+/** PEM 结构粗校验(拦截明显误贴,最终以服务端解析为准)。 */
+function looksLikeCertPem(text: string): boolean {
+  return hasPemBlock(text, 'CERTIFICATE');
+}
+
+function looksLikePrivateKeyPem(text: string): boolean {
+  return PRIVATE_KEY_KINDS.some((kind) => hasPemBlock(text, kind));
+}
+
+/** 加密私钥前端解不开,单独给出可执行的下一步。 */
+function isEncryptedPrivateKey(text: string): boolean {
+  return text.includes('-----BEGIN ENCRYPTED PRIVATE KEY-----');
+}
+
+/**
+ * -webkit-text-security 只有 Chromium/WebKit 支持。不支持时(如 Firefox)不渲染
+ * 「显示/隐藏」开关 —— 否则开关点了没用、反而让人以为已遮住。
+ */
+const supportsTextSecurity =
+  typeof CSS !== 'undefined' && typeof CSS.supports === 'function'
+    ? CSS.supports('-webkit-text-security', 'disc')
+    : false;
 
 const certSchema = z.object({
   name: z.string().trim().min(1, '请输入名称'),
@@ -55,12 +85,19 @@ const certSchema = z.object({
     .string()
     .trim()
     .min(1, '请粘贴或上传证书 PEM')
-    .refine((v) => looksLikePem(v, 'CERTIFICATE'), '证书 PEM 结构非法(缺 BEGIN/END CERTIFICATE)'),
+    .refine(looksLikeCertPem, '证书 PEM 结构非法(缺 BEGIN/END CERTIFICATE)'),
   key_pem: z
     .string()
     .trim()
     .min(1, '请粘贴或上传私钥 PEM')
-    .refine((v) => looksLikePem(v, 'PRIVATE KEY'), '私钥 PEM 结构非法(缺 BEGIN/END PRIVATE KEY)'),
+    .refine(
+      (v) => !isEncryptedPrivateKey(v),
+      '不支持加密私钥:请先解密后再粘贴(openssl rsa -in 原私钥 -out 明文私钥)',
+    )
+    .refine(
+      looksLikePrivateKeyPem,
+      '私钥 PEM 结构非法:支持 PKCS#8(PRIVATE KEY)与 PKCS#1 / SEC1(RSA / EC PRIVATE KEY)',
+    ),
 });
 
 type CertFormValues = z.infer<typeof certSchema>;
@@ -192,7 +229,7 @@ export default function CertsPage() {
     const file = event.target.files?.[0];
     if (!file) return;
     const text = await file.text();
-    if (file.name.includes('key') || looksLikePem(text, 'PRIVATE KEY')) {
+    if (file.name.includes('key') || looksLikePrivateKeyPem(text)) {
       form.setValue('key_pem', text.trim(), { shouldValidate: true, shouldDirty: true });
     } else {
       form.setValue('cert_pem', text.trim(), { shouldValidate: true, shouldDirty: true });
@@ -393,9 +430,12 @@ export default function CertsPage() {
                     </FormLabel>
                     <FormControl>
                       <Textarea
-                        className="min-h-32 font-mono text-xs"
+                        // field-sizing-fixed + 固定高度:否则 shadcn Textarea 默认
+                        // field-sizing-content 会被上百行的证书链撑得很高
+                        className="field-sizing-fixed h-32 max-h-40 overflow-y-auto font-mono text-xs"
                         placeholder="-----BEGIN CERTIFICATE-----…"
                         rows={5}
+                        spellCheck={false}
                         {...field}
                       />
                     </FormControl>
@@ -409,34 +449,49 @@ export default function CertsPage() {
                 name="key_pem"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="私钥 PEM" infoKey="cert.key_pem" />
-                    </FormLabel>
-                    <div className="relative">
-                      <FormControl>
-                        <Input
-                          autoComplete="off"
-                          className="pr-9 font-mono text-xs"
-                          placeholder="-----BEGIN PRIVATE KEY-----…"
-                          type={keyVisible ? 'text' : 'password'}
-                          {...field}
-                        />
-                      </FormControl>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-xs"
-                        className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
-                        aria-label={keyVisible ? '隐藏私钥' : '显示私钥'}
-                        onClick={() => setKeyVisible((v) => !v)}
-                      >
-                        {keyVisible ? <EyeOff /> : <Eye />}
-                      </Button>
+                    <div className="flex items-center justify-between gap-2">
+                      <FormLabel>
+                        <InfoLabel title="私钥 PEM" infoKey="cert.key_pem" />
+                      </FormLabel>
+                      {/* 私钥是多行 PEM,用 Textarea 而不是单行 Input;
+                          遮罩走 -webkit-text-security(仅 Chromium/WebKit),
+                          不支持就不显示开关,避免「开关点了没用」 */}
+                      {supportsTextSecurity ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="xs"
+                          className="text-muted-foreground"
+                          aria-label={keyVisible ? '隐藏私钥' : '显示私钥'}
+                          onClick={() => setKeyVisible((v) => !v)}
+                        >
+                          {keyVisible ? (
+                            <EyeOff className="size-3.5" />
+                          ) : (
+                            <Eye className="size-3.5" />
+                          )}
+                          {keyVisible ? '隐藏' : '显示'}
+                        </Button>
+                      ) : null}
                     </div>
+                    <FormControl>
+                      <Textarea
+                        autoComplete="off"
+                        className={cn(
+                          'field-sizing-fixed h-32 max-h-40 overflow-y-auto font-mono text-xs',
+                          !keyVisible && supportsTextSecurity && '[-webkit-text-security:disc]',
+                        )}
+                        placeholder="-----BEGIN RSA PRIVATE KEY-----…"
+                        rows={5}
+                        spellCheck={false}
+                        {...field}
+                      />
+                    </FormControl>
                     <FormDescription>
                       {editing
                         ? '编辑时服务端不回显已存私钥,需重新粘贴私钥 PEM。'
-                        : '仅上传时提交,任何响应不回显。'}
+                        : '仅上传时提交,任何响应不回显。'}{' '}
+                      支持 PKCS#8(PRIVATE KEY)与 PKCS#1 / SEC1(RSA / EC PRIVATE KEY)。
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
