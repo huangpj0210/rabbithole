@@ -3,6 +3,8 @@ import {
   Globe,
   KeyRound,
   LayoutDashboard,
+  PanelLeftClose,
+  PanelLeftOpen,
   Radio,
   Server,
   Settings,
@@ -24,7 +26,9 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarRail,
+  useSidebar,
 } from '@/components/ui/sidebar';
+import { Button } from '@/components/ui/button';
 import { NAV_GROUPS, ROUTES } from '@/router/paths';
 
 const ICONS: Record<string, LucideIcon> = {
@@ -38,7 +42,36 @@ const ICONS: Record<string, LucideIcon> = {
   settings: Settings,
 };
 
-/** 侧栏:两组 + 设置,底部版本号;路径与旧版一致。 */
+/**
+ * 侧栏折叠开关。放在页脚版本号那一行(用户要求),收起/展开用不同图标。
+ *
+ * 不用生成组件里的 SidebarTrigger:它把 PanelLeftIcon 写死在内部、不接受
+ * children,拿不到状态相关图标;这里用 useSidebar() 自己实现,也不改动
+ * shadcn 生成文件(便于 CLI 覆盖升级)。
+ */
+function SidebarCollapseToggle() {
+  const { state, toggleSidebar } = useSidebar();
+  const collapsed = state === 'collapsed';
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      onClick={toggleSidebar}
+      aria-label={collapsed ? '展开侧栏' : '收起侧栏'}
+      title={collapsed ? '展开侧栏' : '收起侧栏'}
+      className="shrink-0 text-muted-foreground"
+    >
+      {collapsed ? (
+        <PanelLeftOpen className="size-4" aria-hidden="true" />
+      ) : (
+        <PanelLeftClose className="size-4" aria-hidden="true" />
+      )}
+    </Button>
+  );
+}
+
+/** 侧栏:两组 + 设置,底部版本号 + 折叠开关;路径与旧版一致。 */
 export function AppSidebar() {
   const { pathname } = useLocation();
 
@@ -101,8 +134,11 @@ export function AppSidebar() {
       </SidebarContent>
 
       <SidebarFooter>
-        <div className="px-2 pb-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
-          rabbithole v{__APP_VERSION__}
+        <div className="flex items-center justify-between gap-1 group-data-[collapsible=icon]:justify-center">
+          <span className="truncate px-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
+            rabbithole v{__APP_VERSION__}
+          </span>
+          <SidebarCollapseToggle />
         </div>
       </SidebarFooter>
       <SidebarRail />

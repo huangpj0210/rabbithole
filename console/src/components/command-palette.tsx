@@ -61,14 +61,13 @@ export function CommandPaletteTrigger() {
   return (
     <Button
       variant="outline"
-      size="sm"
-      className="gap-2 text-muted-foreground max-sm:w-9 max-sm:px-0"
       onClick={() => window.dispatchEvent(new CustomEvent('rh:toggle-command'))}
       aria-label="打开命令面板"
+      className="h-9 w-72 max-w-[45vw] justify-start gap-2 font-normal text-muted-foreground max-sm:w-9 max-sm:px-0"
     >
-      <Search className="size-4" />
-      <span className="max-sm:hidden">搜索</span>
-      <KbdGroup className="max-sm:hidden">
+      <Search className="size-4 shrink-0" />
+      <span className="truncate max-sm:hidden">搜索页面、客户端或转发规则</span>
+      <KbdGroup className="ml-auto shrink-0 max-sm:hidden">
         <Kbd>{isMac() ? '⌘' : 'Ctrl'}</Kbd>
         <Kbd>K</Kbd>
       </KbdGroup>

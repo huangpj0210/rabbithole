@@ -16,10 +16,12 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 5. 域名服务页新建弹窗(多 kind 选择器)+ 选 socks5 插件展开子表单;
 6. ⌘K 命令面板;
 7. 切暗色主题,重走总览/客户端/TCP/设置 + 规则弹窗;
-8. 390px 小屏(表格卡片降级 + 侧栏抽屉);
+8. 390px 小屏(表格卡片降级 + 侧栏抽屉:断言顶栏入口可见、点击后抽屉打开);
 9. 登出(二次确认)→ 回登录页 → 重新登录并核对后端审计事件里出现「已登出」;
 10. 深链直接刷新、旧路径重定向(`/rabbithole/services`、`/rabbithole/visitors`)、404 兜底;
-11. 侧栏收起为图标态:断言品牌文字块不可见、底部版本号不可见、header 内无元素越出 48px 轨道;
+11. 侧栏收起态与顶栏:断言顶栏不含当前页面名、桌面端不出现侧栏切换按钮、搜索框 ≥240px;
+    页脚含版本号与折叠开关,开/关图标不同;收起后品牌文字块与版本号不可见、
+    header 内无元素越出 48px 轨道;
 12. 行操作与列名:断言「⋯」**常显**(未悬停该行时 opacity=1)、悬停「⋯」直接展开菜单、
    主操作「编辑」留在主位;并做**抗闪烁采样**(悬停期间连续 15 次 × 100ms 检查菜单
    可见性,要求 0 次翻转、末态可见),鼠标移开后自动关闭;
@@ -58,12 +60,12 @@ Playwright(Chromium)驱动真实浏览器,对**空数据库**的新实例跑完�
 | `25-settings-dark.png` | 暗色主题 · 设置 |
 | `26-rule-form-dark.png` | 暗色主题 · 规则弹窗 |
 | `27-mobile-tcp.png` / `28-mobile-clients.png` | 390px 小屏表格降级为卡片 |
-| `29-mobile-sidebar.png` | 小屏侧栏抽屉 |
+| `29-mobile-sidebar.png` | 小屏侧栏抽屉(顶栏有仅小屏可见的入口) |
 | `30-logout-confirm.png` / `31-login-after-logout.png` | 登出二次确认与回登录页 |
 | `32-overview-events.png` | 审计事件(含「已登出」) |
 | `33-settings-deeplink-refresh.png` | 深链直接刷新 |
 | `34-not-found.png` | 404 兜底页 |
-| `35-sidebar-collapsed.png` | 侧栏收起为图标态(品牌区只留标记) |
+| `35-sidebar-collapsed.png` | 侧栏收起为图标态(品牌区只留标记;页脚开关换成展开图标) |
 | `36-clients-row-actions.png` | 客户端行操作:主操作「编辑」+ 常显的「⋯」 |
 | `37-clients-row-actions-menu.png` | 悬停「⋯」直接展开的操作列表(轮换客户端密钥 / 删除) |
 | `38-clients-column-menu.png` | 「列」下拉:中文列名 |

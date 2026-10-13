@@ -1,6 +1,6 @@
 import { LogOut } from 'lucide-react';
 import { useState } from 'react';
-import { Outlet, useLocation, useNavigate } from 'react-router';
+import { Outlet, useNavigate } from 'react-router';
 
 import { CommandPalette, CommandPaletteTrigger } from '@/components/command-palette';
 import { AppSidebar } from '@/components/layout/app-sidebar';
@@ -16,12 +16,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
-import {
-  Breadcrumb,
-  BreadcrumbItem,
-  BreadcrumbList,
-  BreadcrumbPage,
-} from '@/components/ui/breadcrumb';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -31,23 +25,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { Separator } from '@/components/ui/separator';
 import { SidebarInset, SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar';
 import { logoutApi } from '@/api/auth';
 import { feedbackSuccess } from '@/lib/feedback';
-import { NAV_GROUPS, ROUTES } from '@/router/paths';
+import { ROUTES } from '@/router/paths';
 import { useAuthStore } from '@/stores/auth';
-
-function currentTitle(pathname: string): string {
-  for (const group of NAV_GROUPS) {
-    for (const item of group.items) {
-      if (pathname === item.to || pathname.startsWith(`${item.to}/`)) {
-        return item.title;
-      }
-    }
-  }
-  return '控制台';
-}
 
 function UserMenu() {
   const username = useAuthStore((state) => state.username);
@@ -119,25 +101,20 @@ function UserMenu() {
 
 /** 应用外壳:shadcn sidebar(collapsible=icon)+ 顶栏;移动端自动抽屉。 */
 export function ConsoleLayout() {
-  const { pathname } = useLocation();
-
   return (
     <SidebarProvider>
       <AppSidebar />
       <SidebarInset>
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
-          {/* aria-label 覆盖生成组件里的英文 sr-only 文案「Toggle Sidebar」 */}
-          <SidebarTrigger className="-ml-1" aria-label="切换侧栏" />
-          <Separator orientation="vertical" className="mr-1 h-4" />
-          <Breadcrumb className="min-w-0">
-            <BreadcrumbList>
-              <BreadcrumbItem>
-                <BreadcrumbPage className="truncate">{currentTitle(pathname)}</BreadcrumbPage>
-              </BreadcrumbItem>
-            </BreadcrumbList>
-          </Breadcrumb>
+          {/*
+            顶栏不再显示当前页面名(用户要求):面包屑去掉后左侧留给搜索。
+            桌面端的折叠开关移到了侧栏页脚(版本号那一行)。
+            但小屏侧栏是 Sheet,页脚在侧栏内部、够不到,所以这里保留一个
+            仅小屏可见的入口,否则 <768px 无法打开侧栏。
+          */}
+          <SidebarTrigger className="-ml-1 md:hidden" aria-label="打开侧栏菜单" />
+          <CommandPaletteTrigger />
           <div className="ml-auto flex items-center gap-1.5">
-            <CommandPaletteTrigger />
             <ThemeToggle />
             <UserMenu />
           </div>
