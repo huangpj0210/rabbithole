@@ -15,5 +15,5 @@ createRoot(container).render(
   </StrictMode>,
 );
 
-// 首屏占位移除(见 index.html 的 #rh-boot)
-document.getElementById('rh-boot')?.remove();
+// #rh-boot 的移除在 App 的 effect 里做(React 首次提交之后),
+// 这里立刻移除会露出一帧空白

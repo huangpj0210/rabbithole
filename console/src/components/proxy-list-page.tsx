@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { KeyRound, Plus, RefreshCw, Trash2, Upload } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { Suspense, lazy, useMemo, useState } from 'react';
 import { Link } from 'react-router';
 
 import {
@@ -22,7 +22,6 @@ import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono } from '@/components/mono';
 import { PageHeader } from '@/components/page-header';
-import { ProxyFormModal } from '@/components/proxy-form-modal';
 import { RowActionsMenu } from '@/components/row-actions';
 import { StatusBadge, proxyStatusSignal } from '@/components/status-badge';
 import { Badge } from '@/components/ui/badge';
@@ -53,6 +52,18 @@ import { qk } from '@/lib/query-keys';
 import { ROUTES } from '@/router/paths';
 
 const ALL_KINDS_FILTER = '__all__';
+
+/**
+ * 规则表单弹窗按需加载。
+ *
+ * 它静态引入会拖进 react-hook-form + zod + Form/Textarea/Switch 等(约 130 KB 未压缩),
+ * 而这些只有用户点「新建/编辑」时才需要 —— 列表页首屏不该为它买单。
+ */
+const LazyProxyFormModal = lazy(() =>
+  import('@/components/proxy-form-modal').then((module) => ({
+    default: module.ProxyFormModal,
+  })),
+);
 
 export interface ProxyListPageProps {
   kinds: ProxyKind[];
@@ -90,6 +101,8 @@ export function ProxyListPage({
   // 动作超过 2 个时收进 ⋯,确认框由菜单项受控打开
   const [rotateTarget, setRotateTarget] = useState<ServiceRow | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServiceRow | null>(null);
+  // 打开过一次后再常驻挂载:既能延后加载表单模块,又不丢关闭动画
+  const [modalEverOpened, setModalEverOpened] = useState(false);
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchText, setBatchText] = useState('');
   const [batchResults, setBatchResults] = useState<null | Array<{ name: string; msg: string }>>(
@@ -114,6 +127,12 @@ export function ProxyListPage({
   );
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['services'] });
+
+  /** 打开新建/编辑弹窗。顺带记录「已打开过」,之后弹窗常驻挂载以保留关闭动画。 */
+  const openModal = (editing: ServiceRow | null) => {
+    setModalEverOpened(true);
+    setModal({ open: true, editing });
+  };
 
   const saveMutation = useMutation({
     mutationFn: ({ editing, spec }: { editing: null | ServiceRow; spec: ServiceSpecPayload }) =>
@@ -299,11 +318,7 @@ export function ProxyListPage({
           const overflow = actionCount > 2;
           return (
             <div className="flex items-center justify-end gap-1">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setModal({ open: true, editing: service })}
-              >
+              <Button variant="ghost" size="sm" onClick={() => openModal(service)}>
                 编辑
               </Button>
               {!overflow && visitorAction ? (
@@ -445,7 +460,7 @@ export function ProxyListPage({
             <Link to={ROUTES.clients}>去创建客户端</Link>
           </Button>
         ) : (
-          <Button onClick={() => setModal({ open: true, editing: null })}>
+          <Button onClick={() => openModal(null)}>
             <Plus className="size-4" />
             新建规则
           </Button>
@@ -531,7 +546,7 @@ export function ProxyListPage({
                 <TooltipContent>先创建并接入一个客户端</TooltipContent>
               </Tooltip>
             ) : (
-              <Button size="sm" onClick={() => setModal({ open: true, editing: null })}>
+              <Button size="sm" onClick={() => openModal(null)}>
                 <Plus className="size-4" />
                 新建规则
               </Button>
@@ -566,19 +581,23 @@ export function ProxyListPage({
         </div>
       ) : null}
 
-      <ProxyFormModal
-        key={modal.editing ? `edit-${modal.editing.id}` : 'new'}
-        open={modal.open}
-        onOpenChange={(open) => setModal({ open, editing: open ? modal.editing : null })}
-        kinds={kinds}
-        defaultKind={defaultKind}
-        editing={modal.editing}
-        clients={clients}
-        submitting={saveMutation.isPending}
-        onSubmit={async (spec) => {
-          await saveMutation.mutateAsync({ editing: modal.editing, spec });
-        }}
-      />
+      {modalEverOpened ? (
+        <Suspense fallback={null}>
+          <LazyProxyFormModal
+            key={modal.editing ? `edit-${modal.editing.id}` : 'new'}
+            open={modal.open}
+            onOpenChange={(open) => setModal({ open, editing: open ? modal.editing : null })}
+            kinds={kinds}
+            defaultKind={defaultKind}
+            editing={modal.editing}
+            clients={clients}
+            submitting={saveMutation.isPending}
+            onSubmit={async (spec) => {
+              await saveMutation.mutateAsync({ editing: modal.editing, spec });
+            }}
+          />
+        </Suspense>
+      ) : null}
 
       <Dialog open={batchOpen} onOpenChange={setBatchOpen}>
         <DialogContent className="sm:max-w-2xl" onOpenAutoFocus={focusFirstControl}>

@@ -1,47 +1,35 @@
-import { zodResolver } from '@hookform/resolvers/zod';
 import { Loader2, Lock, User } from 'lucide-react';
-import { useEffect } from 'react';
-import { useForm } from 'react-hook-form';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
-import { z } from 'zod';
 
 import { codesApi, loginApi, userInfoApi } from '@/api/auth';
 import { safeRedirect } from '@/api/request';
 import { BrandMark } from '@/components/brand-mark';
 import { Button } from '@/components/ui/button';
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { feedbackSuccess } from '@/lib/feedback';
 import { HOME_PATH, useAuthStore } from '@/stores/auth';
-
-const schema = z.object({
-  username: z.string().min(1, '请输入用户名'),
-  password: z.string().min(1, '请输入密码'),
-});
-
-type LoginValues = z.infer<typeof schema>;
 
 /**
  * 登录页:全站唯一品牌位。
  * 表单在左、品牌面板在右(移动端品牌面板收起为顶部窄条)。
  * 账号/密码两个字段,无第三方/注册/忘记密码入口(契约见 design.md §7.1)。
+ *
+ * 刻意**不用 react-hook-form + zod**:这两个依赖只服务表单校验,却是首屏关键路径上
+ * 最大的一块(约 122 KB 未压缩)。登录只有"两个必填"这一条规则,用受控 state 手写
+ * 更划算 —— 首屏不加载它们,其余页面的表单仍走 shadcn Form + RHF + zod。
  */
 export default function LoginPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const token = useAuthStore((state) => state.token);
 
-  const form = useForm<LoginValues>({
-    resolver: zodResolver(schema),
-    defaultValues: { username: '', password: '' },
-  });
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [errors, setErrors] = useState<{ password?: string; username?: string }>({});
+  const [submitting, setSubmitting] = useState(false);
+  const passwordRef = useRef<HTMLInputElement | null>(null);
 
   // 已登录访问登录页 → 回控制台
   useEffect(() => {
@@ -50,10 +38,18 @@ export default function LoginPage() {
     }
   }, [token, navigate]);
 
-  const onSubmit = async (values: LoginValues) => {
+  const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const nextErrors: { password?: string; username?: string } = {};
+    if (!username.trim()) nextErrors.username = '请输入用户名';
+    if (!password) nextErrors.password = '请输入密码';
+    setErrors(nextErrors);
+    if (Object.keys(nextErrors).length > 0) return;
+
+    setSubmitting(true);
     try {
-      const { accessToken } = await loginApi(values);
-      useAuthStore.getState().setAuth(accessToken, values.username);
+      const { accessToken } = await loginApi({ username, password });
+      useAuthStore.getState().setAuth(accessToken, username);
       // 登录后并行请求 user/info + auth/codes(codes 预期 [],失败不阻断)
       const [info] = await Promise.all([
         userInfoApi().catch(() => null),
@@ -67,7 +63,9 @@ export default function LoginPage() {
     } catch {
       // 错误提示由响应拦截器统一弹出(sonner 挂在根部,登录页也收得到)
       // 焦点回到密码框,便于直接重输
-      form.setFocus('password');
+      passwordRef.current?.focus();
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -106,67 +104,66 @@ export default function LoginPage() {
             <p className="text-sm text-muted-foreground">登录后管理客户端、隧道与证书</p>
           </div>
 
-          <Form {...form}>
-            <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-              <FormField
-                control={form.control}
-                name="username"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>用户名</FormLabel>
-                    {/* FormControl 必须直接包住 input:它的 Slot 把 id/aria 挂到直接子元素上,
-                        外面再套一层 div 会让 <label htmlFor> 指不到输入框 */}
-                    <div className="relative">
-                      <User
-                        className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
-                        aria-hidden="true"
-                      />
-                      <FormControl>
-                        <Input
-                          {...field}
-                          autoComplete="username"
-                          placeholder="用户名(默认 admin)"
-                          className="pl-9"
-                        />
-                      </FormControl>
-                    </div>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="password"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>密码</FormLabel>
-                    <div className="relative">
-                      <Lock
-                        className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
-                        aria-hidden="true"
-                      />
-                      <FormControl>
-                        <Input
-                          {...field}
-                          type="password"
-                          autoComplete="current-password"
-                          placeholder="密码(首启随机密码见服务端日志)"
-                          className="pl-9"
-                        />
-                      </FormControl>
-                    </div>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <Button type="submit" className="w-full" disabled={form.formState.isSubmitting}>
-                {form.formState.isSubmitting ? (
-                  <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-                ) : null}
-                进入控制台
-              </Button>
-            </form>
-          </Form>
+          <form onSubmit={onSubmit} className="space-y-4" noValidate>
+            <div className="space-y-2">
+              <Label htmlFor="login-username">用户名</Label>
+              <div className="relative">
+                <User
+                  className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
+                  aria-hidden="true"
+                />
+                <Input
+                  id="login-username"
+                  name="username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  autoComplete="username"
+                  placeholder="用户名(默认 admin)"
+                  className="pl-9"
+                  aria-invalid={errors.username ? true : undefined}
+                  aria-describedby={errors.username ? 'login-username-error' : undefined}
+                />
+              </div>
+              {errors.username ? (
+                <p id="login-username-error" className="text-sm text-destructive">
+                  {errors.username}
+                </p>
+              ) : null}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="login-password">密码</Label>
+              <div className="relative">
+                <Lock
+                  className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
+                  aria-hidden="true"
+                />
+                <Input
+                  id="login-password"
+                  name="password"
+                  ref={passwordRef}
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  type="password"
+                  autoComplete="current-password"
+                  placeholder="密码(首启随机密码见服务端日志)"
+                  className="pl-9"
+                  aria-invalid={errors.password ? true : undefined}
+                  aria-describedby={errors.password ? 'login-password-error' : undefined}
+                />
+              </div>
+              {errors.password ? (
+                <p id="login-password-error" className="text-sm text-destructive">
+                  {errors.password}
+                </p>
+              ) : null}
+            </div>
+
+            <Button type="submit" className="w-full" disabled={submitting}>
+              {submitting ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
+              进入控制台
+            </Button>
+          </form>
 
           <p className="text-xs leading-relaxed text-muted-foreground">
             忘记密码?重启服务端并删除数据目录中的数据库可重新引导(数据将丢失)

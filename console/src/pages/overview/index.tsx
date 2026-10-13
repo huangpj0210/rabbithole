@@ -1,16 +1,26 @@
 import { useQuery } from '@tanstack/react-query';
 import { ChevronDown, ChevronUp, Inbox, Waypoints } from 'lucide-react';
-import { useState } from 'react';
+import { Suspense, lazy, useState } from 'react';
 import type { ReactNode } from 'react';
 
 import type { ServiceRow } from '@/api/rabbithole';
+
+/**
+ * 图表按需加载:recharts 约 367 KB,是总览页最大的一块。
+ * 指标条与事件先渲染,图表随后到(期间显示骨架),避免整页等图表库。
+ */
+const TrafficRateChart = lazy(() =>
+  import('@/components/traffic-chart').then((module) => ({
+    default: module.TrafficRateChart,
+  })),
+);
 import { listEvents, listServices, statsOverview } from '@/api/rabbithole';
 import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono } from '@/components/mono';
 import { PageHeader } from '@/components/page-header';
 import { StatusBadge, eventLevelSignal, proxyStatusSignal } from '@/components/status-badge';
-import { TrafficRateChart, useTrafficRateWindow } from '@/components/traffic-chart';
+import { useTrafficRateWindow } from '@/components/traffic-rate';
 import { Button } from '@/components/ui/button';
 import {
   Card,
@@ -213,7 +223,9 @@ export default function OverviewPage() {
             {statsLoading ? (
               <Skeleton className="h-[220px] w-full" />
             ) : (
-              <TrafficRateChart points={points} />
+              <Suspense fallback={<Skeleton className="h-[220px] w-full" />}>
+                <TrafficRateChart points={points} />
+              </Suspense>
             )}
           </CardContent>
         </Card>

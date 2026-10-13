@@ -250,6 +250,25 @@ vitest **50/50**;pnpm build ✓(JS ≈420 KB gz + CSS 15.5 KB gz,已拆 vendor)�
   ③自写 `NumberControl` 吃掉注入的 id;④`InfoLabel` 的 `onFocus` 让弹窗一打开就弹出
   首个字段的说明浮层(且第一次 Esc 只关浮层);⑤规则表单「所属客户端」下拉选项为空
   (矩阵里 client_id 是动态选项,不是静态 `options`)。
+### 首屏体积与秒开优化(用户反馈「产出物有点大、首页白屏」)
+- **登录页首屏**:6 个资源 1450 KB(未压缩)/ 约 440 KB gz → **2 个资源 543 KB / 162 KB gz**。
+  原先登录页会连带下载 recharts(357 KB)与 react-hook-form + zod(122 KB)。
+- **路由级懒加载**:全部 `/rabbithole/*` 页面与控制台外壳改 `React.lazy` + `Suspense`
+  (加载期给 Spinner/骨架,不再白屏);登录页保持静态引入。
+- **Provider 下移**:`QueryClientProvider` 与 `TooltipProvider` 从应用根部移到控制台外壳
+  —— 登录页不用它们,放根部会让首屏白背 93 KB(react-query)+ 一份 radix tooltip。
+- **登录页去掉 RHF + zod**:只有「两个必填」一条规则,改受控 state + 行内错误,
+  校验与交互不变;其余页面表单仍走 shadcn Form + RHF + zod。
+- **弹窗与图表按需加载**:规则表单弹窗(约 130 KB,含 RHF/zod/Form)首次打开才加载;
+  总览的 recharts 拆成独立 chunk(数据 hook 留在 `traffic-rate.ts`),指标条与事件先渲染。
+- **根因修复(重要)**:object 形式的 `rollupOptions.output.manualChunks` 会把列出的包
+  当成 chunk 入口挂进**静态依赖图**,Vite 因此给 `charts`/`query` 生成 `modulepreload`,
+  即使登录页根本不引用它们也会预加载。去掉手动分包、交给自动分包后,
+  `index.html` 只剩 CSS 一条 preload。
+- **白屏的另一半**:`#rh-boot` 原先在 `createRoot().render()` 之后**同步**移除,
+  而 render 是异步的 → 会露出一帧空白;改到 App 的 effect(首次提交后)移除。
+- 走查新增首屏体积门禁:登录页 JS ≤2 个、合计 ≤700 KB、不得出现图表/表单/外壳块。
+
 - **视觉判读未能按约定执行**:本会话模型不支持图像输入,子代理继承同一模型,
   workflow 的 provider/model 覆盖在本会话不可用 → 已如实说明,改以可编程客观测量 + 原图交付人工过目。
 

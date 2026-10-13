@@ -2,6 +2,8 @@ import { LogOut } from 'lucide-react';
 import { useState } from 'react';
 import { Outlet, useNavigate } from 'react-router';
 
+import { QueryClientProvider } from '@tanstack/react-query';
+
 import { CommandPalette, CommandPaletteTrigger } from '@/components/command-palette';
 import { AppSidebar } from '@/components/layout/app-sidebar';
 import { ThemeToggle } from '@/components/theme-toggle';
@@ -26,8 +28,10 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { SidebarInset, SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar';
+import { TooltipProvider } from '@/components/ui/tooltip';
 import { logoutApi } from '@/api/auth';
 import { feedbackSuccess } from '@/lib/feedback';
+import { queryClient } from '@/lib/query-client';
 import { ROUTES } from '@/router/paths';
 import { useAuthStore } from '@/stores/auth';
 
@@ -102,29 +106,36 @@ function UserMenu() {
 /** 应用外壳:shadcn sidebar(collapsible=icon)+ 顶栏;移动端自动抽屉。 */
 export function ConsoleLayout() {
   return (
-    <SidebarProvider>
-      <AppSidebar />
-      <SidebarInset>
-        <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
-          {/*
+    // QueryClientProvider 挂在控制台外壳上:登录页不用 react-query,
+    // 放根部会让首屏白白加载 @tanstack/react-query(约 93 KB 未压缩)
+    <QueryClientProvider client={queryClient}>
+      {/* TooltipProvider 同样只服务控制台:登录页没有 Tooltip,放根部会让首屏多带一份 */}
+      <TooltipProvider delayDuration={200}>
+        <SidebarProvider>
+          <AppSidebar />
+          <SidebarInset>
+            <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
+              {/*
             顶栏不再显示当前页面名(用户要求):面包屑去掉后左侧留给搜索。
             桌面端的折叠开关移到了侧栏页脚(版本号那一行)。
             但小屏侧栏是 Sheet,页脚在侧栏内部、够不到,所以这里保留一个
             仅小屏可见的入口,否则 <768px 无法打开侧栏。
           */}
-          <SidebarTrigger className="-ml-1 md:hidden" aria-label="打开侧栏菜单" />
-          {/* 搜索框保持在右侧、紧挨主题切换(用户要求) */}
-          <div className="ml-auto flex items-center gap-1.5">
-            <CommandPaletteTrigger />
-            <ThemeToggle />
-            <UserMenu />
-          </div>
-        </header>
-        <div className="flex min-w-0 flex-1 flex-col gap-6 p-4 md:p-6">
-          <Outlet />
-        </div>
-      </SidebarInset>
-      <CommandPalette />
-    </SidebarProvider>
+              <SidebarTrigger className="-ml-1 md:hidden" aria-label="打开侧栏菜单" />
+              {/* 搜索框保持在右侧、紧挨主题切换(用户要求) */}
+              <div className="ml-auto flex items-center gap-1.5">
+                <CommandPaletteTrigger />
+                <ThemeToggle />
+                <UserMenu />
+              </div>
+            </header>
+            <div className="flex min-w-0 flex-1 flex-col gap-6 p-4 md:p-6">
+              <Outlet />
+            </div>
+          </SidebarInset>
+          <CommandPalette />
+        </SidebarProvider>
+      </TooltipProvider>
+    </QueryClientProvider>
   );
 }
