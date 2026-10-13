@@ -53,6 +53,7 @@ import {
   validateServiceForm,
 } from '@/features/services/spec';
 import type { ProxyFormValues, ProxyKind, ServiceSpecPayload } from '@/features/services/types';
+import { focusFirstControl } from '@/lib/dialog-focus';
 
 export type { ProxyKind } from '@/features/services/types';
 
@@ -498,8 +499,12 @@ export function ProxyFormModal({
     const rules = KIND_MATRIX[kind].fields.filter((rule) => rule.group === group && visible(rule));
     if (rules.length === 0) return null;
     return (
-      <section key={group} className="space-y-3">
-        <h3 className="text-sm font-medium text-muted-foreground">{GROUP_LABELS[group]}</h3>
+      // 分组用带边框的容器 + 标题分隔线,否则一长串字段看不出哪些属于同一组
+      <section key={group} className="space-y-4 rounded-lg border p-4">
+        <div className="flex items-center gap-3">
+          <h3 className="text-sm font-semibold">{GROUP_LABELS[group]}</h3>
+          <Separator className="flex-1" />
+        </div>
         <div className="grid gap-4 sm:grid-cols-2">{rules.map(renderField)}</div>
       </section>
     );
@@ -512,13 +517,7 @@ export function ProxyFormModal({
       <DialogContent
         className="max-h-[90svh] overflow-y-auto sm:max-w-3xl"
         // 打开时聚焦第一个真实控件,而不是首个可聚焦元素(那通常是字段名旁的 ℹ 按钮)
-        onOpenAutoFocus={(event) => {
-          event.preventDefault();
-          const first = document.querySelector<HTMLElement>(
-            '#proxy-form input, #proxy-form textarea, #proxy-form [data-slot="select-trigger"]',
-          );
-          first?.focus();
-        }}
+        onOpenAutoFocus={focusFirstControl}
       >
         <DialogHeader>
           <DialogTitle>
@@ -532,27 +531,30 @@ export function ProxyFormModal({
         </DialogHeader>
 
         <Form {...form}>
-          <form onSubmit={handleSubmit} className="space-y-6" id="proxy-form">
+          <form onSubmit={handleSubmit} className="space-y-4" id="proxy-form">
             {groups
               .filter((group) => !ADVANCED_GROUPS.includes(group) && group !== 'plugin')
               .map(section)}
 
-            <section className="space-y-3">
-              <h3 className="text-sm font-medium text-muted-foreground">{GROUP_LABELS.plugin}</h3>
+            <section className="space-y-4 rounded-lg border p-4">
+              <div className="flex items-center gap-3">
+                <h3 className="text-sm font-semibold">{GROUP_LABELS.plugin}</h3>
+                <Separator className="flex-1" />
+              </div>
               <div className="grid gap-4 sm:grid-cols-2">
                 {KIND_MATRIX[kind].fields
                   .filter((rule) => rule.group === 'plugin')
                   .map(renderField)}
               </div>
               {pluginFields ? (
-                <>
-                  <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                <div className="space-y-4 rounded-md border border-dashed p-3">
+                  <p className="text-xs font-medium text-muted-foreground">
                     <InfoLabel title="插件参数" infoKey="service.plugin_params" />
                   </p>
                   <div className="grid gap-4 sm:grid-cols-2">
                     {pluginFields.map(renderPluginField)}
                   </div>
-                </>
+                </div>
               ) : null}
             </section>
 
@@ -569,7 +571,7 @@ export function ProxyFormModal({
                 </CollapsibleTrigger>
                 <InfoLabel iconOnly title="高级配置" infoKey="service.advanced" />
               </div>
-              <CollapsibleContent className="space-y-6 pt-4">
+              <CollapsibleContent className="space-y-4 pt-4">
                 {groups.filter((group) => ADVANCED_GROUPS.includes(group)).map(section)}
               </CollapsibleContent>
             </Collapsible>

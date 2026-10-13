@@ -51,6 +51,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
+import { focusFirstControl } from '@/lib/dialog-focus';
 import { feedbackSuccess } from '@/lib/feedback';
 import { qk } from '@/lib/query-keys';
 
@@ -417,7 +418,7 @@ export function VisitorsPanel({
       />
 
       <Dialog open={modalOpen} onOpenChange={setModalOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="sm:max-w-lg" onOpenAutoFocus={focusFirstControl}>
           <DialogHeader>
             <DialogTitle>{editId !== null ? '编辑访问器' : '新建访问器'}</DialogTitle>
             <DialogDescription>

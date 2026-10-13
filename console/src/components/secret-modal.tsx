@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { focusFirstControl } from '@/lib/dialog-focus';
 import { feedbackSuccess, feedbackWarning } from '@/lib/feedback';
 import { cn } from '@/lib/utils';
 
@@ -144,7 +145,7 @@ export function SecretModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-2xl" onOpenAutoFocus={focusFirstControl}>
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription className="text-amber-600 dark:text-amber-500">

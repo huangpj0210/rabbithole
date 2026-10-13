@@ -47,6 +47,7 @@ import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { ProxyKind, ServiceSpecPayload } from '@/features/services/types';
+import { focusFirstControl } from '@/lib/dialog-focus';
 import { feedbackError, feedbackSuccess } from '@/lib/feedback';
 import { qk } from '@/lib/query-keys';
 import { ROUTES } from '@/router/paths';
@@ -580,7 +581,7 @@ export function ProxyListPage({
       />
 
       <Dialog open={batchOpen} onOpenChange={setBatchOpen}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="sm:max-w-2xl" onOpenAutoFocus={focusFirstControl}>
           <DialogHeader>
             <DialogTitle>批量导入规则</DialogTitle>
             <DialogDescription>

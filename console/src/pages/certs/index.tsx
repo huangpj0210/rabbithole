@@ -39,6 +39,7 @@ import {
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
+import { focusFirstControl } from '@/lib/dialog-focus';
 import { feedbackSuccess } from '@/lib/feedback';
 import { daysUntil, fmtTime } from '@/lib/format';
 import { cn } from '@/lib/utils';
@@ -370,7 +371,10 @@ export default function CertsPage() {
           if (!next) setEditing(null);
         }}
       >
-        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+        <DialogContent
+          className="max-h-[90vh] overflow-y-auto sm:max-w-2xl"
+          onOpenAutoFocus={focusFirstControl}
+        >
           <DialogHeader>
             <DialogTitle>{editing ? `编辑证书 #${editing.id}` : '上传证书'}</DialogTitle>
             <DialogDescription>

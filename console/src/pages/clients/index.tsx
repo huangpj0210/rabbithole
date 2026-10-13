@@ -47,6 +47,7 @@ import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { FieldInfoKey } from '@/features/field-info';
+import { focusFirstControl } from '@/lib/dialog-focus';
 import { feedbackSuccess } from '@/lib/feedback';
 import { bytesToMb, fmtBytes, fmtRelative, mbToBytes } from '@/lib/format';
 import { qk } from '@/lib/query-keys';
@@ -543,7 +544,7 @@ export default function ClientsPage() {
           }
         }}
       >
-        <DialogContent className="sm:max-w-xl">
+        <DialogContent className="sm:max-w-xl" onOpenAutoFocus={focusFirstControl}>
           <DialogHeader>
             <DialogTitle>{editing ? '编辑客户端' : '新建客户端'}</DialogTitle>
             <DialogDescription>
