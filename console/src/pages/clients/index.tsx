@@ -1,16 +1,7 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ColumnDef } from '@tanstack/react-table';
-import {
-  ChevronDown,
-  KeyRound,
-  Loader2,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Trash2,
-  Users,
-} from 'lucide-react';
+import { ChevronDown, KeyRound, Loader2, Plus, RefreshCw, Trash2, Users } from 'lucide-react';
 import { useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -42,7 +33,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
+import { DropdownMenuItem } from '@/components/ui/dropdown-menu';
 import {
   Form,
   FormControl,
@@ -276,17 +267,15 @@ export default function ClientsPage() {
    */
   function renderRowActions(row: ClientRow) {
     return (
-      <div className="flex justify-end">
+      <div className="flex items-center justify-end gap-1">
+        <Button type="button" variant="ghost" size="sm" onClick={() => openEdit(row)}>
+          编辑
+        </Button>
         <RowActionsMenu label={`${row.name} 的操作`}>
-          <DropdownMenuItem onSelect={() => openEdit(row)}>
-            <Pencil className="size-4" aria-hidden="true" />
-            编辑
-          </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setRotateTarget(row)}>
             <KeyRound className="size-4" aria-hidden="true" />
             轮换客户端密钥
           </DropdownMenuItem>
-          <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" onSelect={() => setDeleteTarget(row)}>
             <Trash2 className="size-4" aria-hidden="true" />
             删除

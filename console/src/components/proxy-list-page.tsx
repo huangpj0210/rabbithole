@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ColumnDef } from '@tanstack/react-table';
-import { Plus, RefreshCw, Upload } from 'lucide-react';
+import { KeyRound, Plus, RefreshCw, Trash2, Upload } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router';
 
@@ -23,8 +23,10 @@ import { InfoLabel } from '@/components/info-label';
 import { Mono } from '@/components/mono';
 import { PageHeader } from '@/components/page-header';
 import { ProxyFormModal } from '@/components/proxy-form-modal';
+import { RowActionsMenu } from '@/components/row-actions';
 import { StatusBadge, proxyStatusSignal } from '@/components/status-badge';
 import { Badge } from '@/components/ui/badge';
+import { DropdownMenuItem } from '@/components/ui/dropdown-menu';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -84,6 +86,9 @@ export function ProxyListPage({
   });
   const [clientFilter, setClientFilter] = useState<string>(ALL_KINDS_FILTER);
   const [selected, setSelected] = useState<ServiceRow[]>([]);
+  // 动作超过 2 个时收进 ⋯,确认框由菜单项受控打开
+  const [rotateTarget, setRotateTarget] = useState<ServiceRow | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ServiceRow | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchText, setBatchText] = useState('');
   const [batchResults, setBatchResults] = useState<null | Array<{ name: string; msg: string }>>(
@@ -284,56 +289,86 @@ export function ProxyListPage({
         meta: { label: '操作' },
         enableHiding: false,
         header: () => <span className="sr-only">操作</span>,
-        cell: ({ row }) => (
-          <div className="flex items-center justify-end gap-1">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setModal({ open: true, editing: row.original })}
-            >
-              编辑
-            </Button>
-            {isSecret && onCreateVisitor ? (
-              <Button variant="ghost" size="sm" onClick={() => onCreateVisitor(row.original)}>
-                创建访问器
+        cell: ({ row }) => {
+          const service = row.original;
+          const visitorAction = isSecret && onCreateVisitor;
+          // 动作数 = 编辑 + 删除 + 创建访问器(密钥页) + 轮换密钥(密钥页);
+          // 规则:超过 2 个才收进 ⋯,≤2 个全部平铺,不牺牲快捷操作。
+          const actionCount = 2 + (visitorAction ? 1 : 0) + (isSecret ? 1 : 0);
+          const overflow = actionCount > 2;
+          return (
+            <div className="flex items-center justify-end gap-1">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setModal({ open: true, editing: service })}
+              >
+                编辑
               </Button>
-            ) : null}
-            {isSecret ? (
-              <ConfirmDialog
-                trigger={
-                  <Button variant="ghost" size="sm" disabled={rotateMutation.isPending}>
-                    轮换密钥
-                  </Button>
-                }
-                title={`轮换 ${row.original.name} 的访问密钥?`}
-                description="服务端生成新随机密钥,访问器自动继承,现有中继不受影响。"
-                confirmText="轮换"
-                onConfirm={async () => {
-                  await rotateMutation.mutateAsync(row.original);
-                }}
-              />
-            ) : null}
-            <ConfirmDialog
-              trigger={
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="text-destructive hover:text-destructive"
-                  disabled={deleteMutation.isPending}
-                >
-                  删除
+              {!overflow && visitorAction ? (
+                <Button variant="ghost" size="sm" onClick={() => onCreateVisitor(service)}>
+                  创建访问器
                 </Button>
-              }
-              title={`删除转发规则 ${row.original.name}?`}
-              description="此操作不可恢复,该规则的公网入口立即关闭。"
-              confirmText="删除"
-              destructive
-              onConfirm={async () => {
-                await deleteMutation.mutateAsync(row.original);
-              }}
-            />
-          </div>
-        ),
+              ) : null}
+              {!overflow && isSecret ? (
+                <ConfirmDialog
+                  trigger={
+                    <Button variant="ghost" size="sm" disabled={rotateMutation.isPending}>
+                      轮换密钥
+                    </Button>
+                  }
+                  title={`轮换 ${service.name} 的访问密钥?`}
+                  description="服务端生成新随机密钥,访问器自动继承,现有中继不受影响。"
+                  confirmText="轮换"
+                  onConfirm={async () => {
+                    await rotateMutation.mutateAsync(service);
+                  }}
+                />
+              ) : null}
+              {!overflow ? (
+                <ConfirmDialog
+                  trigger={
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-destructive hover:text-destructive"
+                      disabled={deleteMutation.isPending}
+                    >
+                      删除
+                    </Button>
+                  }
+                  title={`删除转发规则 ${service.name}?`}
+                  description="此操作不可恢复,该规则的公网入口立即关闭。"
+                  confirmText="删除"
+                  destructive
+                  onConfirm={async () => {
+                    await deleteMutation.mutateAsync(service);
+                  }}
+                />
+              ) : null}
+              {overflow ? (
+                <RowActionsMenu label={`${service.name} 的操作`}>
+                  {visitorAction ? (
+                    <DropdownMenuItem onSelect={() => onCreateVisitor(service)}>
+                      <KeyRound className="size-4" aria-hidden="true" />
+                      创建访问器
+                    </DropdownMenuItem>
+                  ) : null}
+                  {isSecret ? (
+                    <DropdownMenuItem onSelect={() => setRotateTarget(service)}>
+                      <RefreshCw className="size-4" aria-hidden="true" />
+                      轮换密钥
+                    </DropdownMenuItem>
+                  ) : null}
+                  <DropdownMenuItem variant="destructive" onSelect={() => setDeleteTarget(service)}>
+                    <Trash2 className="size-4" aria-hidden="true" />
+                    删除
+                  </DropdownMenuItem>
+                </RowActionsMenu>
+              ) : null}
+            </div>
+          );
+        },
       },
     );
 
@@ -572,6 +607,35 @@ export function ProxyListPage({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 密钥页动作超过 2 个,轮换/删除收进 ⋯:确认框全页各一份,受控打开 */}
+      <ConfirmDialog
+        open={rotateTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setRotateTarget(null);
+        }}
+        title={`轮换 ${rotateTarget?.name ?? ''} 的访问密钥?`}
+        description="服务端生成新随机密钥,访问器自动继承,现有中继不受影响。"
+        confirmText="轮换"
+        onConfirm={async () => {
+          if (!rotateTarget) return;
+          await rotateMutation.mutateAsync(rotateTarget);
+        }}
+      />
+      <ConfirmDialog
+        destructive
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
+        }}
+        title={`删除转发规则 ${deleteTarget?.name ?? ''}?`}
+        description="此操作不可恢复,该规则的公网入口立即关闭。"
+        confirmText="删除"
+        onConfirm={async () => {
+          if (!deleteTarget) return;
+          await deleteMutation.mutateAsync(deleteTarget);
+        }}
+      />
     </div>
   );
 }
