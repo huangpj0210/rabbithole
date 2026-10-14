@@ -17,7 +17,10 @@ pub async fn recover_all(state: &Arc<AppState>) {
         if !spec.enabled || !enabled_clients.contains(&client_id) {
             continue;
         }
-        crate::db::normalize_spec(&mut spec, state.cfg.limits.default_pool_size);
+        {
+            let l = state.limits.read().unwrap();
+            crate::db::normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
+        }
         // port_auto 被外部占用 → 立即重分配(同事务改库);
         // 固定端口被占不重分配(§4.6):交由 spawn_runtime 进入 bind_error 60s 重试
         let port_auto = state

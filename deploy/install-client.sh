@@ -125,6 +125,8 @@ EnvironmentFile=$CONF_DIR/client.env
 ExecStart=$PREFIX/bin/rh-client
 Restart=always
 RestartSec=3
+# 需内核 fs.nr_open >= 1000000(默认 1048576)
+LimitNOFILE=1000000
 
 [Install]
 WantedBy=multi-user.target

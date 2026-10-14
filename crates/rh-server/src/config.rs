@@ -18,6 +18,9 @@ pub struct ServerConfig {
     pub extra_listeners: Vec<ListenerConfig>,
     /// TCP 传输是否启用 yamux 多路复用。
     pub multiplex: bool,
+    /// 数据面中继模式:splice(Linux 零拷贝,默认)| copy(用户态拷贝)。
+    /// splice 仅对裸 TCP 两端(无 TLS/WS/多路复用/压缩包装)生效,其余自动回落 copy。
+    pub relay_mode: String,
     pub tls: Option<TlsServerFileConfig>,
     pub web: WebConfig,
     pub vhost: VhostConfig,
@@ -109,17 +112,23 @@ pub struct PortsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsConfig {
-    pub max_pool_size: u8,
-    pub default_pool_size: u8,
-    /// 每客户端并发数据连接上限(池+在途+转发中)。
+    /// 单条复用连接(yamux/QUIC)并发流硬顶;0 = 不限。
+    /// 热改仅对新会话生效;yamux 超限 SYN 会终止整条会话,故配额须低于此值。
+    pub max_mux_streams: usize,
+    /// 每客户端并发数据连接上限(池+在途+转发中);0 = 不限。
+    /// 有效值自动钳制到 max_mux_streams-1024(见 data_conn_limit)。
     pub max_data_conns_per_client: usize,
-    /// 每客户端 UDP 会话映射上限。
+    /// 每代理 UDP 会话映射上限;0 = 不限。
     pub max_udp_sessions_per_proxy: usize,
-    /// 控制连接发送队列上限。
+    /// 每规则预热池深度上限;0 = 不限(仅钳制新建/更新的规则)。
+    pub max_pool_size: u8,
+    /// 规则未指定池深时的默认值。
+    pub default_pool_size: u8,
+    /// 控制连接发送队列上限(满则背压等待,不拒连);新会话生效。
     pub control_send_queue: usize,
-    /// 每 IP 未认证并发连接上限。
+    /// 每 IP 未认证并发连接上限;0 = 不限。防匿名洪水,不限制已认证业务并发。
     pub unauth_conns_per_ip: usize,
-    /// UDP 报文上限。
+    /// UDP 报文缓冲上限(实际取 max(1500, 此值))。
     pub udp_packet_size: usize,
     /// 用户连接等待池补拨总额(毫秒)。
     pub pool_wait_timeout_ms: u64,
@@ -128,14 +137,37 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_pool_size: 16,
+            // 默认零上限:并发瓶颈交由系统层(fd/内存/端口),
+            // 运维可在控制台或配置文件显式加帽
+            max_mux_streams: 0,
+            max_data_conns_per_client: 0,
+            max_udp_sessions_per_proxy: 0,
+            max_pool_size: 0,
             default_pool_size: 2,
-            max_data_conns_per_client: 256,
-            max_udp_sessions_per_proxy: 1024,
             control_send_queue: 256,
             unauth_conns_per_ip: 64,
             udp_packet_size: 64 * 1024,
             pool_wait_timeout_ms: 10_000,
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// 复用流硬顶有效值(0 = 不限 → 1<<24;64 位限定:256KiB×1<<24 = 4TiB)。
+    pub fn mux_streams(&self) -> usize {
+        match self.max_mux_streams {
+            0 => rh_transport::MUX_STREAMS_UNLIMITED,
+            n => n.min(rh_transport::MUX_STREAMS_UNLIMITED),
+        }
+    }
+
+    /// 每客户端并发数据通道有效上限:配额(0=∞)钳制到 mux 顶 -1024,
+    /// 保证应用层永远先于 yamux 干净拒绝(留 1024 给在途未完成 HELLO 的流)。
+    pub fn data_conn_limit(&self) -> usize {
+        let ceiling = self.mux_streams().saturating_sub(1024);
+        match self.max_data_conns_per_client {
+            0 => ceiling,
+            n => n.min(ceiling),
         }
     }
 }

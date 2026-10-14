@@ -96,7 +96,7 @@ impl Default for ChallengeTable {
 
 /// 控制端口 accept 循环。
 pub async fn serve_transport(state: Arc<AppState>, cfg: rh_transport::ServerTransportConfig) {
-    let listener = match rh_transport::listen(&cfg).await {
+    let listener = match rh_transport::listen(&cfg, state.mux_streams.clone()).await {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(error = %e, proto = %cfg.protocol, "control listen failed");
@@ -241,7 +241,8 @@ async fn auth_and_run(
     let session_id = uuid::Uuid::new_v4().to_string();
     let epoch = state.sessions.next_epoch();
     let cancel = CancellationToken::new();
-    let (qtx, qrx) = mpsc::channel::<ServerMessage>(state.cfg.limits.control_send_queue);
+    let (qtx, qrx) =
+        mpsc::channel::<ServerMessage>(state.limits.read().unwrap().control_send_queue);
     let sess = Session::new(latest.id.clone(), session_id.clone(), epoch, cancel, qtx);
     if let Some(old) = state.sessions.register(sess.clone()) {
         info!(client = %latest.name, old_epoch = old.epoch, "session replaced");
@@ -517,7 +518,9 @@ pub async fn route_data_stream(
         .data_conn_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         + 1;
-    if count as usize > state.cfg.limits.max_data_conns_per_client {
+    // 有效上限已钳制到 mux 顶-1024:应用层必然先于 yamux 拒绝,
+    // 不会触发 yamux 的超限 SYN → 终止整条会话
+    if count as usize > state.limits.read().unwrap().data_conn_limit() {
         sess.data_conn_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         return Err(anyhow::anyhow!("data connection limit"));
@@ -563,7 +566,7 @@ pub async fn route_data_stream(
 }
 
 /// 数据通道限额守卫流:流被丢弃即释放该通道的限额占用。
-struct QuotaIo {
+pub(crate) struct QuotaIo {
     inner: rh_transport::BoxedIo,
     sess: Arc<Session>,
 }
@@ -571,8 +574,57 @@ struct QuotaIo {
 impl QuotaIo {
     // 返回装箱 Io 而非 Self(直接可用作 BoxedIo)
     #[allow(clippy::new_ret_no_self)] // 返回装箱 Io(直接可用作 BoxedIo)
-    fn new(inner: rh_transport::BoxedIo, sess: Arc<Session>) -> rh_transport::BoxedIo {
+    pub(crate) fn new(inner: rh_transport::BoxedIo, sess: Arc<Session>) -> rh_transport::BoxedIo {
         Box::new(Self { inner, sess })
+    }
+
+    /// 内部流引用(splice 快路径:剥壳提取裸 TCP;限额语义随原对象生命周期)。
+    pub(crate) fn inner_ref(&self) -> &rh_transport::BoxedIo {
+        &self.inner
+    }
+
+    /// 按所有权剥壳(goal-repair B1:仅 TcpPool→assign_forward 转发路径):
+    /// 返回(内层流, 限额守卫)。守卫释放(或本体 Drop)即递减
+    /// data_conn_count,与 QuotaIo::Drop 完全等价——限额占用期 = 转发期,
+    /// 不得因剥壳提前释放。非 QuotaIo 包装时原样返回(守卫 None)。
+    pub(crate) fn peel(io: rh_transport::BoxedIo) -> (rh_transport::BoxedIo, Option<QuotaGuard>) {
+        // 探测经显式 &dyn Io 接收者(vtable 派发到具体类型;Box 层
+        // 转发实现会让 owned/&Box 接收者解析到 Box<dyn Io> 本体)
+        fn is_quota_io(io: &rh_transport::BoxedIo) -> bool {
+            let dynio: &dyn rh_transport::Io = &**io;
+            dynio.as_any().downcast_ref::<QuotaIo>().is_some()
+        }
+        if !is_quota_io(&io) {
+            return (io, None);
+        }
+        let any = io.into_any_box();
+        let boxed = match any.downcast::<QuotaIo>() {
+            Ok(b) => b,
+            Err(_) => unreachable!("as_any 已确认具体类型为 QuotaIo"),
+        };
+        // 整体移出 Box(移动 Drop 类型的整体是允许的),再经 ManuallyDrop
+        // 拆字段:两字段所有权都转交给返回值,原对象不再 Drop,
+        // data_conn_count 由 QuotaGuard 恰好递减一次。
+        let md = std::mem::ManuallyDrop::new(*boxed);
+        // SAFETY:md 置于 ManuallyDrop,绝不运行 QuotaIo::Drop;
+        // 两个 ptr::read 各自独占地移出字段,无重复释放/双重递减。
+        let inner = unsafe { std::ptr::read(&md.inner) };
+        let sess = unsafe { std::ptr::read(&md.sess) };
+        (inner, Some(QuotaGuard { sess }))
+    }
+}
+
+/// 剥壳后的数据通道限额守卫(goal-repair B1):复刻 QuotaIo::Drop 的
+/// data_conn_count 递减;随转发任务存活,结束即释放占用。
+pub(crate) struct QuotaGuard {
+    sess: Arc<Session>,
+}
+
+impl Drop for QuotaGuard {
+    fn drop(&mut self) {
+        self.sess
+            .data_conn_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -603,6 +655,18 @@ impl tokio::io::AsyncWrite for QuotaIo {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let inner = &mut self.get_mut().inner;
         std::pin::Pin::new(inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        // 限额守卫是透传包装:向量写必须透传,避免上层 writev 优化退化
+        let inner = &mut self.get_mut().inner;
+        std::pin::Pin::new(inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,

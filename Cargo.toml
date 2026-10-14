@@ -30,6 +30,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-log = "0.2"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
 hmac = "0.12"
@@ -47,7 +48,7 @@ rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 quinn = "0.11"
 kcp = "0.6"
-yamux = "0.14"
+yamux = { path = "vendor/yamux" }
 tokio-tungstenite = "0.30"
 snap = "1"
 

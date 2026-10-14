@@ -54,6 +54,9 @@ pub static LOG_SET_LEVEL: std::sync::OnceLock<SetLevelFn> = std::sync::OnceLock:
 
 fn init_tracing(cfg: &config::ServerConfig) {
     use tracing_subscriber::layer::SubscriberExt;
+    // yamux / tungstenite / kcp 等三方 crate 走 log facade;
+    // 不桥接时其协议级错误(如帧错位断连)在生产完全静默
+    let _ = tracing_log::LogTracer::init();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log.level));
     let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
@@ -66,6 +69,28 @@ fn init_tracing(cfg: &config::ServerConfig) {
         }
     };
     let _ = LOG_SET_LEVEL.set(Box::new(set));
+}
+
+/// fd 软上限自检:高并发转发在 ulimit=1024 下会先于测试目标失败,
+/// 且报错为 No file descriptors available,极难归因;启动时提前告警。
+fn check_fd_limit() {
+    if cfg!(target_os = "linux") {
+        if let Ok(txt) = std::fs::read_to_string("/proc/self/limits") {
+            for line in txt.lines() {
+                if let Some(rest) = line.strip_prefix("Max open files") {
+                    if let Some(soft) = rest.split_whitespace().next() {
+                        let soft: i64 = soft.parse().unwrap_or(-1);
+                        if soft >= 0 && soft < 4096 {
+                            tracing::warn!(
+                                soft_limit = soft,
+                                "low open-files ulimit; high-concurrency forwarding will fail (raise with LimitNOFILE/ulimit -n)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 首次启动引导:users 表为空时创建 admin 账号与随机密码。
@@ -186,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("config {:?}: {e}", cli.config))?;
     let cfg = config::ServerConfig::load(&cfg_path)?;
     init_tracing(&cfg);
+    check_fd_limit();
     let db_dir = cfg_path
         .parent()
         .map(|p| p.to_path_buf())

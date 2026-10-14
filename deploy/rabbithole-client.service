@@ -10,7 +10,8 @@ Group=rabbithole
 ExecStart=/usr/local/bin/rh-client --config /etc/rabbithole/client.toml
 Restart=always
 RestartSec=3
-LimitNOFILE=65536
+# 需内核 fs.nr_open >= 1000000(默认 1048576)
+LimitNOFILE=1000000
 NoNewPrivileges=true
 
 [Install]

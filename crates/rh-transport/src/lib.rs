@@ -11,9 +11,11 @@
 pub mod compress;
 pub mod kcp;
 pub mod mux;
-pub use mux::{wrap_stream_as_client, wrap_stream_as_server};
+pub use mux::{wrap_stream_as_client, wrap_stream_as_server, MUX_STREAMS_UNLIMITED};
 pub mod proxy_dial;
 pub mod quic;
+#[cfg(target_os = "linux")]
+pub mod splice;
 pub mod tcp;
 pub mod tls;
 pub mod ws;
@@ -26,10 +28,126 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub use compress::compress_stream;
 
 /// 底层 IO 对象:实现 AsyncRead + AsyncWrite + Send + Unpin 即可。
-pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
+/// `as_any` 供数据面做具体类型反射(splice 资格判定:提取裸 TCP);
+/// `into_any_box` 供按具体类型取回所有权(mux 流零拷贝路径降级判定)。
+pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    fn into_any_box(self: Box<Self>) -> Box<dyn std::any::Any>;
+}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn into_any_box(self: Box<T>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
 
 pub type BoxedIo = Box<dyn Io>;
+
+/// 取消信号(共享):完成即结束转发。规则禁用/删除级联用;
+/// splice 泵与 mux chunk 中继共用同一形态。
+pub type CancelFuture = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
+/// JoinHandle 守卫(goal-repair A1):被 drop 时 abort 子任务;
+/// 实现 Future(以 `&mut` 等待,句柄不移出守卫)。
+///
+/// 中继父任务的正确取消形态:两个方向照旧 `tokio::spawn`,父 future 以
+/// `join_relay_pumps(&mut g1, &mut g2)` 等待——父取消 → join future 被 drop →
+/// 守卫 Drop → 双向子泵终止。禁止把句柄 move 进 join future(那会 detach)。
+pub struct AbortOnDropHandle {
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// 任务是否以 panic 结束(JoinError 的可观测面;正常完成/取消/未完成为 false)。
+    panicked: bool,
+}
+
+impl AbortOnDropHandle {
+    pub fn new(h: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            task: Some(h),
+            panicked: false,
+        }
+    }
+
+    /// 已完成任务是否发生 panic。守卫吸收 JoinError(不向上传播 panic),
+    /// 但中继收尾必须能区分「正常结束」与「panic 结束」——后者要求立即
+    /// 终止对向泵(见 [`join_relay_pumps`]),否则单向 panic 会让对向永存。
+    pub fn panicked(&self) -> bool {
+        self.panicked
+    }
+}
+
+impl Drop for AbortOnDropHandle {
+    fn drop(&mut self) {
+        if let Some(h) = self.task.take() {
+            h.abort();
+        }
+    }
+}
+
+impl std::future::Future for AbortOnDropHandle {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        // JoinHandle: Unpin——无结构性固定问题
+        let Some(h) = self.task.as_mut() else {
+            return std::task::Poll::Ready(());
+        };
+        match std::pin::Pin::new(h).poll(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                self.task = None; // 已完成:Drop 不再 abort
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Ready(Err(join_err)) => {
+                // panic(或取消,JoinError::is_cancelled)吸收为状态:
+                // 不向上传播,也不让对向泵无人终止
+                self.panicked = join_err.is_panic();
+                self.task = None;
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// 中继父任务收尾(全部 relay 共用):双向子泵 join,附加两条收敛保证:
+/// * 单向 panic → 立即返回(守卫 Drop → abort 对向泵)——单向故障不得
+///   让对向泵永存(对向可能在等一个永远不来的 EOF);
+/// * 双向正常 → 等两向各自自然结束(半关闭语义:一向 EOF 后对向继续服务)。
+///
+/// 父任务取消(本 future 被 drop)→ 守卫 Drop → 双向 abort(A1 语义不变)。
+pub async fn join_relay_pumps(g1: &mut AbortOnDropHandle, g2: &mut AbortOnDropHandle) {
+    let panicked = tokio::select! {
+        _ = &mut *g1 => g1.panicked(),
+        _ = &mut *g2 => g2.panicked(),
+    };
+    if panicked {
+        // panic 侧守卫已完成(不再 abort);对向守卫随本函数返回被 drop → abort
+        return;
+    }
+    // 先完成的一向是正常结束:等对向自然结束(已完成的立即返回)
+    let _ = tokio::join!(g1, g2);
+}
+
+/// chunk 中继限速预留(预留/消费/退款三态;goal-repair A5 送达计费合同):
+/// * `consume(n)` = 消费 n 字节额度(不可退);
+/// * drop 未消费部分 = 全额退还。
+pub trait ChunkReservation: Send {
+    fn consume(&mut self, n: usize);
+}
+
+/// 限速器:`reserve(n)` 等待凑足 n 字节额度。
+/// 等待期间 future 被 drop(取消)不得丢已扣令牌(适配方须用
+/// 取消安全原语实现,如 rh-core `TokenBucket::acquire_reserved`)。
+pub trait ChunkLimiter: Send + Sync {
+    fn reserve(&self, n: usize) -> futures::future::BoxFuture<'static, Box<dyn ChunkReservation>>;
+}
 
 /// 在真实流之前回放一段残留字节。
 /// read_frame 可能一次读入多帧;换手给下一处理者时必须把
@@ -47,6 +165,31 @@ impl PrependedIo {
             prefix,
             pos: 0,
         })
+    }
+
+    /// 按所有权剥壳(goal-repair B1):若 `io` 是 PrependedIo,拆出
+    /// (剩余未消费前缀, 内层流);否则返回(空 vec, 原流)。
+    /// 前缀是「通道→用户」方向的先行数据,调用方必须原样最先交付,不得丢弃。
+    pub fn peel(io: BoxedIo) -> (Vec<u8>, BoxedIo) {
+        // 探测经显式 &dyn Io 接收者:方法解析唯一落到 dyn Io 的 vtable
+        // 派发(具体类型的 as_any),不受 Box 层转发实现影响
+        // (owned/&Box 接收者会解析到 impl Io for Box<dyn Io>,
+        // 见 prepended_peel_roundtrip 取证)。
+        fn is_prepended(io: &BoxedIo) -> bool {
+            let dynio: &dyn Io = &**io;
+            dynio.as_any().downcast_ref::<PrependedIo>().is_some()
+        }
+        if !is_prepended(&io) {
+            return (Vec::new(), io);
+        }
+        let any = io.into_any_box();
+        match any.downcast::<PrependedIo>() {
+            Ok(boxed) => {
+                let p = *boxed;
+                (p.prefix[p.pos..].to_vec(), p.inner)
+            }
+            Err(_) => unreachable!("as_any 已确认具体类型为 PrependedIo"),
+        }
     }
 }
 
@@ -75,6 +218,19 @@ impl AsyncWrite for PrependedIo {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let inner = &mut self.get_mut().inner;
         std::pin::Pin::new(inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        // 前缀回放只发生在读侧;写侧必须透传向量写,否则 yamux 的
+        // 「帧头+帧体一次写出」在包装层退化为首个非空分片的标量写
+        let inner = &mut self.get_mut().inner;
+        std::pin::Pin::new(inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
@@ -343,22 +499,27 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// 服务端:按配置监听。
-pub async fn listen(cfg: &ServerTransportConfig) -> std::io::Result<TransportListener> {
+/// 服务端:按配置监听。mux_streams 为并发流上限的有效值(0 已折算为
+/// MUX_STREAMS_UNLIMITED),由调用方持有以便热改;yamux 路径对新连接即时生效,
+/// QUIC 在端点构建时固化(改动需重启)。
+pub async fn listen(
+    cfg: &ServerTransportConfig,
+    mux_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<TransportListener> {
     let local_addr;
     let inner = match cfg.protocol {
         Protocol::Tcp | Protocol::Tls | Protocol::Ws | Protocol::Wss => {
-            let l = tcp::listen_stream(cfg).await?;
+            let l = tcp::listen_stream(cfg, mux_streams).await?;
             local_addr = l.local_addr()?;
             ListenerInner::Tcp(l)
         }
         Protocol::Quic => {
-            let e = quic::listen(cfg)?;
+            let e = quic::listen(cfg, &mux_streams)?;
             local_addr = e.local;
             ListenerInner::Quic(e)
         }
         Protocol::Kcp => {
-            let l = kcp::listen(cfg).await?;
+            let l = kcp::listen(cfg, mux_streams).await?;
             local_addr = l.local_addr();
             ListenerInner::Kcp(l)
         }
@@ -389,5 +550,167 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
         }
         Protocol::Quic => quic::connect(cfg).await,
         Protocol::Kcp => kcp::connect(cfg).await,
+    }
+}
+
+#[cfg(test)]
+mod vectored_tests {
+    use super::*;
+    use std::io::IoSlice;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Default, Debug)]
+    struct Calls {
+        scalar: usize,
+        vectored: usize,
+        last_total: usize,
+    }
+
+    struct VectoredSink(Arc<Mutex<Calls>>);
+
+    impl AsyncRead for VectoredSink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for VectoredSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut log = self.0.lock().unwrap();
+            log.scalar += 1;
+            log.last_total = buf.len();
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let n: usize = bufs.iter().map(|b| b.len()).sum();
+            let mut log = self.0.lock().unwrap();
+            log.vectored += 1;
+            log.last_total = n;
+            Poll::Ready(Ok(n))
+        }
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // B1 探针:PrependedIo 剥壳必须取回残留前缀与内层流。
+    #[test]
+    fn prepended_peel_roundtrip() {
+        let (a, _b) = tokio::io::duplex(64);
+        let io: BoxedIo = PrependedIo::wrap(Box::new(a), vec![9u8; 8]);
+        let (p, inner) = PrependedIo::peel(io);
+        let _ = inner;
+        assert_eq!(p, vec![9u8; 8]);
+        // 内层流不再是 PrependedIo
+        assert!(inner.as_any().downcast_ref::<PrependedIo>().is_none());
+    }
+
+    // 回归:PrependedIo 曾只转发标量写,导致 yamux 帧头+帧体向量写
+    // 退化为「只写 12B 帧头」(实测复现)。包装层必须透传向量写与能力位。
+    #[test]
+    fn prepended_io_forwards_vectored_write() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let io: BoxedIo = PrependedIo::wrap(Box::new(VectoredSink(calls.clone())), vec![0u8; 4]);
+        let mut io = io;
+
+        assert!(io.is_write_vectored(), "能力位必须透传");
+
+        let noop = std::task::Waker::noop();
+        let mut cx = Context::from_waker(noop);
+        let header = [0u8; 12];
+        let body = vec![7u8; 65536];
+        let offered = header.len() + body.len();
+
+        let n = match Pin::new(&mut io)
+            .poll_write_vectored(&mut cx, &[IoSlice::new(&header), IoSlice::new(&body)])
+        {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("unexpected poll result: {other:?}"),
+        };
+
+        let log = calls.lock().unwrap();
+        assert_eq!(n, offered, "一次向量写应带走全部数据");
+        assert_eq!(log.vectored, 1, "应恰好一次向量写");
+        assert_eq!(log.scalar, 0, "不得退化为标量写");
+        assert_eq!(log.last_total, offered);
+    }
+}
+
+#[cfg(test)]
+mod relay_join_tests {
+    use super::*;
+
+    /// final-gaps:join_relay_pumps 的收敛合同可移植锁定(splice_relay
+    /// 收尾改用本函数;mux/copy 内联同款逻辑)。单泵 panic → 对向泵
+    /// 立即 abort(不永存);双向正常 → 等两向自然结束。
+    /// 这是在 darwin 上可运行的对 Linux-gated splice panic 收敛修复的
+    /// 直接证据(splice.rs 内端到端回归 splice_sibling_aborted_on_pump_panic
+    /// 需 Linux 测试床运行)。
+    #[tokio::test]
+    async fn join_relay_pumps_aborts_sibling_on_panic() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sibling_killed = Arc::new(AtomicBool::new(false));
+        let s2 = sibling_killed.clone();
+
+        let g1 = AbortOnDropHandle::new(tokio::spawn(async move {
+            panic!("injected pump panic");
+        }));
+        // 对向泵:阻塞在永远不会完成的等待(panic 泵不做任何 teardown
+        // 时它必须被 abort,否则永存)
+        let g2 = AbortOnDropHandle::new(tokio::spawn(async move {
+            futures::future::pending::<()>().await;
+            s2.store(true, Ordering::SeqCst); // 不可达
+        }));
+
+        let mut g1 = g1;
+        let mut g2 = g2;
+        tokio::time::timeout(std::time::Duration::from_secs(3), join_relay_pumps(&mut g1, &mut g2))
+            .await
+            .expect("单泵 panic 后 join_relay_pumps 必须立即返回(对向不得永存)");
+    }
+
+    /// 双向正常结束:等两向都自然完成(半关闭语义不提前打断)。
+    #[tokio::test]
+    async fn join_relay_pumps_waits_both_on_clean_exit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let second_finished = Arc::new(AtomicBool::new(false));
+        let s2 = second_finished.clone();
+
+        let g1 = AbortOnDropHandle::new(tokio::spawn(async move {}));
+        let g2 = AbortOnDropHandle::new(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            s2.store(true, Ordering::SeqCst);
+        }));
+
+        let mut g1 = g1;
+        let mut g2 = g2;
+        tokio::time::timeout(std::time::Duration::from_secs(3), join_relay_pumps(&mut g1, &mut g2))
+            .await
+            .expect("双向正常结束必须等两向完成");
+        assert!(
+            second_finished.load(Ordering::SeqCst),
+            "先完成的正常泵不得提前打断对向(半关闭语义)"
+        );
     }
 }

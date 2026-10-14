@@ -29,10 +29,16 @@ allow_ports = ["10000-40000"]
 max_services_per_client = 32
 
 [limits]
-max_data_conns_per_client = 256
-pool_wait_timeout_ms = 8000
-default_pool_size = 4
-udp_packet_size = 65536
+# 并发上限默认全部 0 = 不限(交由系统层 fd/内存/端口兜底);均可在控制台热改。
+# max_mux_streams = 0            # 单复用连接并发流硬顶(0=不限;新会话生效;QUIC 需重启)
+# max_data_conns_per_client = 0  # 每客户端并发数据通道(0=不限;立即生效;自动钳制到流上限-1024)
+# max_udp_sessions_per_proxy = 0 # 每规则 UDP 会话数(0=不限;立即生效)
+# max_pool_size = 0              # 每规则池深上限(0=不限;仅新建/更新规则生效)
+default_pool_size = 2
+# control_send_queue = 256       # 控制帧发送队列(满则背压;新会话生效)
+# unauth_conns_per_ip = 64       # 每 IP 认证窗口并发(0=不限;防匿名洪水,不建议关)
+# udp_packet_size = 65536        # UDP 报文缓冲(实际取 max(1500, 此值))
+# pool_wait_timeout_ms = 10000   # 用户连接等池补拨总时长
 
 [metrics]
 # 容器内需 0.0.0.0 才能经端口映射抓取(-p 9100:9100);端口无鉴权,仅在内网/加固后暴露

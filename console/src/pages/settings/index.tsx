@@ -1,5 +1,5 @@
 import { changePassword, getServerConfig, putServerConfig } from '@/api/rabbithole';
-import type { ServerConfigUpdate } from '@/api/rabbithole';
+import type { LimitsConfig, ServerConfigUpdate } from '@/api/rabbithole';
 import { useAuthStore } from '@/stores/auth';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { history, useLocation } from '@umijs/max';
@@ -25,12 +25,16 @@ interface PortsForm {
   max_services_per_client: number | null;
 }
 
+/** 并发与限流:0 = 不限(池深默认值除外)。 */
+type LimitsForm = LimitsConfig;
+
 /** 服务器配置(热生效子集):SSH 网关 / 端口策略 / 日志级别 / 公钥白名单。 */
 const ServerConfigCard: React.FC = () => {
   const queryClient = useQueryClient();
   const { message } = App.useApp();
   const [sshForm] = Form.useForm<SshForm>();
   const [portsForm] = Form.useForm<PortsForm>();
+  const [limitsForm] = Form.useForm<LimitsForm>();
   const [logLevel, setLogLevel] = React.useState('info');
   const [keys, setKeys] = React.useState('');
 
@@ -52,9 +56,10 @@ const ServerConfigCard: React.FC = () => {
       allow_ports: h.allow_ports.join(','),
       max_services_per_client: h.max_services_per_client,
     });
+    limitsForm.setFieldsValue({ ...h.limits });
     setLogLevel(h.log_level || 'info');
     setKeys(cfgQ.data.authorized_keys ?? '');
-  }, [cfgQ.data, sshForm, portsForm]);
+  }, [cfgQ.data, sshForm, portsForm, limitsForm]);
 
   const saveMut = useMutation({
     mutationFn: (u: ServerConfigUpdate) => putServerConfig(u),
@@ -71,6 +76,7 @@ const ServerConfigCard: React.FC = () => {
   function saveAll() {
     const ssh = sshForm.getFieldsValue();
     const ports = portsForm.getFieldsValue();
+    const lim = limitsForm.getFieldsValue();
     saveMut.mutate({
       ssh_gateway: {
         enabled: !!ssh.enabled,
@@ -83,6 +89,17 @@ const ServerConfigCard: React.FC = () => {
           .map((x: string) => x.trim())
           .filter(Boolean),
         max_services_per_client: ports.max_services_per_client ?? 0,
+      },
+      limits: {
+        max_mux_streams: lim.max_mux_streams ?? 0,
+        max_data_conns_per_client: lim.max_data_conns_per_client ?? 0,
+        max_udp_sessions_per_proxy: lim.max_udp_sessions_per_proxy ?? 0,
+        max_pool_size: lim.max_pool_size ?? 0,
+        default_pool_size: lim.default_pool_size ?? 2,
+        control_send_queue: lim.control_send_queue ?? 256,
+        unauth_conns_per_ip: lim.unauth_conns_per_ip ?? 64,
+        udp_packet_size: lim.udp_packet_size ?? 0,
+        pool_wait_timeout_ms: lim.pool_wait_timeout_ms ?? 10000,
       },
       log: { level: logLevel },
       authorized_keys: keys,
@@ -147,6 +164,66 @@ const ServerConfigCard: React.FC = () => {
                 style={{ width: 160 }}
                 value={logLevel}
               />
+            </Form.Item>
+          </Form>
+          <Form form={limitsForm} labelCol={{ span: 6 }} layout="horizontal" wrapperCol={{ span: 14 }}>
+            <Typography.Title level={5}>并发与限流</Typography.Title>
+            <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+              默认全部不设限(0 = 不限),并发上限交由系统层(fd / 内存 / 端口)决定。标「新会话生效」的项对已接入客户端在下一次重连后应用;QUIC 传输的流上限需重启服务端。
+            </Typography.Paragraph>
+            <Form.Item
+              label={<InfoLabel info="单条复用连接(yamux/QUIC)上的并发流硬顶,数据通道即流;0 = 不限。新会话生效" title="复用流上限" />}
+              name="max_mux_streams"
+            >
+              <InputNumber max={16777216} min={0} precision={0} style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="每客户端并发数据通道(池+在途+转发中);0 = 不限。立即生效;实际值自动钳制到复用流上限-1024" title="每客户端并发通道" />}
+              name="max_data_conns_per_client"
+            >
+              <InputNumber min={0} precision={0} style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="每条 UDP 规则的会话映射数(按源地址);0 = 不限。立即生效,超限丢新会话包、既有会话不受影响" title="每规则 UDP 会话" />}
+              name="max_udp_sessions_per_proxy"
+            >
+              <InputNumber min={0} precision={0} style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="每 IP 同时处于认证窗口的连接数,防匿名洪水;0 = 不限(不建议)。立即生效" title="认证窗口并发/IP" />}
+              name="unauth_conns_per_ip"
+            >
+              <InputNumber min={0} precision={0} style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="每规则预热池深度上限;0 = 不限。仅对新建/更新的规则生效" title="池深上限" />}
+              name="max_pool_size"
+            >
+              <InputNumber max={255} min={0} precision={0} style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="规则未指定池深时使用的默认值(0 = 不预热)" title="默认池深" />}
+              name="default_pool_size"
+            >
+              <InputNumber max={255} min={0} precision={0} style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="控制连接发送队列深度,满则背压等待(不拒连);须 ≥ 16。新会话生效" title="控制帧队列" />}
+              name="control_send_queue"
+            >
+              <InputNumber max={65536} min={16} precision={0} style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="UDP 报文缓冲字节上限;0 = 用默认 64KB;范围 1500-65536。立即生效" title="UDP 包缓冲" />}
+              name="udp_packet_size"
+            >
+              <InputNumber max={65536} min={0} precision={0} style={{ width: 160 }} />
+            </Form.Item>
+            <Form.Item
+              label={<InfoLabel info="用户连接等待池补拨的总时长(毫秒);范围 100-600000。立即生效" title="等池超时(ms)" />}
+              name="pool_wait_timeout_ms"
+            >
+              <InputNumber max={600000} min={100} precision={0} style={{ width: 160 }} />
             </Form.Item>
           </Form>
           <Button

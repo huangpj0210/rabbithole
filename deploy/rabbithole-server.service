@@ -10,7 +10,8 @@ Group=rabbithole
 ExecStart=/usr/local/bin/rh-server --config /etc/rabbithole/server.toml
 Restart=on-failure
 RestartSec=3
-LimitNOFILE=65536
+# 需内核 fs.nr_open >= 1000000(默认 1048576)
+LimitNOFILE=1000000
 # 硬化(按需调整)
 NoNewPrivileges=true
 ProtectSystem=strict

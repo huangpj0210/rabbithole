@@ -70,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    // 三方 crate(yamux/tungstenite/kcp)走 log facade,桥接到 tracing
+    let _ = tracing_log::LogTracer::init();
     anyhow::ensure!(
         !cfg.client_id.is_empty(),
         "client_id 为空(配置文件 / RH_CLIENT_ID / --id)"

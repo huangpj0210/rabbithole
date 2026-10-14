@@ -672,7 +672,10 @@ async fn list_services(
     };
     let mut out = Vec::new();
     for (id, client_id, mut spec) in rows {
-        normalize_spec(&mut spec, state.cfg.limits.default_pool_size);
+        {
+            let l = state.limits.read().unwrap();
+            normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
+        }
         let (status, reason) = match state.proxies.get(id as u64) {
             Some(rt) => {
                 let (st, r) = rt.snapshot_state().await;
@@ -751,7 +754,10 @@ async fn create_service_inner(
     {
         return Err((2001, "名称须为 1-64 位字母/数字/下划线/连字符".into()));
     }
-    normalize_spec(spec, state.cfg.limits.default_pool_size);
+    {
+        let l = state.limits.read().unwrap();
+        normalize_spec(spec, l.default_pool_size, l.max_pool_size);
+    }
     // 密钥完全服务端管理:创建即生成随机凭据(入参提供的一律覆盖),
     // 库中密钥访问规则永不为空,也不存在人编口令
     if let Some(cfg) = spec.secret_cfg_mut() {
@@ -917,7 +923,10 @@ async fn update_service(
     {
         return err(2001, "名称须为 1-64 位字母/数字/下划线/连字符");
     }
-    normalize_spec(&mut spec, state.cfg.limits.default_pool_size);
+    {
+        let l = state.limits.read().unwrap();
+        normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
+    }
     // 实体读取在串行域内进行,避免与并发管理操作竞态
     let Some(client_id) = state
         .db
@@ -1756,7 +1765,7 @@ async fn stats_overview(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 .unwrap_or(false)
         })
         .count();
-    let totals = *state.metrics.totals.lock().unwrap();
+    let totals = state.metrics.totals_snapshot();
     ok(json!({
         "clients_total": clients.len(),
         "clients_online": state.sessions.count_online(),
@@ -1818,6 +1827,8 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
             "log_level": hot.log_level,
             "ssh_gateway": serde_json::to_value(&hot.ssh_gateway).unwrap_or(serde_json::Value::Null),
             "metrics": serde_json::to_value(&hot.metrics).unwrap_or(serde_json::Value::Null),
+            "limits": serde_json::to_value(&*state.limits.read().unwrap())
+                .unwrap_or(serde_json::Value::Null),
         },
         "authorized_keys": authorized_keys,
     }))
@@ -1834,9 +1845,26 @@ struct ServerConfigUpdate {
     ssh_gateway: Option<SshGatewayUpdate>,
     #[serde(default)]
     metrics: Option<MetricsUpdate>,
+    #[serde(default)]
+    limits: Option<LimitsUpdate>,
     /// authorized_keys 文件全文(空串 = 清空;null = 不动)。
     #[serde(default)]
     authorized_keys: Option<String>,
+}
+
+/// [limits] 热改子集:全部字段可选,0 = 不限(max_pool_size 除外,见字段)。
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LimitsUpdate {
+    max_mux_streams: Option<usize>,
+    max_data_conns_per_client: Option<usize>,
+    max_udp_sessions_per_proxy: Option<usize>,
+    max_pool_size: Option<u8>,
+    default_pool_size: Option<u8>,
+    control_send_queue: Option<usize>,
+    unauth_conns_per_ip: Option<usize>,
+    udp_packet_size: Option<usize>,
+    pool_wait_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1938,6 +1966,35 @@ async fn put_server_config(
                 && !ktype.starts_with("sk-")
             {
                 return err(1002, &format!("authorized_keys 第 {} 行不是公钥", i + 1));
+            }
+        }
+    }
+
+    if let Some(l) = &req.limits {
+        if let Some(n) = l.max_mux_streams {
+            if n > rh_transport::MUX_STREAMS_UNLIMITED {
+                return err(
+                    1002,
+                    &format!(
+                        "max_mux_streams 须为 0 或 ≤ {}",
+                        rh_transport::MUX_STREAMS_UNLIMITED
+                    ),
+                );
+            }
+        }
+        if let Some(n) = l.control_send_queue {
+            if n < 16 {
+                return err(1002, "control_send_queue 须 ≥ 16(过小会让协议帧排队抖动)");
+            }
+        }
+        if let Some(n) = l.udp_packet_size {
+            if n != 0 && !(1500..=65536).contains(&n) {
+                return err(1002, "udp_packet_size 须为 0(=用默认)或 1500-65536");
+            }
+        }
+        if let Some(n) = l.pool_wait_timeout_ms {
+            if !(100..=600_000).contains(&n) {
+                return err(1002, "pool_wait_timeout_ms 须为 100-600000");
             }
         }
     }
@@ -2053,6 +2110,81 @@ async fn put_server_config(
             applied.push("authorized_keys".into());
         }
     }
+    // limits:独立同步锁(enter_unauth 等非 async 路径共用);
+    // 生效时机:data_conns/unauth/udp_sessions/池超时/包大小 = 立即,
+    // mux 顶与发送队列 = 新会话,池上限 = 新建/更新的规则
+    if let Some(l) = req.limits {
+        let mut lim = state.limits.write().unwrap();
+        let set = |cond: bool, name: &str, applied: &mut Vec<String>| {
+            if cond {
+                applied.push(format!("limits.{name}"));
+            }
+        };
+        if let Some(v) = l.max_mux_streams {
+            set(lim.max_mux_streams != v, "max_mux_streams", &mut applied);
+            lim.max_mux_streams = v;
+        }
+        if let Some(v) = l.max_data_conns_per_client {
+            set(
+                lim.max_data_conns_per_client != v,
+                "max_data_conns_per_client",
+                &mut applied,
+            );
+            lim.max_data_conns_per_client = v;
+        }
+        if let Some(v) = l.max_udp_sessions_per_proxy {
+            set(
+                lim.max_udp_sessions_per_proxy != v,
+                "max_udp_sessions_per_proxy",
+                &mut applied,
+            );
+            lim.max_udp_sessions_per_proxy = v;
+        }
+        if let Some(v) = l.max_pool_size {
+            set(lim.max_pool_size != v, "max_pool_size", &mut applied);
+            lim.max_pool_size = v;
+        }
+        if let Some(v) = l.default_pool_size {
+            set(
+                lim.default_pool_size != v,
+                "default_pool_size",
+                &mut applied,
+            );
+            lim.default_pool_size = v;
+        }
+        if let Some(v) = l.control_send_queue {
+            set(
+                lim.control_send_queue != v,
+                "control_send_queue",
+                &mut applied,
+            );
+            lim.control_send_queue = v;
+        }
+        if let Some(v) = l.unauth_conns_per_ip {
+            set(
+                lim.unauth_conns_per_ip != v,
+                "unauth_conns_per_ip",
+                &mut applied,
+            );
+            lim.unauth_conns_per_ip = v;
+        }
+        if let Some(v) = l.udp_packet_size {
+            set(lim.udp_packet_size != v, "udp_packet_size", &mut applied);
+            lim.udp_packet_size = v;
+        }
+        if let Some(v) = l.pool_wait_timeout_ms {
+            set(
+                lim.pool_wait_timeout_ms != v,
+                "pool_wait_timeout_ms",
+                &mut applied,
+            );
+            lim.pool_wait_timeout_ms = v;
+        }
+        // mux 顶热值同步给 transport accept 泵(新会话生效)
+        state
+            .mux_streams
+            .store(lim.mux_streams(), std::sync::atomic::Ordering::Relaxed);
+    }
     if ssh_changed {
         let _ = state.ssh_watch.0.send(u64::MAX);
     }
@@ -2067,6 +2199,7 @@ async fn put_server_config(
         disk.log.level = hot.log_level.clone();
         disk.ssh_gateway = hot.ssh_gateway.clone();
         disk.metrics = hot.metrics.clone();
+        disk.limits = state.limits.read().unwrap().clone();
         disk.web.jwt_secret = state.cfg.web.jwt_secret.clone(); // 保留原值(未脱敏源)
         persist_err = match toml::to_string_pretty(&disk) {
             Ok(text) => {

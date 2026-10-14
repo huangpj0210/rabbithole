@@ -47,6 +47,12 @@ pub struct AppState {
     unauth_conns: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
     /// 热生效配置子集(网页可管:端口策略/日志级别/SSH 网关)。
     pub hot: Arc<RwLock<HotConfig>>,
+    /// 热生效 limits(控制台可改):并发/限流上限的运行时唯一真源。
+    /// 同步锁:enter_unauth 等非 async 路径也要读。
+    pub limits: Arc<std::sync::RwLock<crate::config::LimitsConfig>>,
+    /// 复用流上限有效值(limits.max_mux_streams 折算,0 → 不限制),
+    /// transport accept 泵每连接读取 → 热改对新会话生效。
+    pub mux_streams: Arc<std::sync::atomic::AtomicUsize>,
     /// F2 每客户端用量/配额缓存。
     pub client_usage: Arc<dashmap::DashMap<String, Arc<ClientUsage>>>,
     /// M3 服务端终结证书(SNI 匹配;certs 表变更后整体重建)。
@@ -131,6 +137,9 @@ pub struct ClientUsage {
     /// 流量上限击穿标记(置位后相关连接在下一轮 IO 即关)。
     pub flow_cut: AtomicBool,
     pub quota: std::sync::RwLock<ClientQuota>,
+    /// flow_limit 的原子缓存(配额写入时同步):数据面每块字节都要读,
+    /// 避免 RwLock 热读;与 quota RwLock 由 set_quota 写侧保持一致。
+    flow_limit_cache: AtomicI64,
     /// 服务端侧客户端级限速桶(随 rate_limit 重建)。
     pub rate_bucket: std::sync::RwLock<Option<Arc<rh_core::TokenBucket>>>,
 }
@@ -142,6 +151,7 @@ impl Default for ClientUsage {
             bytes: AtomicU64::new(0),
             flow_cut: AtomicBool::new(false),
             quota: std::sync::RwLock::new(ClientQuota::default()),
+            flow_limit_cache: AtomicI64::new(0),
             rate_bucket: std::sync::RwLock::new(None),
         }
     }
@@ -160,6 +170,8 @@ impl ClientUsage {
             self.flow_cut
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
+        self.flow_limit_cache
+            .store(q.flow_limit, std::sync::atomic::Ordering::Relaxed);
         *cur = q;
     }
 
@@ -169,7 +181,9 @@ impl ClientUsage {
             .bytes
             .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
             + n;
-        let limit = self.quota.read().unwrap().flow_limit;
+        let limit = self
+            .flow_limit_cache
+            .load(std::sync::atomic::Ordering::Relaxed);
         if limit > 0 && total >= limit as u64 {
             self.flow_cut
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -194,13 +208,15 @@ impl Clone for AppState {
             client_locks: self.client_locks.clone(),
             metrics: self.metrics.clone(),
             shutdown: self.shutdown.clone(),
+            hot: self.hot.clone(),
+            limits: self.limits.clone(),
+            mux_streams: self.mux_streams.clone(),
             relay_pairs: self.relay_pairs.clone(),
             udp_relays: self.udp_relays.clone(),
             nathole: self.nathole.clone(),
             login_limiter: self.login_limiter.clone(),
             web_jwt_secret: self.web_jwt_secret.clone(),
             unauth_conns: self.unauth_conns.clone(),
-            hot: self.hot.clone(),
             client_usage: self.client_usage.clone(),
             certs: self.certs.clone(),
             ssh_watch: (self.ssh_watch.0.clone(), self.ssh_watch.1.clone()),
@@ -268,6 +284,10 @@ impl AppState {
         let metrics = Arc::new(Metrics::new());
         let cfg = Arc::new(cfg);
         let hot = Arc::new(RwLock::new(HotConfig::from_cfg(&cfg)));
+        let limits = Arc::new(std::sync::RwLock::new(cfg.limits.clone()));
+        let mux_streams = Arc::new(std::sync::atomic::AtomicUsize::new(
+            cfg.limits.mux_streams(),
+        ));
         let proxies = Arc::new(ProxyManager::new(cfg.clone(), hot.clone()));
         let (ssh_tx, ssh_rx) = tokio::sync::watch::channel(0u64);
         let jwt_secret = cfg
@@ -288,6 +308,8 @@ impl AppState {
             metrics,
             shutdown: CancellationToken::new(),
             hot,
+            limits,
+            mux_streams,
             client_usage: Arc::new(dashmap::DashMap::new()),
             certs: Arc::new(RwLock::new(Vec::new())),
             ssh_watch: (ssh_tx, Arc::new(ssh_rx)),
@@ -350,9 +372,12 @@ impl AppState {
         self.metrics_task.lock().await.is_some()
     }
 
-    /// 认证窗口进入:超过每 IP 上限返回 false。
+    /// 认证窗口进入:超过每 IP 上限返回 false(0 = 不限)。
     pub fn enter_unauth(&self, ip: &IpAddr) -> bool {
-        let limit = self.cfg.limits.unauth_conns_per_ip;
+        let limit = self.limits.read().unwrap().unauth_conns_per_ip;
+        if limit == 0 {
+            return true;
+        }
         let mut g = self.unauth_conns.lock().unwrap();
         let c = g.entry(*ip).or_insert(0);
         if *c >= limit {
@@ -391,8 +416,14 @@ pub struct Metrics {
     /// F1 全局字节计量(用户侧口径,含请求/响应头)。
     pub bytes_in_total: prometheus::IntCounter,
     pub bytes_out_total: prometheus::IntCounter,
-    /// 汇总(控制台 overview)。
-    pub totals: std::sync::Mutex<Totals>,
+    /// goal-repair B1/B7 可观测性:数据面路径选择计数
+    /// (label path = chunk | splice | copy;命中/回落诊断)。
+    pub relay_path_total: prometheus::IntCounterVec,
+    /// 汇总(控制台 overview)。原子化:数据面每块字节都要经过这里,
+    /// 全局互斥锁曾是所有转发连接的串行点。
+    pub conns_current: std::sync::atomic::AtomicI64,
+    pub console_bytes_in: std::sync::atomic::AtomicU64,
+    pub console_bytes_out: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -416,18 +447,45 @@ impl Metrics {
             IntCounter::new("rabbithole_bytes_in_total", "bytes received from users").unwrap();
         let bytes_out_total =
             IntCounter::new("rabbithole_bytes_out_total", "bytes sent to users").unwrap();
+        let relay_path_total = prometheus::IntCounterVec::new(
+            Opts::new(
+                "rabbithole_relay_path_total",
+                "data-plane relay path selection (chunk/splice/copy)",
+            ),
+            &["path"],
+        )
+        .unwrap();
         let _ = registry.register(Box::new(connections.clone()));
         let _ = registry.register(Box::new(client_online.clone()));
         let _ = registry.register(Box::new(bytes_in_total.clone()));
         let _ = registry.register(Box::new(bytes_out_total.clone()));
+        let _ = registry.register(Box::new(relay_path_total.clone()));
         Self {
             registry,
             connections,
             client_online,
             bytes_in_total,
             bytes_out_total,
-            totals: std::sync::Mutex::new(Totals::default()),
+            relay_path_total,
+            conns_current: std::sync::atomic::AtomicI64::new(0),
+            console_bytes_in: std::sync::atomic::AtomicU64::new(0),
+            console_bytes_out: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 控制台 overview 快照。
+    pub fn totals_snapshot(&self) -> Totals {
+        use std::sync::atomic::Ordering;
+        Totals {
+            conns_current: self.conns_current.load(Ordering::Relaxed),
+            bytes_in: self.console_bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.console_bytes_out.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 数据面路径选择计数(chunk/splice/copy;goal-repair B1/B7 诊断)。
+    pub fn count_relay_path(&self, path: &str) {
+        self.relay_path_total.with_label_values(&[path]).inc();
     }
 
     /// 用户→服务端方向 n 字节(入站):totals 供控制台,counter 供 /metrics。
@@ -436,7 +494,8 @@ impl Metrics {
             return;
         }
         self.bytes_in_total.inc_by(n as u64);
-        self.totals.lock().unwrap().bytes_in += n as u64;
+        self.console_bytes_in
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 服务端→用户方向 n 字节(出站)。
@@ -445,7 +504,8 @@ impl Metrics {
             return;
         }
         self.bytes_out_total.inc_by(n as u64);
-        self.totals.lock().unwrap().bytes_out += n as u64;
+        self.console_bytes_out
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

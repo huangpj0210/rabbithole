@@ -48,6 +48,10 @@ pub async fn close_proxy_channels(rt: &Arc<ProxyRuntime>) {
     *rt.udp_new_channel_tx.lock().await = None;
 }
 
+/// copy 路径读缓冲下/上限(R3 红线 2 常量锁:上限 64KiB 不得放宽)。
+const COPY_MIN_BUF: usize = 32 * 1024;
+const COPY_MAX_BUF: usize = 64 * 1024;
+
 // ---------------- TCP 池 ----------------
 
 /// 会话认领池(epoch 全局单调,仅允许向前):驱逐旧会话遗留的就绪条目。
@@ -188,12 +192,9 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
         pool.remove_waiter(waiter_id).await;
         return None;
     }
-    match tokio::time::timeout(
-        Duration::from_millis(state.cfg.limits.pool_wait_timeout_ms),
-        rx,
-    )
-    .await
-    {
+    // 先取出标量再进入 match:读锁守卫不得作为 match 临时量跨 await 持有
+    let wait_ms = state.limits.read().unwrap().pool_wait_timeout_ms;
+    match tokio::time::timeout(Duration::from_millis(wait_ms), rx).await {
         Ok(Ok(s)) => Some(s),
         _ => {
             pool.remove_waiter(waiter_id).await;
@@ -238,7 +239,12 @@ pub async fn assign_forward(
     {
         return; // 死连接:上层取下一条/重试
     }
-    let channel: BoxedIo = if spec.transport.use_compression {
+    // B1:剥 QuotaIo 壳(route_data_stream 包装;仅 TcpPool→assign_forward
+    // 路径)。零拷贝资格判定需要具体类型;限额占用随 quota_guard 存活至
+    // 转发结束,与 QuotaIo::Drop 等价,不得提前释放。
+    let (channel, quota_guard) = crate::control::QuotaIo::peel(channel);
+    let _quota_guard = quota_guard; // 存活至本函数(转发)结束
+    let mut channel: BoxedIo = if spec.transport.use_compression {
         compress_stream(channel).await
     } else {
         channel
@@ -258,47 +264,231 @@ pub async fn assign_forward(
         .map(|q| Arc::new(TokenBucket::new(q.bytes_per_sec() as f64)));
     // F2 客户端级限速(服务端侧,与规则级限速叠加)
     let client_bucket = state.client_usage(&rt.client_id).bucket();
-    let (mut u_r, mut u_w) = tokio::io::split(user);
-    let (mut c_r, mut c_w) = tokio::io::split(channel);
+    // Y1 零拷贝 mux 中继:通道为 RhMuxStream(mux 模式常态;B1 修复后
+    // QuotaIo/PrependedIo 壳已在上方剥开)时,数据以 Bytes 引用直达
+    // 帧体/内核,消除两次中间拷贝。计量经 CountedUserIo 透明进行;
+    // 限速/取消/半关闭语义与拷贝路径一致。
+    // B7:relay_mode=copy 是同二进制 A/B 开关,同样关闭 chunk 快路径
+    //(benchmark README:93 承诺的 copy 对照语义)。
+    if !spec.transport.use_compression && state.cfg.relay_mode != "copy" {
+        // B1:PrependedIo(同批抵达的残留字节)剥壳——前缀字节是
+        // 通道→用户方向的先行数据,注入读半 front 最先交付,
+        // 与 PrependedIo 读语义逐字节等价。
+        let (prefix, ch) = rh_transport::PrependedIo::peel(channel);
+        match mux_steal_or_rewrap(prefix, ch) {
+            Ok((b_r, b_w)) => {
+                state.metrics.count_relay_path("chunk");
+                debug!(proxy = rt.id, "relay path: chunk");
+                mux_forward_chunked(rt, user, b_r, b_w, &bucket, &client_bucket).await;
+                return;
+            }
+            // 非 mux / 偷取失败:prefix 已原样回包(见 mux_steal_or_rewrap),
+            // 回落下方拷贝/splice 路径——回包后的 PrependedIo 不是裸 TCP,
+            // splice 资格判定必然回落 copy,prefix 不经内核 splice 丢失
+            Err(fallback) => channel = fallback,
+        }
+    }
+    // 零拷贝快路径:两端裸 TCP(裸模式明文载体)时走内核 splice。
+    // 计量/限速/半关闭语义与下方用户态路径一致;资源不可用则原样回落。
+    #[cfg(target_os = "linux")]
+    {
+        if state.cfg.relay_mode != "copy" && !spec.transport.use_compression {
+            let user_tcp = user
+                .as_any()
+                .downcast_ref::<CountedUserIo<tokio::net::TcpStream>>()
+                .map(|w| w.inner_ref());
+            // 通道可能被 QuotaIo(限额守卫)包装:剥壳探测;更内层还有
+            // PrependedIo(残留字节)时不可零拷贝,保持回落。
+            let chan_tcp = rh_transport::splice::plain_tcp(&channel).or_else(|| {
+                channel
+                    .as_any()
+                    .downcast_ref::<crate::control::QuotaIo>()
+                    .and_then(|q| rh_transport::splice::plain_tcp(q.inner_ref()))
+            });
+            if let (Some(utcp), Some(ctcp)) = (user_tcp, chan_tcp) {
+                state.metrics.count_relay_path("splice");
+                debug!(proxy = rt.id, "relay path: splice");
+                if splice_forward(state, rt, utcp, ctcp, &bucket, &client_bucket)
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+    }
     let _ = local_addr_override;
-    let bucket2 = bucket.clone();
-    let cb2 = client_bucket.clone();
-    let cancel = rt.rule_cancel.clone();
-    let t1 = tokio::spawn(async move {
-        // 规则取消(禁用/删除)级联关闭在途转发(§4.1)
-        tokio::select! {
-            _ = copy_limited(&mut u_r, &mut c_w, bucket2, cb2) => {}
-            _ = cancel.cancelled() => {}
-        }
-        let _ = c_w.shutdown().await;
-    });
-    let cancel2 = rt.rule_cancel.clone();
-    let t2 = tokio::spawn(async move {
-        tokio::select! {
-            _ = copy_limited(&mut c_r, &mut u_w, bucket, client_bucket) => {}
-            _ = cancel2.cancelled() => {}
-        }
-        let _ = u_w.shutdown().await;
-    });
-    let _ = tokio::join!(t1, t2);
+    state.metrics.count_relay_path("copy");
+    debug!(proxy = rt.id, "relay path: copy");
+    copy_relay_pair(user, channel, bucket, client_bucket, rt.rule_cancel.clone()).await;
 }
 
+/// 规则取消后的收尾(shutdown)等待上限:poll_shutdown 可能永久 Pending
+/// (对端不读且发送缓冲满、自定义 IO 直接 Pending)。取消(规则禁用/删除)
+/// 路径必须收敛释放 IO;EOF 路径不设上限,正常半关闭语义保持(红线)。
+/// 与 rh-transport mux::CANCEL_CLOSE_GRACE 同值同义。
+const CANCEL_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// mux 偷取或 prefix 回包(goal-repair B1 + prefix 兜底):
+/// * mux 流且偷取成功 → Ok(halves),非空 prefix 注入读半 front(最先交付);
+/// * 非 mux / 偷取失败 → Err(回包后的通道):**剩余 prefix 必须原样回包**
+///   (剥出的残留是「通道→用户」方向最先到达的字节,回包后仍最先交付,
+///   嵌套 PrependedIo 顺序保持:外层残留先于内层残留先于流数据),
+///   绝不丢弃——修前回落直接 `channel = ch` 把 prefix 丢掉。
+///   回包产物是 PrependedIo 包装,裸 TCP/splice 资格判定天然不匹配,
+///   必回落 copy 路径(尚有 prefix 的流不得走 splice)。
+fn mux_steal_or_rewrap(
+    prefix: Vec<u8>,
+    mut ch: rh_transport::BoxedIo,
+) -> Result<
+    (
+        rh_transport::mux::RhMuxStreamRead,
+        rh_transport::mux::RhMuxStreamWrite,
+    ),
+    rh_transport::BoxedIo,
+> {
+    if rh_transport::mux::is_mux_stream(&ch) {
+        if let Some((mut b_r, b_w)) = rh_transport::mux::steal_mux_halves(&mut ch) {
+            if !prefix.is_empty() {
+                b_r.set_front_prefix(bytes::Bytes::from(prefix));
+            }
+            drop(ch); // 壳(halves 已偷出)
+            return Ok((b_r, b_w));
+        }
+    }
+    Err(if prefix.is_empty() {
+        ch
+    } else {
+        rh_transport::PrependedIo::wrap(ch, prefix)
+    })
+}
+
+/// copy 路径收尾等待与规则取消的合流(与 rh-transport mux.rs
+/// `close_with_late_cancel` 同义):
+/// * 未取消:无界等待完整半关闭(红线——不硬加短超时防截断);
+/// * 收尾期间取消抵达:仅在 CANCEL_CLOSE_GRACE 内继续等待已推进的
+///   shutdown,超时即放弃并释放 IO(cancel-after-eof 复现:泵先 EOF
+///   进入 shutdown 后取消永不再被监听 → relay 卡死、IO 不释放)。
+async fn shutdown_with_late_cancel<F>(sd: F, cancel: impl std::future::Future<Output = ()>)
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut sd = std::pin::pin!(sd);
+    tokio::select! {
+        _ = &mut sd => {}
+        _ = cancel => {
+            let _ = tokio::time::timeout(CANCEL_CLOSE_GRACE, &mut sd).await;
+        }
+    }
+}
+
+/// copy 路径双向泵(自 assign_forward 抽出的同一段代码;A1(c) 修复位点)。
+/// 半关闭:双向各自运行到结束;规则取消(禁用/删除)级联关闭在途转发。
+/// final-gaps 补修:错误路径(非 panic IO 错误)与 mux_relay 对齐——
+/// 有界收尾(CANCEL_CLOSE_GRACE)+ 先完成侧异常(panic/错误)立即
+/// 终止对向泵(对向可能在等一个永远不来的数据/EOF,不得永存);
+/// clean EOF 保持无界半关闭等待(红线)。
+async fn copy_relay_pair(
+    user: BoxedIo,
+    channel: BoxedIo,
+    bucket: Option<Arc<TokenBucket>>,
+    client_bucket: Option<Arc<TokenBucket>>,
+    rule_cancel: tokio_util::sync::CancellationToken,
+) {
+    use std::sync::atomic::Ordering;
+    let (mut u_r, mut u_w) = tokio::io::split(user);
+    let (mut c_r, mut c_w) = tokio::io::split(channel);
+    let bucket2 = bucket.clone();
+    let cb2 = client_bucket.clone();
+    let cancel = rule_cancel.clone();
+    let cancel_tail = rule_cancel.clone();
+    // 本向以错误(非 EOF、非取消)结束时置位:对向数据通路已死
+    //(用户侧/通道侧错误),继续等对向只会在已死通路上永存
+    //(与 rh-transport mux.rs mux_relay 同款收敛保证)。
+    let up_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dn_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let up_err = up_errored.clone();
+    let t1 = tokio::spawn(async move {
+        // 规则取消(禁用/删除)级联关闭在途转发(§4.1);取消路径收尾
+        // 有界等待(shutdown 永久 Pending 不得卡死,rule-cancel 回归)
+        let (by_cancel, clean) = tokio::select! {
+            clean = copy_limited(&mut u_r, &mut c_w, bucket2, cb2) => (false, clean),
+            _ = cancel.cancelled() => (true, false),
+        };
+        if !clean {
+            up_err.store(true, Ordering::SeqCst);
+        }
+        if by_cancel || !clean {
+            // 取消/错误路径:有界收尾(IO 已不可用/连接已坏,等完整
+            // shutdown 无意义;永久 Pending 不得扣住 IO)
+            let _ = tokio::time::timeout(CANCEL_CLOSE_GRACE, c_w.shutdown()).await;
+        } else {
+            // 正常 EOF:无界等完整半关闭(红线,不加硬超时防截断);但收尾
+            // 期间规则取消仍必须被听见(cancel-after-eof 复现同款缺陷)
+            shutdown_with_late_cancel(c_w.shutdown(), cancel_tail.cancelled()).await;
+        }
+    });
+    let cancel2 = rule_cancel;
+    let cancel2_tail = cancel2.clone();
+    let dn_err = dn_errored.clone();
+    let t2 = tokio::spawn(async move {
+        let (by_cancel, clean) = tokio::select! {
+            clean = copy_limited(&mut c_r, &mut u_w, bucket, client_bucket) => (false, clean),
+            _ = cancel2.cancelled() => (true, false),
+        };
+        if !clean {
+            dn_err.store(true, Ordering::SeqCst);
+        }
+        if by_cancel || !clean {
+            let _ = tokio::time::timeout(CANCEL_CLOSE_GRACE, u_w.shutdown()).await;
+        } else {
+            shutdown_with_late_cancel(u_w.shutdown(), cancel2_tail.cancelled()).await;
+        }
+    });
+    // A1(c):父任务取消(本 future 被 drop)→ 守卫 Drop → abort 双向子泵,
+    // 不再随 join future 移动句柄而 detach;单向子泵 panic 时对向泵
+    // 立即终止(不永存)
+    let mut g1 = rh_transport::AbortOnDropHandle::new(t1);
+    let mut g2 = rh_transport::AbortOnDropHandle::new(t2);
+    // 收敛 join(mux_relay 同款):先完成侧 panic 或 IO 错误 → 立即返回
+    //(守卫 Drop → abort 对向);clean EOF → 等对向自然结束(半关闭红线)。
+    let first = tokio::select! {
+        _ = &mut g1 => 1,
+        _ = &mut g2 => 2,
+    };
+    let abnormal = match first {
+        1 => g1.panicked() || up_errored.load(Ordering::SeqCst),
+        _ => g2.panicked() || dn_errored.load(Ordering::SeqCst),
+    };
+    if abnormal {
+        return;
+    }
+    let _ = tokio::join!(g1, g2);
+}
+
+/// 返回 true = 以 clean EOF 结束(对向写端关闭,半关闭语义);
+/// false = 读/写 IO 错误(调用方收尾走有界 grace,与 mux 泵同口径)。
 async fn copy_limited<R, W>(
     r: &mut R,
     w: &mut W,
     bucket: Option<Arc<TokenBucket>>,
     client_bucket: Option<Arc<TokenBucket>>,
-) where
+) -> bool
+where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; 32 * 1024];
+    // 缓冲按需增长(读满翻倍,上限 64KiB):见 forward.rs 同名函数
+    let mut buf = vec![0u8; COPY_MIN_BUF];
     loop {
         let n = match r.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => return true,
             Ok(n) => n,
-            Err(_) => break,
+            Err(_) => return false,
         };
+        if n == buf.len() && buf.len() < COPY_MAX_BUF {
+            buf.resize((buf.len() * 2).min(COPY_MAX_BUF), 0);
+        }
         if let Some(b) = &bucket {
             b.acquire(n).await;
         }
@@ -306,9 +496,142 @@ async fn copy_limited<R, W>(
             b.acquire(n).await;
         }
         if w.write_all(&buf[..n]).await.is_err() {
-            break;
+            return false;
         }
     }
+}
+
+/// 双桶限速适配(goal-repair A5:预留式取消安全;两桶串行预留,
+/// 中途取消时已预留部分由 Reservation::drop 自动退还)。
+fn mk_limiter(
+    b1: &Option<Arc<TokenBucket>>,
+    b2: &Option<Arc<TokenBucket>>,
+) -> Option<Arc<dyn rh_transport::ChunkLimiter>> {
+    if b1.is_none() && b2.is_none() {
+        return None; // 双桶皆空:零热路径开销(F3 同款)
+    }
+    struct BucketLimiter {
+        rule: Option<Arc<TokenBucket>>,
+        client: Option<Arc<TokenBucket>>,
+    }
+    struct BothReservation {
+        r1: Option<rh_core::ratelimit::Reservation>,
+        r2: Option<rh_core::ratelimit::Reservation>,
+    }
+    impl rh_transport::ChunkReservation for BothReservation {
+        fn consume(&mut self, n: usize) {
+            if let Some(r) = &mut self.r1 {
+                r.consume(n);
+            }
+            if let Some(r) = &mut self.r2 {
+                r.consume(n);
+            }
+        }
+    }
+    impl rh_transport::ChunkLimiter for BucketLimiter {
+        fn reserve(
+            &self,
+            n: usize,
+        ) -> futures::future::BoxFuture<'static, Box<dyn rh_transport::ChunkReservation>> {
+            let b1 = self.rule.clone();
+            let b2 = self.client.clone();
+            Box::pin(async move {
+                let r1 = match &b1 {
+                    Some(b) => Some(b.clone().acquire_reserved(n).await),
+                    None => None,
+                };
+                let r2 = match &b2 {
+                    Some(b) => Some(b.clone().acquire_reserved(n).await),
+                    None => None,
+                };
+                Box::new(BothReservation { r1, r2 }) as Box<dyn rh_transport::ChunkReservation>
+            })
+        }
+    }
+    Some(Arc::new(BucketLimiter {
+        rule: b1.clone(),
+        client: b2.clone(),
+    }))
+}
+
+/// Y1 零拷贝 mux 中继装配:限速双桶(皆空不装,预留式取消安全)+
+/// 规则取消级联。与 splice_forward 的钩子装配同构;计量由 CountedUserIo 承担。
+async fn mux_forward_chunked(
+    rt: &Arc<ProxyRuntime>,
+    user: BoxedIo,
+    b_r: rh_transport::mux::RhMuxStreamRead,
+    b_w: rh_transport::mux::RhMuxStreamWrite,
+    rule_bucket: &Option<Arc<TokenBucket>>,
+    client_bucket: &Option<Arc<TokenBucket>>,
+) {
+    let limiter = mk_limiter(rule_bucket, client_bucket);
+    // 规则禁用/删除级联(与用户态/splice 路径同语义)
+    let rc = rt.rule_cancel.clone();
+    let cancel: rh_transport::CancelFuture = futures::FutureExt::shared(futures::FutureExt::boxed(
+        async move { rc.cancelled().await },
+    ));
+    rh_transport::mux::mux_relay(user, b_r, b_w, limiter, Some(cancel)).await;
+}
+
+/// 零拷贝指派中继(splice 快路径钩子装配)。
+/// 语义对齐 CountedUserIo + copy_limited:up(user→carrier)计 in、
+/// down(carrier→user)计 out,两向都叠加客户端用量;限速双桶按搬运字节扣减;
+/// flow_cut 触发双向断连。资源申请失败返回 Err(调用方回落用户态拷贝)。
+#[cfg(target_os = "linux")]
+async fn splice_forward(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    user: &tokio::net::TcpStream,
+    carrier: &tokio::net::TcpStream,
+    rule_bucket: &Option<Arc<TokenBucket>>,
+    client_bucket: &Option<Arc<TokenBucket>>,
+) -> std::io::Result<()> {
+    use futures::FutureExt as _;
+    use rh_transport::splice::{DirHook, SpliceHooks};
+
+    // 双桶皆空时不装 limiter:免每块一次 BoxFuture 分配与虚调用
+    // (基准与绝大多数规则都不配限速,不应为其付热路径成本)
+    let limiter = mk_limiter(rule_bucket, client_bucket);
+
+    let metrics_up = state.metrics.clone();
+    let metrics_dn = state.metrics.clone();
+    let rt_up = rt.clone();
+    let rt_dn = rt.clone();
+    let usage_up = state.client_usage(&rt.client_id);
+    let usage_dn = usage_up.clone();
+    let usage_cut = usage_up.clone();
+
+    let hooks = SpliceHooks {
+        // B6:up=读侧口径(fill 完成即计,先于限速等待——与 copy 路径
+        // CountedUserIo.poll_read 先计、copy_limited 后 acquire 一致);
+        // down=送达口径(排空后计)。
+        up: Some(DirHook {
+            on_bytes: Some(Arc::new(move |n| {
+                metrics_up.count_user_in(n as usize);
+                rt_up.bytes_in.fetch_add(n, Ordering::Relaxed);
+                usage_up.add_bytes(n);
+            })),
+            meter_on_fill: true,
+            limiter: limiter.clone(),
+        }),
+        down: Some(DirHook {
+            on_bytes: Some(Arc::new(move |n| {
+                metrics_dn.count_user_out(n as usize);
+                rt_dn.bytes_out.fetch_add(n, Ordering::Relaxed);
+                usage_dn.add_bytes(n);
+            })),
+            meter_on_fill: false,
+            limiter,
+        }),
+        abort: Some(Arc::new(move || usage_cut.flow_cut.load(Ordering::Relaxed))),
+        // 规则禁用/删除级联:与用户态路径的 select-cancelled 语义一致,
+        // 阻塞在就绪等待/限速等待中的泵都能被立即拆除(abort 只在块边界检查)。
+        cancel: {
+            let rc = rt.rule_cancel.clone();
+            Some(async move { rc.cancelled().await }.boxed().shared())
+        },
+    };
+    rh_transport::splice::splice_relay(user, carrier, hooks).await
 }
 
 /// F1 计量:IO 透明包装,不改任何 IO 行为。
@@ -332,6 +655,12 @@ impl<T> CountedUserIo<T> {
             usage: None,
             reversed: false,
         }
+    }
+
+    /// 内部流引用(splice 快路径:提取裸 TCP 做零拷贝判定)。
+    #[cfg(target_os = "linux")]
+    pub fn inner_ref(&self) -> &T {
+        &self.inner
     }
 
     /// 用户侧连接(归属到规则;state 派生客户端用量)。
@@ -455,6 +784,36 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountedUserIo<T
         }
     }
 
+    // C5:向量写透传 + 一次计量(按实际写出的聚合字节数)——
+    // 未来引入 writev 优化时计量不缺失、能力位不退化。
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.flow_cut() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "client flow limit exceeded",
+            )));
+        }
+        match std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs) {
+            std::task::Poll::Ready(Ok(n)) => {
+                if self.reversed {
+                    self.count_in(n);
+                } else {
+                    self.count_out(n);
+                }
+                std::task::Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -503,7 +862,9 @@ pub struct ConnGuard {
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.metrics.totals.lock().unwrap().conns_current -= 1;
+        self.metrics
+            .conns_current
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(rt) = &self.proxy {
             rt.conns_current
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -532,7 +893,10 @@ pub fn try_open_user_conn(
             return None;
         }
     }
-    state.metrics.totals.lock().unwrap().conns_current += 1;
+    state
+        .metrics
+        .conns_current
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(rt) = proxy {
         rt.conns_current
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -671,6 +1035,20 @@ pub async fn udp_on_channel(
 }
 
 /// UDP 服务主循环:等待通道 → 双向搬运;死亡 → 退避重建。
+/// UDP 会话准入:已存在 = 刷新时间戳放行;新会话在 max_udp_sessions_per_proxy
+/// (热配置,0 = 不限)已满时拒绝。返回 false = 本次报文按新会话超限处理。
+fn udp_session_admit(
+    state: &Arc<AppState>,
+    sessions: &mut std::collections::HashMap<SocketAddr, Instant>,
+    addr: SocketAddr,
+) -> bool {
+    if sessions.contains_key(&addr) {
+        return true;
+    }
+    let limit = state.limits.read().unwrap().max_udp_sessions_per_proxy;
+    limit == 0 || sessions.len() < limit
+}
+
 pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: Arc<UdpSocket>) {
     let (new_tx, mut new_rx) = mpsc::channel::<BoxedIo>(4);
     *rt.udp_new_channel_tx.lock().await = Some(new_tx);
@@ -686,7 +1064,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
         };
         let (mut ch_r, mut ch_w) = tokio::io::split(stream);
         let mut frame_buf = bytes::BytesMut::with_capacity(2048);
-        let mut pkt_buf = vec![0u8; state.cfg.limits.udp_packet_size.max(1500)];
+        let mut pkt_buf = vec![0u8; state.limits.read().unwrap().udp_packet_size.max(1500)];
         let mut last_ping_sent = Instant::now();
         let mut last_alive = Instant::now();
         let dead = loop {
@@ -694,6 +1072,10 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                 r = sock.recv_from(&mut pkt_buf) => {
                     match r {
                         Ok((n, peer)) => {
+                            // 会话准入:超上限的新源地址直接丢包(既有会话不受影响)
+                            if !udp_session_admit(&state, &mut sessions, peer) {
+                                continue;
+                            }
                             state.metrics.count_user_in(n);
                             rt.bytes_in.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                             state.client_usage(&rt.client_id).add_bytes(n as u64);
@@ -716,6 +1098,10 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                                         .flow_cut
                                         .load(std::sync::atomic::Ordering::Relaxed)
                                     {
+                                        last_alive = Instant::now();
+                                        continue;
+                                    }
+                                    if !udp_session_admit(&state, &mut sessions, addr) {
                                         last_alive = Instant::now();
                                         continue;
                                     }
@@ -781,5 +1167,731 @@ fn conv_proxy_proto(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::
         rh_protocol::ProxyProtoVersion::None => rh_protocol::message::ProxyProto::None,
         rh_protocol::ProxyProtoVersion::V1 => rh_protocol::message::ProxyProto::V1,
         rh_protocol::ProxyProtoVersion::V2 => rh_protocol::message::ProxyProto::V2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drop 探针 IO(审计 src/main.rs 同款手法):子泵终止(所有权释放)时翻转。
+    struct DropIo {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for DropIo {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl tokio::io::AsyncRead for DropIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DropIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    async fn wait_flag(f: &Arc<std::sync::atomic::AtomicBool>, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !f.load(std::sync::atomic::Ordering::SeqCst) {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("{what}: 探针在 2s 内未翻转(copy 子泵未随父取消终止)");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // A1(c):assign_forward copy 路径(t1/t2 spawn 后 join)——父任务取消
+    // 必须终止双向子泵;修前句柄 move 进 join future,父取消即 detach。
+    #[tokio::test]
+    async fn server_copy_parent_cancel_kills_children() {
+        let (mut a_peer, a_local) = tokio::io::duplex(4096);
+        let (mut c_peer, c_local) = tokio::io::duplex(4096);
+
+        let d_user = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d_chan = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let user: BoxedIo = Box::new(DropIo {
+            inner: a_local,
+            dropped: d_user.clone(),
+        });
+        let channel: BoxedIo = Box::new(DropIo {
+            inner: c_local,
+            dropped: d_chan.clone(),
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let parent = tokio::spawn(copy_relay_pair(user, channel, None, None, cancel));
+
+        // 建立流:user 侧写入 → 通道对端收到(copy 双向在跑)
+        a_peer.write_u8(1).await.unwrap();
+        assert_eq!(c_peer.read_u8().await.unwrap(), 1);
+
+        // 父任务取消(会话拆除形态)
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
+        wait_flag(&d_user, "server copy user io").await;
+        wait_flag(&d_chan, "server copy channel io").await;
+
+        // 窗口期断言:取消后写入的字节不得再被转发。
+        // 探针已翻转 ⇒ 中继侧 duplex 已释放 ⇒ 写入应 BrokenPipe
+        // (比"写入成功但不被转发"更强的保证);防御性兼容写入成功路径。
+        match a_peer.write_u8(9).await {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("探测写异常: {e}"),
+            Ok(()) => {
+                match tokio::time::timeout(Duration::from_millis(300), c_peer.read_u8()).await {
+                    Err(_) => {}
+                    Ok(Ok(b)) => panic!("取消后字节 {b} 仍被转发(copy 子泵 detach)"),
+                    Ok(Err(e)) => panic!("读侧异常: {e}"),
+                }
+            }
+        }
+    }
+
+    // R3(红线 2 锁):copy 路径读缓冲上限必须保持 64KiB。
+    #[test]
+    fn copy_buf_cap_is_64kib() {
+        assert_eq!(COPY_MAX_BUF, 64 * 1024, "copy 路径读缓冲上限红线(64KiB)");
+        const _: () = assert!(COPY_MIN_BUF <= COPY_MAX_BUF);
+    }
+
+    /// poll_shutdown 永久 Pending 的用户侧 IO(主代理 cancel-close 复现同款:
+    /// /tmp/rh-main-independent-review/src/main.rs PendingShutdownIo;与 mux_relay
+    /// 的 cancel_close 缺陷同类):模拟对端不读 + 发送缓冲满等 shutdown
+    /// 永不就绪的真实形态。
+    struct PendingShutdownIo {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for PendingShutdownIo {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl tokio::io::AsyncRead for PendingShutdownIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PendingShutdownIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    // 规则取消(禁用/删除级联 CancellationToken)后 copy_relay_pair 必须收敛
+    // 退出并释放两侧 IO,即使收尾的 shutdown 永久 Pending。父 abort 守卫
+    // (A1c)不覆盖本路径:父任务仍在 join 等待,卡死的是子泵收尾。
+    // 修前证据:benchmark/runs/goal-repair/relay/(本轮 before-fix 日志)。
+    #[tokio::test]
+    async fn copy_rule_cancel_converges_when_shutdown_pends() {
+        let (mut a_peer, a_local) = tokio::io::duplex(4096);
+        let (mut c_peer, c_local) = tokio::io::duplex(4096);
+
+        let d_user = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let user: BoxedIo = Box::new(PendingShutdownIo {
+            inner: a_local,
+            dropped: d_user.clone(),
+        });
+        let channel: BoxedIo = Box::new(c_local);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut parent = tokio::spawn(copy_relay_pair(user, channel, None, None, cancel.clone()));
+
+        // 建立流:user 侧写入 → 通道对端收到(copy 双向在跑)
+        use tokio::io::AsyncWriteExt as _;
+        a_peer.write_u8(1).await.unwrap();
+        use tokio::io::AsyncReadExt as _;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), c_peer.read_u8())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+
+        // 触发规则取消(禁用/删除级联)
+        cancel.cancel();
+        // 3s 内必须收敛退出(修前:u_w.shutdown() 永久 Pending,join 永不完成)
+        tokio::time::timeout(Duration::from_secs(3), &mut parent)
+            .await
+            .expect("规则取消后 copy_relay_pair 必须收敛退出(即使 poll_shutdown 永久 Pending)")
+            .unwrap();
+        assert!(
+            d_user.load(std::sync::atomic::Ordering::SeqCst),
+            "规则取消必须释放用户侧 IO"
+        );
+    }
+
+    // 故障注入:取消在 EOF 收尾期间才抵达(cancel-after-eof;与
+    // rh-transport mux_relay_cancel_after_eof_converges 同款缺陷)。
+    // 通道侧 EOF → t2 泵正常结束进入 u_w.shutdown() 收尾(用户侧
+    // PendingShutdownIo 永久 Pending)→ 规则取消必须仍被听见并在
+    // CANCEL_CLOSE_GRACE 内收敛;未取消的正常 EOF 不加硬超时(红线)。
+    #[tokio::test]
+    async fn copy_rule_cancel_after_eof_converges() {
+        let (mut a_peer, a_local) = tokio::io::duplex(4096);
+        let (mut c_peer, c_local) = tokio::io::duplex(4096);
+
+        let d_user = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let user: BoxedIo = Box::new(PendingShutdownIo {
+            inner: a_local,
+            dropped: d_user.clone(),
+        });
+        let channel: BoxedIo = Box::new(c_local);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut parent = tokio::spawn(copy_relay_pair(user, channel, None, None, cancel.clone()));
+
+        // 双向在跑:user 写 → 通道对端收到
+        use tokio::io::AsyncWriteExt as _;
+        a_peer.write_u8(1).await.unwrap();
+        use tokio::io::AsyncReadExt as _;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), c_peer.read_u8())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+
+        // 通道侧 EOF → t2 收尾 u_w.shutdown() 永久 Pending;等收尾挂起后取消
+        drop(c_peer);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(3), &mut parent)
+            .await
+            .expect("EOF 收尾期间抵达的规则取消必须仍被听见并收敛")
+            .unwrap();
+        assert!(
+            d_user.load(std::sync::atomic::Ordering::SeqCst),
+            "EOF 收尾取消必须释放用户侧 IO"
+        );
+    }
+
+    /// 注入写错误 + 永久 Pending 收尾的 IO:poll_write 直接 Err,
+    /// poll_shutdown 永久 Pending(错误路径有界收敛的故障形态)。
+    struct WriteErrShutdownPendIo {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for WriteErrShutdownPendIo {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl tokio::io::AsyncRead for WriteErrShutdownPendIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for WriteErrShutdownPendIo {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected write error",
+            )))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    // final-gaps(红→绿):copy 通道错误路径有界收敛——非 panic IO 错误
+    // + 收尾 shutdown 永久 Pending + **无取消信号**时,copy_relay_pair
+    // 必须收敛退出并释放两侧 IO;对向泵(停在读等待)不得在已死通路上
+    // 永存。修前:t2 写用户侧 Err → shutdown_with_late_cancel 无界等待
+    //(取消永不来)→ relay 卡死、IO 不释放(与 mux_relay 修过的同款
+    // 缺陷,mux 侧回归 goal_repair_mux.rs mux_relay_error_path_converges_
+    // when_shutdown_pends;copy 路径漏了等价修复)。
+    #[tokio::test]
+    async fn copy_error_path_converges_when_shutdown_pends() {
+        let (_a_peer_hold, a_local) = tokio::io::duplex(4096);
+        let (mut c_peer, c_local) = tokio::io::duplex(4096);
+
+        let d_user = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let user: BoxedIo = Box::new(WriteErrShutdownPendIo {
+            inner: a_local,
+            dropped: d_user.clone(),
+        });
+        let channel: BoxedIo = Box::new(c_local);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut parent = tokio::spawn(copy_relay_pair(
+            user,
+            channel,
+            None,
+            None,
+            cancel.clone(),
+        ));
+
+        // 通道侧数据抵达 → t2(c_r→u_w)写用户侧得 Err → 错误路径;
+        // 全程不触发 cancel(错误路径自身必须有界收敛)
+        use tokio::io::AsyncWriteExt as _;
+        c_peer.write_all(b"boom").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), &mut parent)
+            .await
+            .expect("copy 错误路径必须收敛(即使 poll_shutdown 永久 Pending 且无取消)")
+            .unwrap();
+        assert!(
+            d_user.load(std::sync::atomic::Ordering::SeqCst),
+            "copy 错误路径必须释放用户侧 IO"
+        );
+    }
+
+    // C5:CountedUserIo 必须透传向量写 + 一次计量(按聚合写出字节)。
+    #[test]
+    fn counted_user_io_forwards_vectored() {
+        use std::io::IoSlice;
+        use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite as _, ReadBuf};
+
+        #[derive(Default, Debug)]
+        struct Calls {
+            scalar: usize,
+            vectored: usize,
+            last_total: usize,
+        }
+        struct VectoredSink(Arc<Mutex<Calls>>);
+        impl AsyncRead for VectoredSink {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl tokio::io::AsyncWrite for VectoredSink {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                let mut log = self.0.lock().unwrap();
+                log.scalar += 1;
+                log.last_total = buf.len();
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bufs: &[IoSlice<'_>],
+            ) -> Poll<std::io::Result<usize>> {
+                let n: usize = bufs.iter().map(|b| b.len()).sum();
+                let mut log = self.0.lock().unwrap();
+                log.vectored += 1;
+                log.last_total = n;
+                Poll::Ready(Ok(n))
+            }
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let metrics = Arc::new(crate::state::Metrics::new());
+        let mut io = CountedUserIo::new(VectoredSink(calls.clone()), metrics.clone());
+        assert!(io.is_write_vectored(), "能力位必须透传");
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let header = [0u8; 12];
+        let body = vec![7u8; 4096];
+        let offered = header.len() + body.len();
+        let n = match Pin::new(&mut io)
+            .poll_write_vectored(&mut cx, &[IoSlice::new(&header), IoSlice::new(&body)])
+        {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("unexpected poll result: {other:?}"),
+        };
+        assert_eq!(n, offered, "一次向量写应带走全部数据");
+        let log = calls.lock().unwrap();
+        assert_eq!(log.vectored, 1, "应恰好一次向量写");
+        assert_eq!(log.scalar, 0, "不得退化为标量写");
+        drop(log);
+        assert_eq!(
+            metrics
+                .console_bytes_out
+                .load(std::sync::atomic::Ordering::Relaxed),
+            offered as u64,
+            "一次计量:按聚合写出字节"
+        );
+    }
+
+    // B1(真实包装链):QuotaIo<PrependedIo<RhMuxStream>> 必须仍能进入
+    // chunk 路径——剥壳后 halves 可偷出、前缀字节最先送达、且
+    // guard 存活期 data_conn_count 不提前递减。
+    // 修前判定(源码,REVIEW.md:16):is_mux_stream 对该链恒 false → chunk 不可达。
+    #[tokio::test]
+    async fn chunk_path_engages_through_quota_and_prepended() {
+        use tokio::io::AsyncReadExt;
+
+        // 构造 Session(仅用 data_conn_count)
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sess = crate::session::Session::new(
+            "cid".into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = rh_transport::wrap_stream_as_server(Box::new(b), true, 64);
+        let client = rh_transport::wrap_stream_as_client(Box::new(a), true, 64);
+
+        let c = client.open_stream().await.unwrap();
+        // SYN 惰性发送:首写建立流;残留前缀 = 同批抵达的先行数据。
+        // 写入放独立任务:载荷(>单流接收窗)在服务端 accept 前可能
+        // 因流控阻塞,不得与 accept 顺序死锁。
+        let wire_len = 64 + 300 * 1024;
+        let mut wire = vec![0xA1u8; 64];
+        wire.extend_from_slice(&vec![0xB2u8; 300 * 1024]); // 总载荷 > 64KiB 分片
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let mut c = c;
+            c.write_all(&wire).await.unwrap();
+            let _ = c.shutdown().await;
+        });
+
+        let s = server.accept().await.unwrap();
+        // 模拟 route_data_stream 的包装链:PrependedIo(残留)→ QuotaIo(限额)
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let wrapped: BoxedIo = crate::control::QuotaIo::new(
+            rh_transport::PrependedIo::wrap(s, vec![0xC3u8; 32]),
+            sess.clone(),
+        );
+        // assign_forward 同款剥壳序列
+        let (inner, guard) = crate::control::QuotaIo::peel(wrapped);
+        assert!(guard.is_some(), "QuotaIo 包装必须剥出限额守卫(B1)");
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "guard 存活期 data_conn_count 不得提前递减(B1)"
+        );
+        let (prefix, inner) = rh_transport::PrependedIo::peel(inner);
+        assert_eq!(
+            prefix,
+            vec![0xC3u8; 32],
+            "PrependedIo 壳必须剥出残留前缀(B1)"
+        );
+        let mut inner = inner;
+        assert!(
+            rh_transport::mux::is_mux_stream(&inner),
+            "剥壳后必须识别为 mux 流(B1 修前恒 false)"
+        );
+        let (mut b_r, b_w) = rh_transport::mux::steal_mux_halves(&mut inner).expect("steal halves");
+        drop(inner); // 壳
+        b_r.set_front_prefix(bytes::Bytes::from(prefix));
+
+        // 用户侧 + chunk 中继:前缀字节必须最先送达,载荷完整
+        let (mut local, relay_io) = tokio::io::duplex(1024 * 1024);
+        let relay = tokio::spawn(rh_transport::mux::mux_relay(
+            Box::new(relay_io),
+            b_r,
+            b_w,
+            None,
+            None,
+        ));
+        let mut got = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), local.read_to_end(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, wire_len + 32, "前缀 + 全部载荷必须送达");
+        assert_eq!(&got[..32], &vec![0xC3u8; 32][..], "前缀字节最先(B1)");
+        assert_eq!(&got[32..32 + 64], &vec![0xA1u8; 64][..]);
+        assert!(got[32..].ends_with(&[0xB2u8; 8]));
+        drop(local);
+        let _ = tokio::time::timeout(Duration::from_secs(2), relay).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+        drop(guard);
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "guard 释放即递减(与 QuotaIo::Drop 等价)"
+        );
+    }
+
+    // B7:relay_mode=copy 必须禁用 chunk 快路径(路径判定层面)。
+    // 与 chunk_path_engages... 共用剥壳链;此处验证判定式本身。
+    #[test]
+    fn relay_mode_copy_disables_chunk_gate() {
+        // assign_forward 的判定条件(与实现保持同式):
+        // use_compression == false && relay_mode != "copy"
+        let gate =
+            |use_compression: bool, relay_mode: &str| !use_compression && relay_mode != "copy";
+        assert!(gate(false, "splice"), "默认(splice)开 chunk");
+        assert!(!gate(false, "copy"), "B7:copy 必须关 chunk");
+        assert!(!gate(true, "splice"), "压缩恒回落 copy");
+        assert!(!gate(true, "copy"));
+    }
+
+    /// 注入 panic 的写 IO:poll_write 直接 panic(模拟适配层/自定义 IO bug)。
+    struct PanicWriteIo {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for PanicWriteIo {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl tokio::io::AsyncRead for PanicWriteIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PanicWriteIo {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            panic!("injected poll_write panic")
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    // 故障注入:单向子泵 panic(user→channel 方向写用户侧)。守卫吸收
+    // JoinError,但对向泵(停在 channel 读)不得永存——copy_relay_pair
+    // 必须收敛并释放两侧 IO(join_relay_pumps panic 收敛)。
+    #[tokio::test]
+    async fn copy_relay_panic_contained() {
+        let (_a_peer, a_local) = tokio::io::duplex(4096);
+        let (mut c_peer, c_local) = tokio::io::duplex(4096);
+
+        let d_user = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d_chan = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let user: BoxedIo = Box::new(PanicWriteIo {
+            inner: a_local,
+            dropped: d_user.clone(),
+        });
+        let channel: BoxedIo = Box::new(DropIo {
+            inner: c_local,
+            dropped: d_chan.clone(),
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut parent = tokio::spawn(copy_relay_pair(user, channel, None, None, cancel));
+
+        // channel→user 方向数据抵达 → t2 写用户侧 panic
+        use tokio::io::AsyncWriteExt as _;
+        c_peer.write_u8(1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), &mut parent)
+            .await
+            .expect("单向子泵 panic 后 copy_relay_pair 必须收敛(对向不得永存)")
+            .unwrap();
+        assert!(d_user.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(d_chan.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // B1/prefix 兜底:正常 server 包装链(QuotaIo<PrependedIo<裸 duplex>>,
+    // 非 mux)+ 非空 prefix → mux_steal_or_rewrap 必须把 prefix 原样回包,
+    // 回包通道读序 = prefix 最先 + 线路字节随后;QuotaGuard 全期不提前递减。
+    // 修前:assign_forward 回落直接 `channel = ch`,prefix 丢弃。
+    #[tokio::test]
+    async fn nonmux_fallback_preserves_prefix_and_guard() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sess = crate::session::Session::new(
+            "cid".into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+
+        // 模拟 route_data_stream 的限额占用(计数 +1 随 QuotaIo Drop 递减)
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let (mut wire, wire_local) = tokio::io::duplex(64 * 1024);
+        let prefix = vec![0xC3u8; 32];
+        let wrapped: BoxedIo = crate::control::QuotaIo::new(
+            rh_transport::PrependedIo::wrap(Box::new(wire_local), prefix.clone()),
+            sess.clone(),
+        );
+
+        // assign_forward 同款剥壳序列
+        let (inner, guard) = crate::control::QuotaIo::peel(wrapped);
+        assert!(guard.is_some(), "QuotaIo 壳必须剥出守卫");
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "守卫存活期不得提前递减"
+        );
+        let (p, ch) = rh_transport::PrependedIo::peel(inner);
+        assert_eq!(p, prefix, "PrependedIo 壳必须剥出残留前缀");
+
+        // 非 mux:必须回包(Err),不得偷取、不得丢 prefix
+        let mut fallback = match mux_steal_or_rewrap(p, ch) {
+            Err(f) => f,
+            Ok(_) => panic!("非 mux 流必须回落(Err),不得偷取"),
+        };
+        assert!(
+            !rh_transport::mux::is_mux_stream(&fallback),
+            "非 mux 回落产物不得再被判为 mux"
+        );
+        assert!(
+            fallback
+                .as_any()
+                .downcast_ref::<rh_transport::PrependedIo>()
+                .is_some(),
+            "非空 prefix 回落必须回包 PrependedIo(splice 资格判定随之回落 copy)"
+        );
+
+        // 回包通道读序:prefix 最先,线路字节随后
+        wire.write_all(b"hello").await.unwrap();
+        let mut got = [0u8; 37];
+        tokio::time::timeout(Duration::from_secs(2), fallback.read_exact(&mut got))
+            .await
+            .expect("prefix + 线路字节必须完整可读(修前 prefix 丢失)")
+            .unwrap();
+        assert_eq!(&got[..32], &prefix[..], "prefix 字节最先交付");
+        assert_eq!(&got[32..], b"hello", "线路字节紧随其后");
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "转发(读)期间守卫不得递减"
+        );
+        drop(fallback);
+        drop(guard);
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "守卫释放即递减(与 QuotaIo::Drop 等价)"
+        );
+    }
+
+    // 嵌套 prefix 顺序:剥最外层(B)后回包,读序必须保持
+    // B(外层残留)→ A(内层残留)→ 流数据——与原包装链逐字节等价。
+    #[tokio::test]
+    async fn nested_prefix_rewrap_preserves_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut wire, wire_local) = tokio::io::duplex(64 * 1024);
+        let inner: BoxedIo = rh_transport::PrependedIo::wrap(Box::new(wire_local), vec![0xA1u8; 8]);
+        let outer: BoxedIo = rh_transport::PrependedIo::wrap(inner, vec![0xB2u8; 16]);
+
+        let (b_prefix, ch) = rh_transport::PrependedIo::peel(outer);
+        assert_eq!(b_prefix, vec![0xB2u8; 16], "只剥最外层");
+        let mut fallback = match mux_steal_or_rewrap(b_prefix, ch) {
+            Err(f) => f,
+            Ok(_) => panic!("非 mux 流必须回落(Err),不得偷取"),
+        };
+
+        wire.write_all(b"stream").await.unwrap();
+        let mut got = [0u8; 30];
+        tokio::time::timeout(Duration::from_secs(2), fallback.read_exact(&mut got))
+            .await
+            .expect("嵌套 prefix + 载荷必须完整可读")
+            .unwrap();
+        assert_eq!(&got[..16], &vec![0xB2u8; 16][..], "外层残留最先");
+        assert_eq!(&got[16..24], &vec![0xA1u8; 8][..], "内层残留次之");
+        assert_eq!(&got[24..], b"stream", "流数据最后(顺序逐字节等价)");
     }
 }
