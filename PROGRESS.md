@@ -269,6 +269,27 @@ vitest **50/50**;pnpm build ✓(JS ≈420 KB gz + CSS 15.5 KB gz,已拆 vendor)�
   而 render 是异步的 → 会露出一帧空白;改到 App 的 effect(首次提交后)移除。
 - 走查新增首屏体积门禁:登录页 JS ≤2 个、合计 ≤700 KB、不得出现图表/表单/外壳块。
 
+### 合并上游 v0.3.1 并移植其新增设置项
+- 上游 main 前进 2 个 commit(`c84f631` 传输层修复 + `79bb1a9` release v0.3.1),
+  其中**只改了 console/ 两个文件**且都是我们已重写覆盖的路径:
+  - `console/src/api/rabbithole.ts` —— 自动合并成功(上游新增 `LimitsConfig` /
+    `hot.limits` / `ServerConfigUpdate.limits` 已并入);
+  - `console/src/pages/settings/index.tsx` —— 冲突,取我们的 shadcn 重写版,
+    并把上游新增的**「并发与限流」九项完整移植**(校验范围与后端一致、默认值/
+    回填/提交载荷齐备、独立分节渲染,九条 ℹ 文案进 `features/field-info.ts`)。
+- 后端与上游 main **零差异**(crates/ migrations/ tests/ deploy/ vendor/ benchmark/
+  .github 全部无 diff),差异仅 `console/` 与文档。
+- 端到端验证(重编 rh-server 到 0.3.1 后):`/api/server/config` 的 `hot.limits`
+  九项与前端字段一一对应;改 128/4/8000 保存后服务端确认落库;默认池深填 999
+  被前端拦下且未写库。
+- 顺带修掉一个**触屏缺陷**:说明统一改用 Tooltip 后,触屏点按失效 ——
+  Radix Tooltip 的 trigger 对 touch 会 `pointerdown → onClose`、`click → onClose`,
+  自己不会打开还会吃掉我们同步设置的 open;改为在 pointerdown 记录按下前状态、
+  点按取反并把定态推迟到下一个宏任务。鼠标路径不受影响。
+- 教训(已自查出并修):两次出现「提交了引用方、漏了被引用方」——
+  `vite.config.ts` 与 `field-info.ts` 都曾留在工作区,导致**已提交状态类型检查失败**。
+  之后一律用**干净检出的 worktree** 验证已提交状态,而不是只看工作区。
+
 - **视觉判读未能按约定执行**:本会话模型不支持图像输入,子代理继承同一模型,
   workflow 的 provider/model 覆盖在本会话不可用 → 已如实说明,改以可编程客观测量 + 原图交付人工过目。
 
