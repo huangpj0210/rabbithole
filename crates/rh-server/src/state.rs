@@ -64,6 +64,21 @@ pub struct AppState {
     ),
     /// Prometheus 独立监听任务(热开关启停;None = 未监听)。
     pub metrics_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// metrics 实际在用的监听地址(metrics_listen_start 绑定成功时记录,stop 清除)。
+    /// 2007/3005 自身占用归属只看这里,不读配置文件/hot 里的 metrics 字段——
+    /// 热改(含回滚)后配置值可能与实际监听不一致。
+    pub metrics_listen_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+}
+
+/// 2007/3005 自身监听占用命中(诊断提示用)。
+pub struct SelfPortHit {
+    /// 来源说明(如 "Web 管理后台"、"控制面主监听(kcp)")。
+    pub label: String,
+    /// 该监听的配置地址或(metrics)实际监听地址。
+    pub addr: SocketAddr,
+    /// true = 来自实际在跑的监听(metrics 绑定成功时记录);
+    /// false = 静态配置保留口径,不冒充实时进程检测。
+    pub live: bool,
 }
 
 /// 网页可管且即时生效的配置子集;其余字段改动标记需重启。
@@ -221,6 +236,7 @@ impl Clone for AppState {
             certs: self.certs.clone(),
             ssh_watch: (self.ssh_watch.0.clone(), self.ssh_watch.1.clone()),
             metrics_task: self.metrics_task.clone(),
+            metrics_listen_addr: self.metrics_listen_addr.clone(),
         }
     }
 }
@@ -314,6 +330,7 @@ impl AppState {
             certs: Arc::new(RwLock::new(Vec::new())),
             ssh_watch: (ssh_tx, Arc::new(ssh_rx)),
             metrics_task: Arc::new(Mutex::new(None)),
+            metrics_listen_addr: Arc::new(std::sync::Mutex::new(None)),
             relay_pairs: Arc::new(Mutex::new(HashMap::new())),
             udp_relays: Arc::new(Mutex::new(std::collections::HashSet::new())),
             nathole: Arc::new(crate::nathole::NatCoordinator::new()),
@@ -342,6 +359,8 @@ impl AppState {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| anyhow::anyhow!("metrics 端口监听失败 {addr}:{e}"))?;
+        // 绑定成功才记录实际监听地址(2007/3005 自身占用归属用)
+        *self.metrics_listen_addr.lock().unwrap() = Some(addr);
         tracing::info!(%addr, "prometheus metrics up");
         let app = axum::Router::new()
             .route(
@@ -365,11 +384,136 @@ impl AppState {
             let _ = t.await;
             tracing::info!("prometheus metrics down");
         }
+        // 无论任务是否在跑都清除记录,避免残留陈旧地址
+        *self.metrics_listen_addr.lock().unwrap() = None;
     }
 
     /// Prometheus 独立监听是否在运行。
     pub async fn metrics_listening(&self) -> bool {
         self.metrics_task.lock().await.is_some()
+    }
+
+    /// 2007/3005 端口占用归属分类:按协议族(tcp/udp)+端口+IP 重叠
+    /// (复用 rh_core::net::bind_conflicts 口径,通配/具体双向)匹配本进程
+    /// 自身配置/在用的监听。命中返回来源说明;未命中视为外部进程占用
+    /// (调用方保持通用文案),OS 试绑仍是最终裁定。
+    ///
+    /// 覆盖范围只含实际启用的字段:控制面主监听/附加监听(bind_port>0 且协议
+    /// 可解析)、Web 管理后台、vhost http/https/tcpmux(0=关闭)、SSH 网关
+    /// (热配置 enabled)、metrics(实际监听地址,热改即时反映)。
+    /// 未启用的字段不构成占用;合法的规则组复用/异地址不在此判定(由
+    /// port_in_use 与试绑负责),不会误报。
+    pub async fn classify_port_occupation(
+        &self,
+        proto: &str,
+        ip: IpAddr,
+        port: u16,
+    ) -> Option<SelfPortHit> {
+        if port == 0 {
+            return None;
+        }
+        // (标签, 协议族, 监听 IP, 端口, 是否实际在跑的监听)
+        let mut cand: Vec<(String, &'static str, IpAddr, u16, bool)> = Vec::new();
+        let any_v4 = IpAddr::from([0, 0, 0, 0]);
+        let cfg = &self.cfg;
+        let control_ip = rh_core::net::parse_bind_ip(&cfg.bind_addr).unwrap_or(any_v4);
+        // 控制面主监听 + 附加传输监听(tcp/tls/ws/wss=TCP 族;quic/kcp=UDP 族)
+        if cfg.bind_port > 0 {
+            if let Some(p) = rh_transport::Protocol::parse(&cfg.bind_protocol) {
+                let family = if p.is_tcp_based() { "tcp" } else { "udp" };
+                cand.push((
+                    format!("控制面主监听({p})"),
+                    family,
+                    control_ip,
+                    cfg.bind_port,
+                    false,
+                ));
+            }
+        }
+        for l in &cfg.extra_listeners {
+            if l.bind_port == 0 {
+                continue;
+            }
+            let Some(p) = rh_transport::Protocol::parse(&l.protocol) else {
+                continue;
+            };
+            let lip = l
+                .bind_addr
+                .as_deref()
+                .and_then(rh_core::net::parse_bind_ip)
+                .unwrap_or(control_ip);
+            let family = if p.is_tcp_based() { "tcp" } else { "udp" };
+            cand.push((
+                format!("附加传输监听({p})"),
+                family,
+                lip,
+                l.bind_port,
+                false,
+            ));
+        }
+        // Web 管理后台(启动即绑定;bind_addr 缺省 127.0.0.1)
+        if cfg.web.port > 0 {
+            let wip = rh_core::net::parse_bind_ip(&cfg.web.bind_addr)
+                .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+            cand.push(("Web 管理后台".into(), "tcp", wip, cfg.web.port, false));
+        }
+        // vhost 共享监听(与控制面同 bind_addr;端口 0 = 关闭,不占用)
+        if cfg.vhost.http_port > 0 {
+            cand.push((
+                "vhost HTTP 共享监听".into(),
+                "tcp",
+                control_ip,
+                cfg.vhost.http_port,
+                false,
+            ));
+        }
+        if cfg.vhost.https_port > 0 {
+            cand.push((
+                "vhost HTTPS(SNI) 共享监听".into(),
+                "tcp",
+                control_ip,
+                cfg.vhost.https_port,
+                false,
+            ));
+        }
+        if cfg.vhost.tcpmux_port > 0 {
+            cand.push((
+                "vhost tcpmux 共享监听".into(),
+                "tcp",
+                control_ip,
+                cfg.vhost.tcpmux_port,
+                false,
+            ));
+        }
+        // SSH 网关(热配置;enabled 才占用,bind_addr 空 = 0.0.0.0)
+        {
+            let ssh = self.hot.read().await.ssh_gateway.clone();
+            if ssh.enabled && ssh.bind_port > 0 {
+                let sip = rh_core::net::parse_bind_ip(&ssh.bind_addr).unwrap_or(any_v4);
+                cand.push(("SSH 网关".into(), "tcp", sip, ssh.bind_port, false));
+            }
+        }
+        // metrics:实际监听地址(metrics_listen_start 成功时记录;
+        // 热改/回滚即时反映,不读配置文件或 hot 的 metrics 字段)
+        let maddr = *self.metrics_listen_addr.lock().unwrap();
+        if let Some(maddr) = maddr {
+            cand.push((
+                "Prometheus 指标监听".into(),
+                "tcp",
+                maddr.ip(),
+                maddr.port(),
+                true,
+            ));
+        }
+        cand.into_iter()
+            .find(|(_, family, cip, cport, _)| {
+                bind_conflicts(proto, ip, port, family, *cip, *cport)
+            })
+            .map(|(label, _, cip, cport, live)| SelfPortHit {
+                label,
+                addr: SocketAddr::new(cip, cport),
+                live,
+            })
     }
 
     /// 认证窗口进入:超过每 IP 上限返回 false(0 = 不限)。
@@ -419,6 +563,12 @@ pub struct Metrics {
     /// goal-repair B1/B7 可观测性:数据面路径选择计数
     /// (label path = chunk | splice | copy;命中/回落诊断)。
     pub relay_path_total: prometheus::IntCounterVec,
+    /// c84 G5 1/N 事件归因(candidate-r0 diagnostics README:36-40):
+    /// 会话级失败计数——建立阶段静默丢弃(健康摘除/通道不可得/配额拒绝/
+    /// START_FORWARD 写失败)与 copy 路径 relay 异常终止的唯一常驻留痕。
+    /// label reason 为固定小集合(见 data.rs 调用点),无逐连接标签;
+    /// 正常 EOF 与规则取消不计,避免淹没 1/N 信号。
+    pub session_failures_total: prometheus::IntCounterVec,
     /// 汇总(控制台 overview)。原子化:数据面每块字节都要经过这里,
     /// 全局互斥锁曾是所有转发连接的串行点。
     pub conns_current: std::sync::atomic::AtomicI64,
@@ -455,11 +605,20 @@ impl Metrics {
             &["path"],
         )
         .unwrap();
+        let session_failures_total = prometheus::IntCounterVec::new(
+            Opts::new(
+                "rabbithole_session_failures_total",
+                "per-session failures (establishment drop / relay abnormal end)",
+            ),
+            &["reason"],
+        )
+        .unwrap();
         let _ = registry.register(Box::new(connections.clone()));
         let _ = registry.register(Box::new(client_online.clone()));
         let _ = registry.register(Box::new(bytes_in_total.clone()));
         let _ = registry.register(Box::new(bytes_out_total.clone()));
         let _ = registry.register(Box::new(relay_path_total.clone()));
+        let _ = registry.register(Box::new(session_failures_total.clone()));
         Self {
             registry,
             connections,
@@ -467,6 +626,7 @@ impl Metrics {
             bytes_in_total,
             bytes_out_total,
             relay_path_total,
+            session_failures_total,
             conns_current: std::sync::atomic::AtomicI64::new(0),
             console_bytes_in: std::sync::atomic::AtomicU64::new(0),
             console_bytes_out: std::sync::atomic::AtomicU64::new(0),
@@ -486,6 +646,14 @@ impl Metrics {
     /// 数据面路径选择计数(chunk/splice/copy;goal-repair B1/B7 诊断)。
     pub fn count_relay_path(&self, path: &str) {
         self.relay_path_total.with_label_values(&[path]).inc();
+    }
+
+    /// 会话级失败计数(c84 G5 1/N 归因):建立失败/relay 异常终止各调用点
+    /// 自带单条 debug!() 明细,这里是常驻 /metrics 信号(reason 固定小集合)。
+    pub fn count_session_failure(&self, reason: &str) {
+        self.session_failures_total
+            .with_label_values(&[reason])
+            .inc();
     }
 
     /// 用户→服务端方向 n 字节(入站):totals 供控制台,counter 供 /metrics。

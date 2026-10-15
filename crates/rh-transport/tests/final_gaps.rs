@@ -18,7 +18,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const DEADLINE: Duration = Duration::from_secs(5);
 
 /// 公共夹具:duplex 上的真实 client/server yamux 对。
-fn peer_pair() -> (std::sync::Arc<rh_transport::Multiplexer>, std::sync::Arc<rh_transport::Multiplexer>) {
+fn peer_pair() -> (
+    std::sync::Arc<rh_transport::Multiplexer>,
+    std::sync::Arc<rh_transport::Multiplexer>,
+) {
     let (a, b) = tokio::io::duplex(4096);
     let client = mux::wrap_stream_as_client(Box::new(a) as BoxedIo, true, 100);
     let server = mux::wrap_stream_as_server(Box::new(b) as BoxedIo, true, 100);

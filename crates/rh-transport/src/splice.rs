@@ -11,10 +11,14 @@
 //! * abort(流量封禁)→ 双向 SHUT_RDWR 模拟断连,唤醒对向泵。
 
 use crate::BoxedIo;
+use pin_project_lite::pin_project;
+use std::future::Future;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::io::unix::AsyncFd;
 
 const SPLICE_F_MOVE: u32 = 1;
@@ -42,6 +46,461 @@ fn notsent_lowat() -> u32 {
             .and_then(|s| s.parse().ok())
             .unwrap_or(NOTSENT_LOWAT)
     })
+}
+
+/// 每批字节预算(G1 修正 2 新增不变量):tokio `AsyncFd::readable/writable`
+/// 的 async 路径不消耗协作预算(实测 1.53.2 `async_fd.rs` 全文无
+/// `poll_proceed`),两端持续就绪时泵可在单 worker 上无限期霸占执行。
+/// 批次化泵(`pump_batched`)在**无真实等待的连续搬运段**内每搬运该
+/// 字节数后 `tokio::task::yield_now()` 显式让步一次——不用
+/// `consume_budget()`:它只在任务预算(默认 128)耗尽时才让步,而本泵
+/// 每批仅调用一次,预算永不耗尽,让步不会发生(设计期自查发现)。
+/// yield_now 是确定性让步:每批至多一次调度切换,4MiB = 16 块 @
+/// 256KiB,开销相对搬运量可忽略;「批」以真实等待(EAGAIN)为界,
+/// 低负载小包场景每批 2 ops 远不触预算,不引入额外让步延迟。
+const BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// 每批 splice 操作数预算(小包/小块场景按操作数兜底,字节预算不触发)。
+const BATCH_OPS: u32 = 64;
+
+/// 单泵本地计数(G1-A 最小观测;计划 §A「每泵本地累计、结束时输出,
+/// 默认不影响热路径」):每泵私有实例,泵任务独占写,AtomicU64 仅为
+/// 结束后的外部读取(测试断言/诊断输出)服务——不存在跨泵争用点,
+/// 频率为每搬运块常数次(≈5 次/256KiB,远低于一次 splice syscall),
+/// 不构成「每包全局原子」热点。
+///
+/// 生产默认(`RH_SPLICE_STATS` 未设/空/"0")泵**不持有**计数:不分配
+/// Arc、热循环不执行任何统计原子/Instant/输出(见 [`splice_relay`]);
+/// 以下字段仅在统计开启(计数句柄注入)时被写。
+///
+/// 语义对齐 example-contract(fixed-ab-v1)的 counters 字段:
+/// * `pending_waits_*`:**EAGAIN 观察后**经 `guard.clear_ready()` 的
+///   等待尝试次数——**旧口径(尝试),保留历史可比性**;真实挂起由
+///   下方 v2 字段(pending_polls_/wait_cycles_/wait_ns_)区分,不写入
+///   本字段。legacy 臂的首次初始等待(无 EAGAIN 前置)不在该口径内。
+/// * `eagain_fill_input_empty` / `eagain_drain_pipe_full` /
+///   `eagain_drain_write_full`:按 EAGAIN 的**实际来源方向**分开计
+///   (G1 复核修正 3)。单块管线深度(fill 时刻管道必空)下
+///   `eagain_drain_pipe_full` 结构性不出现(恒 0);引入多块管线时
+///   必须先补「管道满 → 转 drain」的路由再使用该计数。
+///
+/// v2 真实挂起观测(口径):
+/// * `pending_polls_*`:poll 实际返回 `Poll::Pending` 的次数(同周期
+///   多次 Pending 各计 1;poll 数 ≠ 周期数 ≠ 内核 wakeup);
+/// * `wait_cycles_*`:「至少一次 Pending」的周期数(首次 Pending 计 1,
+///   Ready 立返不计);
+/// * `wait_ns_*`:各周期「首次 Pending → Ready/取消/Drop」累计纳秒
+///   (时钟可注入;Drop 结算不遗失);
+/// * `*_min/max_bytes`:成功 fill/drain 单次字节数(块分布;无成功
+///   调用输出 null,不以 0 冒充)。
+pub(crate) struct PumpCounters {
+    pub fill_calls: AtomicU64,
+    pub fill_bytes: AtomicU64,
+    pub drain_calls: AtomicU64,
+    pub drain_bytes: AtomicU64,
+    pub eagain_fill_input_empty: AtomicU64,
+    pub eagain_drain_pipe_full: AtomicU64,
+    pub eagain_drain_write_full: AtomicU64,
+    pub pending_waits_read: AtomicU64,
+    pub pending_waits_write: AtomicU64,
+    pub coop_yields: AtomicU64,
+    pub pending_polls_read: AtomicU64,
+    pub pending_polls_write: AtomicU64,
+    pub wait_cycles_read: AtomicU64,
+    pub wait_cycles_write: AtomicU64,
+    pub wait_ns_read: AtomicU64,
+    pub wait_ns_write: AtomicU64,
+    pub fill_min_bytes: AtomicU64,
+    pub fill_max_bytes: AtomicU64,
+    pub drain_min_bytes: AtomicU64,
+    pub drain_max_bytes: AtomicU64,
+}
+
+impl Default for PumpCounters {
+    fn default() -> Self {
+        Self {
+            fill_calls: AtomicU64::new(0),
+            fill_bytes: AtomicU64::new(0),
+            drain_calls: AtomicU64::new(0),
+            drain_bytes: AtomicU64::new(0),
+            eagain_fill_input_empty: AtomicU64::new(0),
+            eagain_drain_pipe_full: AtomicU64::new(0),
+            eagain_drain_write_full: AtomicU64::new(0),
+            pending_waits_read: AtomicU64::new(0),
+            pending_waits_write: AtomicU64::new(0),
+            coop_yields: AtomicU64::new(0),
+            pending_polls_read: AtomicU64::new(0),
+            pending_polls_write: AtomicU64::new(0),
+            wait_cycles_read: AtomicU64::new(0),
+            wait_cycles_write: AtomicU64::new(0),
+            wait_ns_read: AtomicU64::new(0),
+            wait_ns_write: AtomicU64::new(0),
+            // min 哨兵 = u64::MAX(0 会让 fetch_min 永远停在 0);
+            // 无成功调用时快照输出 null,哨兵值不外泄
+            fill_min_bytes: AtomicU64::new(u64::MAX),
+            fill_max_bytes: AtomicU64::new(0),
+            drain_min_bytes: AtomicU64::new(u64::MAX),
+            drain_max_bytes: AtomicU64::new(0),
+        }
+    }
+}
+
+/// v2 结束记录的非计数字段(relay/pump 建立时采样一次)。
+struct RelayMeta {
+    mode: PumpMode,
+    dir: &'static str,
+    /// 泵起始时刻(ns,相对 relay 共享时钟锚点;up/down 可关联)。
+    start_ns: u64,
+    /// relay 建立时刻墙钟(UNIX 微秒);与 duration_ns 配对,把
+    /// start_ns/duration 对齐到 iperf epoch 窗口。未采样 → null。
+    started_unix_us: Option<u64>,
+    /// 源 socket(泵输入)本地/对端地址;采样失败 → None(JSON null)。
+    src_local: Option<String>,
+    src_peer: Option<String>,
+    dst_local: Option<String>,
+    dst_peer: Option<String>,
+}
+
+impl PumpCounters {
+    /// 单行严格 JSON(schema v2):计数快照 + 可关联元数据(模式/方向/
+    /// 单调时间区间/四元组地址)。沿既有 stderr 单行输出形态。
+    fn snapshot_json(&self, m: &RelayMeta, end_ns: u64) -> String {
+        let fc = self.fill_calls.load(Ordering::Relaxed);
+        let dc = self.drain_calls.load(Ordering::Relaxed);
+        // 无成功调用 → null(未观测,不以 0 冒充)
+        let block = |calls: u64, v: u64| -> serde_json::Value {
+            if calls == 0 {
+                serde_json::Value::Null
+            } else {
+                v.into()
+            }
+        };
+        serde_json::json!({
+            "splice_stats": "v2",
+            "dir": m.dir,
+            "pump_mode": match m.mode {
+                PumpMode::Legacy => "legacy",
+                PumpMode::Batched => "batched",
+            },
+            "start_ns": m.start_ns,
+            "started_unix_us": m.started_unix_us,
+            "duration_ns": end_ns.saturating_sub(m.start_ns),
+            "src_local": m.src_local.as_deref(),
+            "src_peer": m.src_peer.as_deref(),
+            "dst_local": m.dst_local.as_deref(),
+            "dst_peer": m.dst_peer.as_deref(),
+            "fill_calls": fc,
+            "fill_bytes": self.fill_bytes.load(Ordering::Relaxed),
+            "fill_min_bytes": block(fc, self.fill_min_bytes.load(Ordering::Relaxed)),
+            "fill_max_bytes": block(fc, self.fill_max_bytes.load(Ordering::Relaxed)),
+            "drain_calls": dc,
+            "drain_bytes": self.drain_bytes.load(Ordering::Relaxed),
+            "drain_min_bytes": block(dc, self.drain_min_bytes.load(Ordering::Relaxed)),
+            "drain_max_bytes": block(dc, self.drain_max_bytes.load(Ordering::Relaxed)),
+            "eagain_fill_input_empty": self.eagain_fill_input_empty.load(Ordering::Relaxed),
+            "eagain_drain_pipe_full": self.eagain_drain_pipe_full.load(Ordering::Relaxed),
+            "eagain_drain_write_full": self.eagain_drain_write_full.load(Ordering::Relaxed),
+            "pending_waits_read": self.pending_waits_read.load(Ordering::Relaxed),
+            "pending_waits_write": self.pending_waits_write.load(Ordering::Relaxed),
+            "pending_polls_read": self.pending_polls_read.load(Ordering::Relaxed),
+            "pending_polls_write": self.pending_polls_write.load(Ordering::Relaxed),
+            "wait_cycles_read": self.wait_cycles_read.load(Ordering::Relaxed),
+            "wait_cycles_write": self.wait_cycles_write.load(Ordering::Relaxed),
+            "wait_ns_read": self.wait_ns_read.load(Ordering::Relaxed),
+            "wait_ns_write": self.wait_ns_write.load(Ordering::Relaxed),
+            "coop_yields": self.coop_yields.load(Ordering::Relaxed),
+        })
+        .to_string()
+    }
+}
+
+/// 开关解析(纯函数,可测):未设置/空/"0" 视为关闭,其余任意值开启。
+fn stats_enabled_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !s.is_empty() && s != "0",
+        None => false,
+    }
+}
+
+/// `RH_SPLICE_STATS`:生产入口初始化读一次决定是否装配统计,热循环
+/// 不再读 env。开启时泵退出(含 panic unwind)输出 v2 单行 JSON。
+fn stats_enabled() -> bool {
+    stats_enabled_value(std::env::var("RH_SPLICE_STATS").ok().as_deref())
+}
+
+/// 等待时长时钟(单调纳秒差值;可注入,测试用受控时钟)。
+trait WaitClock: Send + Sync {
+    fn now_ns(&self) -> u64;
+}
+
+/// 生产单调时钟:锚点 = relay 初始化,两泵共享。
+struct MonoClock {
+    anchor: std::time::Instant,
+}
+
+impl MonoClock {
+    fn new() -> Self {
+        Self {
+            anchor: std::time::Instant::now(),
+        }
+    }
+}
+
+impl WaitClock for MonoClock {
+    fn now_ns(&self) -> u64 {
+        self.anchor.elapsed().as_nanos() as u64
+    }
+}
+
+/// readiness 等待方向(选择 v2 计数字段)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WaitDir {
+    Read,
+    Write,
+}
+
+/// 泵观测装配:counters/clock/started 同 Some(开启)或同 None(默认)。
+#[derive(Clone, Default)]
+struct PumpObs {
+    counters: Option<Arc<PumpCounters>>,
+    clock: Option<Arc<dyn WaitClock>>,
+    /// relay 建立墙钟(UNIX 微秒):开启时采一次,关不读 SystemTime。
+    started_unix_us: Option<u64>,
+}
+
+/// 建立时刻墙钟(UNIX 微秒);时钟不可用时 None(JSON null,不冒充)。
+fn unix_now_us() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_micros() as u64)
+}
+
+/// 统计开启才执行的原子自增(关闭 = 零原子操作,仅 Option 判空分支)。
+macro_rules! stat_bump {
+    ($obs:expr, $field:ident, $v:expr) => {
+        if let Some(s) = &$obs.counters {
+            s.$field.fetch_add($v as u64, Ordering::Relaxed);
+        }
+    };
+}
+
+// readiness 等待观测包装(v2 口径见 [`PumpCounters`];仅统计开启时装配)。
+pin_project! {
+    struct ReadinessWatch<F> {
+        #[pin]
+        fut: F,
+        c: Arc<PumpCounters>,
+        dir: WaitDir,
+        clock: Arc<dyn WaitClock>,
+        first_pending_ns: Option<u64>,
+    }
+    impl<F> PinnedDrop for ReadinessWatch<F> {
+        fn drop(this: Pin<&mut Self>) {
+            let p = this.project();
+            settle_wait(p.c, *p.dir, p.clock.as_ref(), p.first_pending_ns.take());
+        }
+    }
+}
+
+/// 幂等结算一个等待周期(已被 take → no-op):结束 − 首次 Pending,
+/// 累计入 wait_ns_*。
+fn settle_wait(
+    c: &PumpCounters,
+    dir: WaitDir,
+    clock: &dyn WaitClock,
+    first_pending_ns: Option<u64>,
+) {
+    if let Some(first) = first_pending_ns {
+        let ns = clock.now_ns().saturating_sub(first);
+        match dir {
+            WaitDir::Read => &c.wait_ns_read,
+            WaitDir::Write => &c.wait_ns_write,
+        }
+        .fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+impl<F> ReadinessWatch<F> {
+    fn new(fut: F, c: Arc<PumpCounters>, dir: WaitDir, clock: Arc<dyn WaitClock>) -> Self {
+        Self {
+            fut,
+            c,
+            dir,
+            clock,
+            first_pending_ns: None,
+        }
+    }
+}
+
+impl<F: Future> Future for ReadinessWatch<F> {
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let mut this = self.project();
+        match this.fut.as_mut().poll(cx) {
+            Poll::Pending => {
+                let now_ns = this.clock.now_ns();
+                match this.dir {
+                    WaitDir::Read => {
+                        this.c.pending_polls_read.fetch_add(1, Ordering::Relaxed);
+                    }
+                    WaitDir::Write => {
+                        this.c.pending_polls_write.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if this.first_pending_ns.is_none() {
+                    *this.first_pending_ns = Some(now_ns);
+                    match this.dir {
+                        WaitDir::Read => {
+                            this.c.wait_cycles_read.fetch_add(1, Ordering::Relaxed);
+                        }
+                        WaitDir::Write => {
+                            this.c.wait_cycles_write.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Poll::Pending
+            }
+            r @ Poll::Ready(_) => {
+                settle_wait(
+                    this.c,
+                    *this.dir,
+                    this.clock.as_ref(),
+                    this.first_pending_ns.take(),
+                );
+                r
+            }
+        }
+    }
+}
+
+pin_project! {
+    /// Off = 统计关闭原样转发(零计数、无额外 await,取消行为不变);
+    /// On = 观测。两臂同口径。
+    #[project = WatchedProj]
+    enum Watched<F> {
+        Off {
+            #[pin]
+            fut: F,
+        },
+        On {
+            #[pin]
+            watch: ReadinessWatch<F>,
+        },
+    }
+}
+
+impl<F: Future> Future for Watched<F> {
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        match self.project() {
+            WatchedProj::Off { fut } => fut.poll(cx),
+            WatchedProj::On { watch } => watch.poll(cx),
+        }
+    }
+}
+
+/// 就绪等待包装点:开启 → On 观测;否则 Off 原样透传。
+fn watch_ready<F: Future>(obs: &PumpObs, fut: F, dir: WaitDir) -> Watched<F> {
+    match (&obs.counters, &obs.clock) {
+        (Some(c), Some(k)) => Watched::On {
+            watch: ReadinessWatch::new(fut, c.clone(), dir, k.clone()),
+        },
+        _ => Watched::Off { fut },
+    }
+}
+
+/// 泵退出的计数输出守卫:统计开启时任何 return/panic 路径经 Drop 输出
+/// 一行 v2 JSON(stderr);地址/时间建立采一次、结束采一次。
+struct StatsEmitter {
+    c: Arc<PumpCounters>,
+    meta: RelayMeta,
+    clock: Arc<dyn WaitClock>,
+}
+
+/// socket 四元组采样(本地/对端各一次;失败 → None,JSON null)。
+fn sock_addrs(s: &SpliceSock) -> (Option<String>, Option<String>) {
+    let r = socket2::SockRef::from(s.fd.get_ref());
+    let addr = |f: fn(&socket2::SockRef) -> io::Result<socket2::SockAddr>| {
+        f(&r)
+            .ok()
+            .and_then(|a| a.as_socket())
+            .map(|a| a.to_string())
+    };
+    (addr(|r| r.local_addr()), addr(|r| r.peer_addr()))
+}
+
+impl StatsEmitter {
+    fn new(
+        c: Arc<PumpCounters>,
+        mode: PumpMode,
+        dir: &'static str,
+        started_unix_us: Option<u64>,
+        in_sock: &SpliceSock,
+        out_sock: &SpliceSock,
+        clock: Arc<dyn WaitClock>,
+    ) -> Self {
+        let (src_local, src_peer) = sock_addrs(in_sock);
+        let (dst_local, dst_peer) = sock_addrs(out_sock);
+        Self {
+            c,
+            meta: RelayMeta {
+                mode,
+                dir,
+                start_ns: clock.now_ns(),
+                started_unix_us,
+                src_local,
+                src_peer,
+                dst_local,
+                dst_peer,
+            },
+            clock,
+        }
+    }
+}
+
+impl Drop for StatsEmitter {
+    fn drop(&mut self) {
+        eprintln!("{}", self.c.snapshot_json(&self.meta, self.clock.now_ns()));
+    }
+}
+
+/// 统计开启时装配 v2 输出守卫(泵顶部调用一次)。
+fn emitter_for(
+    obs: &PumpObs,
+    mode: PumpMode,
+    dir: &'static str,
+    in_sock: &SpliceSock,
+    out_sock: &SpliceSock,
+) -> Option<StatsEmitter> {
+    match (&obs.counters, &obs.clock) {
+        (Some(c), Some(k)) => Some(StatsEmitter::new(
+            c.clone(),
+            mode,
+            dir,
+            obs.started_unix_us,
+            in_sock,
+            out_sock,
+            k.clone(),
+        )),
+        _ => None,
+    }
+}
+
+/// 泵实现选择:默认 `Batched`(非阻塞快试 + 仅 EAGAIN 后等待 + 有界
+/// 批次预算/让步);`RH_SPLICE_PUMP=legacy` 临时切回旧控制流作同树
+/// 同计数对照(本地归因用;最终获益机制以默认路径交付,不以开关偷换
+/// 目标——fixed-ab/三机验收均在无 env 下走默认臂)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PumpMode {
+    Legacy,
+    Batched,
+}
+
+fn pump_mode_from_env() -> PumpMode {
+    match std::env::var("RH_SPLICE_PUMP").as_deref() {
+        Ok("legacy") => PumpMode::Legacy,
+        _ => PumpMode::Batched,
+    }
 }
 
 /// 限速:预留式取消安全接口(goal-repair A5;适配 TokenBucket 等)。
@@ -211,7 +670,12 @@ fn shutdown_rdwr(s: &SpliceSock) {
     }
 }
 
-/// 单向泵:in socket → pipe → out socket。
+/// 单向泵(旧控制流,`RH_SPLICE_PUMP=legacy` 臂):每次 fill 前建立
+/// readable/select future,然后排空管道;每次 drain 前建立 writable/
+/// select future。相对批次化臂**无协作让步**(coop_yields 恒 0)与
+/// 非阻塞快试——保留用于同树同计数对照(G1-A),行为与 g1 输入基线
+/// 的旧泵一致,仅插入计数点。
+///
 /// 退出路径(EOF/读错误/写错误 → shutdown out 写侧;中止/取消 → 断连),
 /// 与用户态 copy 循环「循环结束即 shutdown 写端」语义对齐(B5:写错误
 /// 分支同样 shutdown 写侧,不再与 copy 口径分叉)。
@@ -219,14 +683,20 @@ fn shutdown_rdwr(s: &SpliceSock) {
 /// down(送达口径,排空后按实际送达字节计)由 DirHook 装配决定。
 /// 限速(A5):预留式等待与取消信号竞争;down 按实际送达消费,
 /// 取消/部分送达退还未消费预留(A6:取消时已送达字节先计量再退出)。
-async fn pump(
+/// 观测(A):`obs` 全 None 时热循环零统计;开启时就绪等待经
+/// [`watch_ready`] 包装记录真实挂起(两臂同口径)。
+#[allow(clippy::too_many_arguments)]
+async fn pump_legacy(
     in_sock: Arc<SpliceSock>,
     out_sock: Arc<SpliceSock>,
     pipe: Pipe,
     hook: Option<DirHook>,
     abort: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     cancel: Option<CancelFuture>,
+    dir: &'static str,
+    obs: PumpObs,
 ) {
+    let _stats_out = emitter_for(&obs, PumpMode::Legacy, dir, &in_sock, &out_sock);
     let pr = pipe.r.as_raw_fd();
     let pw = pipe.w.as_raw_fd();
 
@@ -256,7 +726,7 @@ async fn pump(
         // 就绪等待与取消信号竞争:规则禁用/删除要求拆除阻塞中的泵。
         let n = 'fill: loop {
             let mut guard = match tokio::select! {
-                g = in_sock.fd.readable() => g,
+                g = watch_ready(&obs, in_sock.fd.readable(), WaitDir::Read) => g,
                 _ = &mut cancel_wait => {
                     teardown(&in_sock, &out_sock);
                     return;
@@ -273,9 +743,21 @@ async fn pump(
                     shutdown_wr(&out_sock);
                     return;
                 }
-                Ok(n) => break 'fill n,
+                Ok(n) => {
+                    stat_bump!(obs, fill_calls, 1);
+                    stat_bump!(obs, fill_bytes, n);
+                    if let Some(s) = &obs.counters {
+                        s.fill_min_bytes.fetch_min(n as u64, Ordering::Relaxed);
+                        s.fill_max_bytes.fetch_max(n as u64, Ordering::Relaxed);
+                    }
+                    break 'fill n;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // 块语义:fill 时管道必空,EAGAIN 来源=输入空
+                    stat_bump!(obs, eagain_fill_input_empty, 1);
                     guard.clear_ready();
+                    // 旧口径:等待尝试次数(真实挂起由包装 future 记录)
+                    stat_bump!(obs, pending_waits_read, 1);
                     continue;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -323,7 +805,7 @@ async fn pump(
         let mut delivered: usize = 0;
         loop {
             let mut guard = match tokio::select! {
-                g = out_sock.fd.writable() => g,
+                g = watch_ready(&obs, out_sock.fd.writable(), WaitDir::Write) => g,
                 _ = &mut cancel_wait => {
                     // A6:排空中取消——已送达字节先计量再退出
                     if delivered > 0 {
@@ -351,9 +833,20 @@ async fn pump(
                 }
             };
             match splice_sys(pr, out_sock.raw_fd(), (n - delivered).min(DRAIN_SLICE)) {
-                Ok(m) => delivered += m,
+                Ok(m) => {
+                    delivered += m;
+                    stat_bump!(obs, drain_calls, 1);
+                    stat_bump!(obs, drain_bytes, m);
+                    if let Some(s) = &obs.counters {
+                        s.drain_min_bytes.fetch_min(m as u64, Ordering::Relaxed);
+                        s.drain_max_bytes.fetch_max(m as u64, Ordering::Relaxed);
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    stat_bump!(obs, eagain_drain_write_full, 1);
                     guard.clear_ready();
+                    // 旧口径:等待尝试次数(真实挂起由包装 future 记录)
+                    stat_bump!(obs, pending_waits_write, 1);
                     continue;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -388,35 +881,363 @@ async fn pump(
     }
 }
 
+/// 单向泵(默认臂,G1 候选):in socket → pipe → out socket。
+///
+/// 相对 legacy 的**单变量**控制流差异(G1 计划 §B):
+/// 1. **非阻塞快试**:fill/drain 直接以 `SPLICE_F_NONBLOCK` splice 尝试,
+///    不先建立 readiness future——legacy 每次 fill/drain 各建一次
+///    `readable()/writable()` future(ready 态是异步快速路径,无 syscall,
+///    但仍有 future 构造/poll/drop 成本;两端持续就绪时每块两次)。
+/// 2. **仅 EAGAIN 后等待,按来源归因**(round-2 注释修正:顺序以实现
+///    为准——AsyncFd 的 `clear_ready` 须先持有 guard,故为「等待→清→
+///    重试」):fill EAGAIN(块语义下管道必空,来源=输入空)→ 等
+///    `readable()` 取得 guard → `clear_ready` 清就绪缓存 → 重试快试;
+///    drain EAGAIN(写侧满)→ 等 `writable()` → `clear_ready` → 重试。
+///    陈旧缓存使等待至多一次立即返回,清掉后无新沿(EPOL_ET)时下一次
+///    等待即真实 Pending——只在**观察到对应方向 EAGAIN** 后 clear 是
+///    无丢唤醒/无忙转的关键(G1 复核修正 3:数据已在缓冲而缓存被清后
+///    没有新沿,不得在未观察 EAGAIN 时清读侧就绪)。
+/// 3. **有界批次 + 显式让步**:无等待连续搬运段内每搬运 `BATCH_BYTES`/
+///    `BATCH_OPS` 后 `yield_now()`(确定性让步;`consume_budget()` 在
+///    每批仅一次调用的形态下预算永不耗尽、让步不会发生,见 BATCH_BYTES
+///    注释),两端持续就绪时不再霸占 worker(G1 复核修正 2,
+///    legacy 无此不变量)。零进展(EAGAIN)必然落入真实 readiness 等待,
+///    绝不忙转。
+///
+/// 严格保持(与 legacy 逐点一致):每 fill 块完成即 up 计量、先于限速
+/// 等待(B6);限速预留/消费/退还三态(A5);abort 检查粒度=每块两次
+/// (批首 + fill/限速后);读 EOF 半关闭;写错误/读错误收尾 shutdown 写侧
+/// (B5);排空中取消的已送达计量(A6——本臂逐 drain 进展即计量,取消
+/// 窗口更小);管道有界;任何 drain 返回零即停止而非自旋。
+/// 观测(A):`obs` 全 None 时热循环零统计;开启时 EAGAIN 后的就绪等待
+/// 经 [`watch_ready`] 包装记录真实挂起(口径与 legacy 臂一致)。
+#[allow(clippy::too_many_arguments)]
+async fn pump_batched(
+    in_sock: Arc<SpliceSock>,
+    out_sock: Arc<SpliceSock>,
+    pipe: Pipe,
+    hook: Option<DirHook>,
+    abort: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    cancel: Option<CancelFuture>,
+    dir: &'static str,
+    obs: PumpObs,
+) {
+    let _stats_out = emitter_for(&obs, PumpMode::Batched, dir, &in_sock, &out_sock);
+    let pr = pipe.r.as_raw_fd();
+    let pw = pipe.w.as_raw_fd();
+
+    let cancel_wait = async {
+        match cancel {
+            Some(c) => c.await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancel_wait);
+
+    fn teardown(s1: &SpliceSock, s2: &SpliceSock) {
+        shutdown_rdwr(s1);
+        shutdown_rdwr(s2);
+    }
+
+    let mut batch_bytes = 0usize;
+    let mut batch_ops = 0u32;
+    loop {
+        // 批首 abort(块边界口径与 legacy 一致:每块两次检查之一)
+        if let Some(f) = &abort {
+            if f() {
+                teardown(&in_sock, &out_sock);
+                return;
+            }
+        }
+        // B1(round-2 复核修复):恢复「每块至少一次 cancel poll」。legacy
+        // 每 fill/drain 都经 select{readiness|cancel}(select! 随机顺序下
+        // 即使 readiness 恒 Ready,pending 的 cancel 分支也有 ~50% 概率被
+        // poll),而本臂快试路径无 readiness 等待点——满载两端持续 ready
+        // (无 EAGAIN、无限速:生产装配双桶皆空时不装 limiter)时 cancel
+        // 无人 poll,「完成即双向断连」的响应上界退化为偶发 EAGAIN/流
+        // 自然断。biased select 在块边界同步 poll 一次 cancel_wait:
+        // 已完成立即 teardown,未完成 poll 一次(注册 waker,几十 ns/块,
+        // 相对 256KiB 块的 splice syscall 微秒级成本可忽略)即继续。
+        tokio::select! {
+            biased;
+            _ = &mut cancel_wait => {
+                teardown(&in_sock, &out_sock);
+                return;
+            }
+            _ = futures::future::ready(()) => {}
+        }
+        // fill 快试(非阻塞,不建 readiness future)
+        let n = match splice_sys(in_sock.raw_fd(), pw, PIPE_SIZE as usize) {
+            Ok(0) => {
+                // 读 EOF:块语义下 fill 时管道必空,直接半关闭
+                shutdown_wr(&out_sock);
+                return;
+            }
+            Ok(n) => {
+                stat_bump!(obs, fill_calls, 1);
+                stat_bump!(obs, fill_bytes, n);
+                if let Some(s) = &obs.counters {
+                    s.fill_min_bytes.fetch_min(n as u64, Ordering::Relaxed);
+                    s.fill_max_bytes.fetch_max(n as u64, Ordering::Relaxed);
+                }
+                batch_ops += 1;
+                n
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // 来源归因:单块管线深度下 fill 时管道必空 → 输入空;
+                // 管道满来源(须转 drain)在本臂结构性不出现,计数恒 0
+                stat_bump!(obs, eagain_fill_input_empty, 1);
+                let mut guard = match tokio::select! {
+                    g = watch_ready(&obs, in_sock.fd.readable(), WaitDir::Read) => g,
+                    _ = &mut cancel_wait => {
+                        teardown(&in_sock, &out_sock);
+                        return;
+                    }
+                } {
+                    Ok(g) => g,
+                    Err(_) => {
+                        shutdown_wr(&out_sock);
+                        return;
+                    }
+                };
+                // 已观察到 EAGAIN:清就绪缓存,使下一次 readable() 仅在
+                // 新数据沿后返回——陈旧缓存立即唤醒即零进展忙转
+                guard.clear_ready();
+                // 旧口径:等待尝试次数(真实挂起由包装 future 记录)
+                stat_bump!(obs, pending_waits_read, 1);
+                // 真实等待为「批」之界:连续搬运段结束,预算重新计满
+                batch_bytes = 0;
+                batch_ops = 0;
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                shutdown_wr(&out_sock);
+                return;
+            }
+        };
+        // B6:up 读侧口径——fill 完成即计量,先于限速等待(点位/粒度不变)
+        if let Some(h) = &hook {
+            if h.meter_on_fill {
+                if let Some(c) = &h.on_bytes {
+                    c(n as u64);
+                }
+            }
+        }
+        // A5:预留式限速等待,与取消信号竞争
+        let mut reservation = match hook.as_ref().and_then(|h| h.limiter.clone()) {
+            Some(l) => Some(tokio::select! {
+                r = l.reserve(n) => r,
+                _ = &mut cancel_wait => {
+                    teardown(&in_sock, &out_sock);
+                    return;
+                }
+            }),
+            None => None,
+        };
+        if hook.as_ref().is_some_and(|h| h.meter_on_fill) {
+            if let Some(r) = reservation.as_mut() {
+                r.consume(n);
+            }
+        }
+        // fill/限速后的 abort 检查(每块第二次,粒度不放宽)
+        if let Some(f) = &abort {
+            if f() {
+                drop(reservation); // 未消费预留退还
+                teardown(&in_sock, &out_sock);
+                return;
+            }
+        }
+        // drain:非阻塞快试至块尽/EAGAIN。down 口径**逐 drain 进展**
+        // 计量+消费(总量口径与 legacy 一致;A6 取消窗口更小:已送达
+        // 即已计),reservation 差额随 drop 退还。
+        let mut delivered: usize = 0;
+        loop {
+            match splice_sys(pr, out_sock.raw_fd(), (n - delivered).min(DRAIN_SLICE)) {
+                Ok(0) => {
+                    // 管道空但块未排空:状态错乱(本泵独占管道,不应发生),
+                    // 保守收尾防零进展自旋
+                    shutdown_wr(&out_sock);
+                    break;
+                }
+                Ok(m) => {
+                    delivered += m;
+                    stat_bump!(obs, drain_calls, 1);
+                    stat_bump!(obs, drain_bytes, m);
+                    if let Some(s) = &obs.counters {
+                        s.drain_min_bytes.fetch_min(m as u64, Ordering::Relaxed);
+                        s.drain_max_bytes.fetch_max(m as u64, Ordering::Relaxed);
+                    }
+                    batch_ops += 1;
+                    if let Some(h) = &hook {
+                        if !h.meter_on_fill {
+                            if let Some(c) = &h.on_bytes {
+                                c(m as u64);
+                            }
+                            if let Some(r) = reservation.as_mut() {
+                                r.consume(m);
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // 写侧满:清 out 写就绪缓存后真实等待 writable
+                    stat_bump!(obs, eagain_drain_write_full, 1);
+                    let mut guard = match tokio::select! {
+                        g = watch_ready(&obs, out_sock.fd.writable(), WaitDir::Write) => g,
+                        _ = &mut cancel_wait => {
+                            // A6:取消——已送达已逐进展计量,仅退差额
+                            drop(reservation);
+                            teardown(&in_sock, &out_sock);
+                            return;
+                        }
+                    } {
+                        Ok(g) => g,
+                        Err(_) => {
+                            // 写侧死亡:B5 收尾 shutdown 写侧
+                            shutdown_wr(&out_sock);
+                            break;
+                        }
+                    };
+                    guard.clear_ready();
+                    // 旧口径:等待尝试次数(真实挂起由包装 future 记录)
+                    stat_bump!(obs, pending_waits_write, 1);
+                    // 真实等待为「批」之界(同读侧)
+                    batch_bytes = 0;
+                    batch_ops = 0;
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    // B5:写错误分支与 copy 路径一致地收尾 shutdown 写侧
+                    shutdown_wr(&out_sock);
+                    break;
+                }
+            }
+            if delivered >= n {
+                break;
+            }
+        }
+        drop(reservation); // down 未消费部分(块中断)退还
+        if delivered < n {
+            // 未排空即退出:写侧已不可用
+            return;
+        }
+        batch_bytes += n;
+        // 有界批次:无等待连续搬运段的字节/操作预算触达 → 显式让步一次,
+        // 同 worker 任务不再被持续就绪的泵饿死(确定性 yield,理由见
+        // BATCH_BYTES 注释)
+        if batch_bytes >= BATCH_BYTES || batch_ops >= BATCH_OPS {
+            stat_bump!(obs, coop_yields, 1);
+            tokio::task::yield_now().await;
+            batch_bytes = 0;
+            batch_ops = 0;
+        }
+    }
+}
+
 /// 零拷贝双向中继。a/b 为两条裸 TCP(借用,不消费——回落时调用方仍持有原值)。
 /// 仅在 dup/pipe 等资源申请失败时返回 Err(回落信号);中继本身运行至双向结束。
 /// 父任务被取消(A2)时双向泵随 [`crate::AbortOnDropHandle`] 守卫终止并断连
 /// ——守卫以 `&mut` join,句柄不移出,父 future 被 drop 即 abort 双泵。
+///
+/// 泵实现经 `RH_SPLICE_PUMP` 选择:默认批次化(快试/仅 EAGAIN 等待/有界
+/// 预算让步);`legacy` 临时切回旧控制流(本地同树同计数对照)。
+///
+/// 统计(A):`RH_SPLICE_STATS` 初始化读一次——未设/空/"0"(生产默认)
+/// 不分配计数,热循环零统计原子/Instant/输出;开启时装配每泵计数 +
+/// 共享单调时钟,泵退出输出 v2 单行 JSON(stderr)。
 pub async fn splice_relay(
     a: &tokio::net::TcpStream,
     b: &tokio::net::TcpStream,
     hooks: SpliceHooks,
 ) -> io::Result<()> {
+    let mode = pump_mode_from_env();
+    let (up, down) = if stats_enabled() {
+        (
+            Some(Arc::new(PumpCounters::default())),
+            Some(Arc::new(PumpCounters::default())),
+        )
+    } else {
+        (None, None)
+    };
+    splice_relay_with_stats(a, b, hooks, mode, up, down).await
+}
+
+/// 双向中继(泵实现显式注入;无统计 = 生产默认等价路径;测试不经 env
+/// 直测两臂,避免并行测试的进程级 env 污染)。
+pub(crate) async fn splice_relay_inner(
+    a: &tokio::net::TcpStream,
+    b: &tokio::net::TcpStream,
+    hooks: SpliceHooks,
+    mode: PumpMode,
+) -> io::Result<()> {
+    splice_relay_with_stats(a, b, hooks, mode, None, None).await
+}
+
+/// 双向中继(泵实现与计数句柄显式注入):任一方向 Some 即视为统计
+/// 开启(共享时钟 + v2 输出 + 真实挂起观测);全 None 与生产默认一致。
+pub(crate) async fn splice_relay_with_stats(
+    a: &tokio::net::TcpStream,
+    b: &tokio::net::TcpStream,
+    hooks: SpliceHooks,
+    mode: PumpMode,
+    up_stats: Option<Arc<PumpCounters>>,
+    down_stats: Option<Arc<PumpCounters>>,
+) -> io::Result<()> {
+    let clock: Option<Arc<dyn WaitClock>> = if up_stats.is_some() || down_stats.is_some() {
+        Some(Arc::new(MonoClock::new()))
+    } else {
+        None
+    };
+    // 建立时刻墙钟仅统计开启时采样一次(默认关闭不读 SystemTime)。
+    let started_unix_us = if clock.is_some() { unix_now_us() } else { None };
+    let obs = |counters: Option<Arc<PumpCounters>>| PumpObs {
+        counters,
+        clock: clock.clone(),
+        started_unix_us,
+    };
     let sa = Arc::new(SpliceSock::dup(a)?);
     let sb = Arc::new(SpliceSock::dup(b)?);
     let p_ab = Pipe::new()?;
     let p_ba = Pipe::new()?;
-    let mut g1 = crate::AbortOnDropHandle::new(tokio::spawn(pump(
+    let spawn = |in_sock: Arc<SpliceSock>,
+                 out_sock: Arc<SpliceSock>,
+                 pipe: Pipe,
+                 hook: Option<DirHook>,
+                 abort: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+                 cancel: Option<CancelFuture>,
+                 dir: &'static str,
+                 obs: PumpObs| {
+        match mode {
+            PumpMode::Legacy => crate::AbortOnDropHandle::new(tokio::spawn(pump_legacy(
+                in_sock, out_sock, pipe, hook, abort, cancel, dir, obs,
+            ))),
+            PumpMode::Batched => crate::AbortOnDropHandle::new(tokio::spawn(pump_batched(
+                in_sock, out_sock, pipe, hook, abort, cancel, dir, obs,
+            ))),
+        }
+    };
+    let mut g1 = spawn(
         sa.clone(),
         sb.clone(),
         p_ab,
         hooks.up,
         hooks.abort.clone(),
         hooks.cancel.clone(),
-    )));
-    let mut g2 = crate::AbortOnDropHandle::new(tokio::spawn(pump(
+        "up",
+        obs(up_stats),
+    );
+    let mut g2 = spawn(
         sb,
         sa,
         p_ba,
         hooks.down,
         hooks.abort,
         hooks.cancel,
-    )));
+        "down",
+        obs(down_stats),
+    );
     // final-gaps 补修:单泵 panic 时对向泵立即终止(不永存)。修前
     // `tokio::join!` 等双泵——panic 泵不做 teardown,对向阻塞在
     // readable() 永不结束,relay 卡死扣住 socket(与 mux/copy 路径的
@@ -1084,5 +1905,694 @@ mod tests {
             .await
             .expect("单泵 panic 后 splice_relay 必须收敛(对向泵不得永存)")
             .unwrap();
+    }
+
+    // ======================= G1 批次化泵定向回归 =======================
+    // 以上既有回归全部经默认 `splice_relay`(=Batched 臂)运行,即新泵
+    // 全量语义回归;以下为 G1 候选新增不变量/观测的直接覆盖。
+
+    /// 泵模式默认值:未设 RH_SPLICE_PUMP 时必须落 Batched(最终获益机制
+    /// 为默认路径,不以开关偷换目标)。只读断言——不在测试内 set_var,
+    /// 避免与并行测试的进程级 env 互相污染。
+    #[test]
+    fn splice_pump_mode_defaults_to_batched() {
+        assert_eq!(pump_mode_from_env(), PumpMode::Batched);
+    }
+
+    /// legacy 臂(RH_SPLICE_PUMP=legacy 的同树对照)基本搬运+半关闭:
+    /// 旧控制流保留且不回归(经 inner 直测,不动进程 env)。
+    #[tokio::test]
+    async fn splice_legacy_arm_transfers_and_half_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (user_cli, user_srv) = tcp_pair().await;
+        let (tgt_conn, mut tgt_echo) = tcp_pair().await;
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match tgt_echo.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tgt_echo.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let relay = tokio::spawn(async move {
+            splice_relay_inner(
+                &user_srv,
+                &tgt_conn,
+                SpliceHooks::default(),
+                PumpMode::Legacy,
+            )
+            .await
+            .unwrap();
+        });
+        let payload = vec![0x5au8; 192 * 1024];
+        let (mut r_half, mut w_half) = user_cli.into_split();
+        let recv = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let _ = r_half.read_to_end(&mut got).await;
+            got
+        });
+        w_half.write_all(&payload).await.unwrap();
+        w_half.shutdown().await.unwrap();
+        let got = recv.await.unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert!(got.iter().all(|&b| b == 0x5a));
+        relay.await.unwrap();
+    }
+
+    /// 每泵计数(G1-A 最小观测):搬运量与载荷一致;down 口径逐 drain
+    /// 进展计量的总量与 fill 相等;legacy/batched 两臂同款计数语义。
+    #[tokio::test]
+    async fn splice_stats_count_payload_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in [PumpMode::Legacy, PumpMode::Batched] {
+            let (a_cli, a_srv) = tcp_pair().await;
+            let (b_cli, b_srv) = tcp_pair().await;
+            let up = Arc::new(PumpCounters::default());
+            let down = Arc::new(PumpCounters::default());
+            let (u, d) = (up.clone(), down.clone());
+            let relay = tokio::spawn(async move {
+                splice_relay_with_stats(
+                    &a_srv,
+                    &b_srv,
+                    SpliceHooks::default(),
+                    mode,
+                    Some(u),
+                    Some(d),
+                )
+                .await
+                .unwrap();
+            });
+            let payload_len = 512 * 1024;
+            let payload = vec![0x11u8; payload_len];
+            let (mut b_r, mut a_w) = {
+                let (_ar, aw) = a_cli.into_split();
+                let (br, _bw) = b_cli.into_split();
+                (br, aw)
+            };
+            let p = payload.clone();
+            let recv = tokio::spawn(async move {
+                let mut buf = vec![0u8; p.len()];
+                let _ = b_r.read_exact(&mut buf).await;
+                buf
+            });
+            a_w.write_all(&payload).await.unwrap();
+            a_w.shutdown().await.unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(5), recv)
+                .await
+                .expect("载荷必须在 5s 内送达")
+                .unwrap();
+            assert_eq!(got.len(), payload_len);
+            // up 泵(a→b):fill 与 drain 总量都等于载荷;计数在泵任务内
+            // 异步发生,轮询等待收敛
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while up.fill_bytes.load(Ordering::Relaxed) < payload_len as u64
+                || up.drain_bytes.load(Ordering::Relaxed) < payload_len as u64
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "计数未收敛到载荷量(fill={} drain={},mode={:?})",
+                    up.fill_bytes.load(Ordering::Relaxed),
+                    up.drain_bytes.load(Ordering::Relaxed),
+                    mode
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(up.fill_calls.load(Ordering::Relaxed) >= 1);
+            assert!(up.drain_calls.load(Ordering::Relaxed) >= 1);
+            // 静默方向(down)不得有搬运
+            assert_eq!(down.fill_bytes.load(Ordering::Relaxed), 0);
+            assert_eq!(down.drain_bytes.load(Ordering::Relaxed), 0);
+            // D6:v2 结束记录离线渲染(不经 env):字段齐全、计数与载荷
+            // 一致、块分布语义成立(有成功调用 → min/max 非 null 且有序)
+            let line = up.snapshot_json(
+                &RelayMeta {
+                    mode,
+                    dir: "up",
+                    start_ns: 5,
+                    started_unix_us: Some(1_700_000_000_000_000),
+                    src_local: Some("127.0.0.1:1".into()),
+                    src_peer: Some("127.0.0.1:2".into()),
+                    dst_local: Some("127.0.0.1:3".into()),
+                    dst_peer: None,
+                },
+                105,
+            );
+            let v: serde_json::Value = serde_json::from_str(&line).expect("v2 行必须是合法 JSON");
+            assert_eq!(v["splice_stats"], "v2");
+            assert_eq!(v["started_unix_us"], 1_700_000_000_000_000u64);
+            assert_eq!(
+                v["pump_mode"],
+                if mode == PumpMode::Legacy {
+                    "legacy"
+                } else {
+                    "batched"
+                }
+            );
+            assert_eq!(v["duration_ns"], 100);
+            assert_eq!(v["src_peer"], "127.0.0.1:2");
+            assert!(v["dst_peer"].is_null(), "未采样地址必须为 null 而非 0");
+            assert_eq!(v["fill_bytes"], payload_len as u64);
+            assert_eq!(v["drain_bytes"], payload_len as u64);
+            let fmin = v["fill_min_bytes"].as_u64().expect("有成功 fill → 非 null");
+            let fmax = v["fill_max_bytes"].as_u64().expect("有成功 fill → 非 null");
+            assert!(
+                fmin >= 1 && fmin <= fmax,
+                "块分布 min/max 语义(fmin={fmin} fmax={fmax})"
+            );
+            let dmin = v["drain_min_bytes"]
+                .as_u64()
+                .expect("有成功 drain → 非 null");
+            let dmax = v["drain_max_bytes"]
+                .as_u64()
+                .expect("有成功 drain → 非 null");
+            assert!(
+                dmin >= 1 && dmin <= dmax,
+                "块分布 min/max 语义(dmin={dmin} dmax={dmax})"
+            );
+            for k in [
+                "pending_waits_read",
+                "pending_waits_write",
+                "pending_polls_read",
+                "pending_polls_write",
+                "wait_cycles_read",
+                "wait_cycles_write",
+                "wait_ns_read",
+                "wait_ns_write",
+                "coop_yields",
+            ] {
+                assert!(v.get(k).is_some_and(|x| x.is_u64()), "缺 v2 字段 {k}");
+            }
+            relay.abort();
+        }
+    }
+
+    /// 公平性/抗饿死(G1 复核修正 2 新增不变量):tokio AsyncFd 的
+    /// async 路径不消耗协作预算,两端持续就绪时无让步的泵可在单
+    /// worker 上饿死同驻任务。Batched 臂每批字节/操作预算触达后
+    /// `yield_now()` 显式让步——本回归在单 worker(current_thread)
+    /// 上让满载泵与 yield_now 伴生任务共驻,断言伴生任务在泵搬运
+    /// 期间获得调度(≥4 次)。legacy 臂无该不变量,不参与断言。
+    /// ★口径如实:loopback 的偶发 EAGAIN 也会让出调度,本回归保护
+    /// 「批次化泵存在显式让步路径且伴生任务不被饿死」,不构成对
+    /// legacy 臂的判定。
+    #[tokio::test]
+    async fn splice_batch_yields_to_sibling_task_on_single_worker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (a_cli, a_srv) = tcp_pair().await;
+        let (b_cli, b_srv) = tcp_pair().await;
+        let up = Arc::new(PumpCounters::default());
+        let down = Arc::new(PumpCounters::default());
+        let (u, d) = (up.clone(), down.clone());
+        let relay = tokio::spawn(async move {
+            splice_relay_with_stats(
+                &a_srv,
+                &b_srv,
+                SpliceHooks::default(),
+                PumpMode::Batched,
+                Some(u),
+                Some(d),
+            )
+            .await
+            .unwrap();
+        });
+        let payload_len = 32 * 1024 * 1024;
+        let payload = vec![0x33u8; payload_len];
+        let (mut b_r, mut a_w) = {
+            let (_ar, aw) = a_cli.into_split();
+            let (br, _bw) = b_cli.into_split();
+            (br, aw)
+        };
+        let p = payload.clone();
+        let recv = tokio::spawn(async move {
+            let mut buf = vec![0u8; p.len()];
+            let _ = b_r.read_exact(&mut buf).await;
+            buf
+        });
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t2 = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                // yield_now 重排回队列;只有泵 Pending/让步时才获得 poll
+                tokio::task::yield_now().await;
+                t2.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        a_w.write_all(&payload).await.unwrap();
+        a_w.shutdown().await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(30), recv)
+            .await
+            .expect("32MiB 必须在 30s 内搬完")
+            .unwrap();
+        assert_eq!(got.len(), payload_len);
+        let n = ticks.load(Ordering::SeqCst);
+        assert!(
+            n >= 4,
+            "单 worker 上满载泵必须让步(伴生任务 ticks={n} < 4,批次预算/yield_now 失效)"
+        );
+        // round-2 增强(复核建议):报告显式让步计数供人工核验。不做硬断言:
+        // 「批」以真实等待为界,loopback 偶发 EAGAIN 会重置批计数,让步由
+        // 等待路径承担时 coop_yields 可为 0——ticks(总让步效果)才是不变量。
+        eprintln!(
+            "fairness: ticks={n} coop_yields={} (up)",
+            up.coop_yields.load(Ordering::Relaxed)
+        );
+        ticker.abort();
+        relay.abort();
+    }
+
+    /// B1(round-2 复核 blocker 修复回归):满载两端持续 ready(无 EAGAIN、
+    /// 无限速——生产装配双桶皆空时不装 limiter)时,cancel 信号也必须在
+    /// **块边界**被 poll——`SpliceHooks::cancel` 文档与 data.rs 装配均承诺
+    /// 「完成即双向断连」。修复前 batched 快试路径无 readiness 等待点,
+    /// cancel 无任何 poll,响应上界退化为偶发 EAGAIN/流自然断;修复=批首
+    /// biased select 同步 poll 一次 cancel_wait(每块至少一次,粒度不低于
+    /// legacy 的 select{readiness|cancel} ~50% poll 机会)。
+    /// 两臂同测:legacy 每 fill/drain 经 select 语义本就覆盖。
+    #[tokio::test]
+    async fn splice_cancel_during_saturated_transfer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in [PumpMode::Legacy, PumpMode::Batched] {
+            let (a_cli, a_srv) = tcp_pair().await;
+            let (b_cli, b_srv) = tcp_pair().await;
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let cancel: CancelFuture = rx.map(|_| ()).boxed().shared();
+            let hooks = SpliceHooks {
+                up: None,
+                down: None,
+                abort: None,
+                cancel: Some(cancel),
+            };
+            let relay = tokio::spawn(async move {
+                splice_relay_inner(&a_srv, &b_srv, hooks, mode)
+                    .await
+                    .unwrap();
+            });
+            // 满载稳态:source 无限写 256KiB 块,sink 并发持续读——两端长期
+            // ready,泵处于快试连续搬运形态(无 EAGAIN/无限速等待点)
+            let mut a_w = a_cli;
+            let writer = tokio::spawn(async move {
+                let buf = vec![0x2du8; 256 * 1024];
+                loop {
+                    if a_w.write_all(&buf).await.is_err() {
+                        break; // teardown 断连后退出
+                    }
+                }
+            });
+            let mut b_r = b_cli;
+            let reader = tokio::spawn(async move {
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    match b_r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+            // 稳态满载窗口后触发取消(规则禁用/删除形态)
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = tx.send(());
+            // 块边界 poll 保证:1s 内 relay 必须收敛(teardown 双向断连)
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("满载中取消必须在 1s 内断连(B1:块边界 cancel poll 缺失,mode={mode:?})")
+                })
+                .unwrap();
+            // 断连后 writer/reader 应随 socket 死亡退出
+            tokio::time::timeout(Duration::from_secs(3), writer)
+                .await
+                .expect("writer 必须随断连退出")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), reader)
+                .await
+                .expect("reader 必须随断连退出")
+                .unwrap();
+        }
+    }
+
+    /// 零进展不得忙转(G1 计划 §B 红线):静默期(无新数据)泵必须停留在
+    /// 真实 readiness 等待,不得以陈旧缓存就绪反复唤醒自旋。判据:静默
+    /// 期两次采样之间 pending_waits_read 增长近似为零(忙转形态会以
+    /// 微秒级循环推高该计数)。up 泵把 a→b 的载荷搬完后进入静默。
+    #[tokio::test]
+    async fn splice_silent_period_no_busy_spin() {
+        use tokio::io::AsyncWriteExt;
+        let (mut a_cli, a_srv) = tcp_pair().await;
+        let (_b_cli, b_srv) = tcp_pair().await;
+        let up = Arc::new(PumpCounters::default());
+        let down = Arc::new(PumpCounters::default());
+        let (u, d) = (up.clone(), down.clone());
+        let relay = tokio::spawn(async move {
+            splice_relay_with_stats(
+                &a_srv,
+                &b_srv,
+                SpliceHooks::default(),
+                PumpMode::Batched,
+                Some(u),
+                Some(d),
+            )
+            .await
+            .unwrap();
+        });
+        let payload = vec![0x77u8; 256 * 1024];
+        a_cli.write_all(&payload).await.unwrap();
+        // 等待搬运完成(计数收敛)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while up.fill_bytes.load(Ordering::Relaxed) < payload.len() as u64 {
+            assert!(tokio::time::Instant::now() < deadline, "载荷搬运未完成");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // 进入静默等待
+        let s1 = up.pending_waits_read.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await; // 静默窗口
+        let s2 = up.pending_waits_read.load(Ordering::Relaxed);
+        assert!(
+            s2.saturating_sub(s1) < 10,
+            "静默期读侧等待计数不得增长(忙转:s1={s1} s2={s2})"
+        );
+        relay.abort();
+    }
+
+    /// RH_SPLICE_STATS 输出格式(v2):单行严格 JSON,新旧字段齐全;
+    /// 无数据字段为 null(不以 0 冒充可观测);pending_waits_* 保留旧
+    /// 「尝试」口径(直接驱动输出函数,不经 env,避免并行测试的进程级
+    /// env 污染)。
+    #[test]
+    fn splice_stats_snapshot_json_fields() {
+        let c = PumpCounters::default();
+        c.fill_calls.store(3, Ordering::Relaxed);
+        c.fill_bytes.store(7 * 256 * 1024, Ordering::Relaxed);
+        c.fill_min_bytes.fetch_min(64 * 1024, Ordering::Relaxed);
+        c.fill_max_bytes.fetch_max(256 * 1024, Ordering::Relaxed);
+        c.pending_waits_write.store(5, Ordering::Relaxed);
+        c.pending_polls_read.store(11, Ordering::Relaxed);
+        c.wait_cycles_read.store(4, Ordering::Relaxed);
+        c.wait_ns_read.store(987654321, Ordering::Relaxed);
+        c.coop_yields.store(2, Ordering::Relaxed);
+        let s = c.snapshot_json(
+            &RelayMeta {
+                mode: PumpMode::Batched,
+                dir: "up",
+                start_ns: 42,
+                started_unix_us: Some(1_728_972_000_000_000),
+                src_local: None,
+                src_peer: None,
+                dst_local: None,
+                dst_peer: None,
+            },
+            142,
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).expect("必须是合法 JSON");
+        assert_eq!(v["splice_stats"], "v2");
+        assert_eq!(v["dir"], "up");
+        assert_eq!(v["pump_mode"], "batched");
+        assert_eq!(v["start_ns"], 42);
+        assert_eq!(v["started_unix_us"], 1_728_972_000_000_000u64);
+        assert_eq!(v["duration_ns"], 100);
+        // 时间字段自检:相对锚 + 建立墙钟 + 时长三件套固定存在且为整数
+        for k in ["start_ns", "started_unix_us", "duration_ns"] {
+            assert!(v.get(k).is_some_and(|x| x.is_u64()), "缺时间字段 {k}");
+        }
+        for k in [
+            "fill_calls",
+            "fill_bytes",
+            "fill_min_bytes",
+            "fill_max_bytes",
+            "drain_calls",
+            "drain_bytes",
+            "drain_min_bytes",
+            "drain_max_bytes",
+            "eagain_fill_input_empty",
+            "eagain_drain_pipe_full",
+            "eagain_drain_write_full",
+            "pending_waits_read",
+            "pending_waits_write",
+            "pending_polls_read",
+            "pending_polls_write",
+            "wait_cycles_read",
+            "wait_cycles_write",
+            "wait_ns_read",
+            "wait_ns_write",
+            "coop_yields",
+        ] {
+            assert!(
+                v.get(k).is_some_and(|x| x.is_u64() || x.is_null()),
+                "缺字段 {k}"
+            );
+        }
+        // 旧字段保留(尝试口径)
+        assert_eq!(v["pending_waits_write"], 5);
+        // v2 真实挂起字段
+        assert_eq!(v["pending_polls_read"], 11);
+        assert_eq!(v["wait_cycles_read"], 4);
+        assert_eq!(v["wait_ns_read"], 987654321);
+        // 块分布:有成功 fill → 非 null;drain 无成功调用 → null(不冒充 0)
+        assert_eq!(v["fill_min_bytes"], 64 * 1024);
+        assert_eq!(v["fill_max_bytes"], 256 * 1024);
+        assert!(v["drain_min_bytes"].is_null());
+        assert!(v["drain_max_bytes"].is_null());
+        assert_eq!(v["coop_yields"], 2);
+        // 地址未采样 → null
+        assert!(v["src_local"].is_null());
+    }
+
+    // ================= v2 观测回归(spec D:确定性,无进程 env 并行污染) =================
+
+    /// D1:开关解析(纯函数,不触 env):None/空/"0" 关,其余任意值开。
+    #[test]
+    fn splice_stats_switch_parsing() {
+        assert!(!stats_enabled_value(None));
+        assert!(!stats_enabled_value(Some("")));
+        assert!(!stats_enabled_value(Some("0")));
+        assert!(stats_enabled_value(Some("1")));
+        assert!(stats_enabled_value(Some("verbose")));
+    }
+
+    /// 受控时钟(纳秒计数由测试推进;确定性,不依赖真实时间精度)。
+    struct FakeClock(Arc<AtomicU64>);
+    impl WaitClock for FakeClock {
+        fn now_ns(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// 伪 future:按脚本逐次返回(空脚本 = 恒 Pending)。
+    struct ScriptFut {
+        script: std::collections::VecDeque<Poll<()>>,
+    }
+
+    impl ScriptFut {
+        fn new(script: Vec<Poll<()>>) -> Self {
+            Self {
+                script: script.into(),
+            }
+        }
+    }
+
+    impl Future for ScriptFut {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            self.script.pop_front().unwrap_or(Poll::Pending)
+        }
+    }
+
+    fn noop_cx() -> Context<'static> {
+        Context::from_waker(futures::task::noop_waker_ref())
+    }
+
+    /// D2:伪 future 立即 Ready:pending poll / cycle / 时长全为 0
+    /// (时钟非零,排除「未走时钟」的假阴性)。
+    #[test]
+    fn readiness_watch_immediate_ready_counts_nothing() {
+        let c = Arc::new(PumpCounters::default());
+        let mut w = ReadinessWatch::new(
+            ScriptFut::new(vec![Poll::Ready(())]),
+            c.clone(),
+            WaitDir::Read,
+            Arc::new(FakeClock(Arc::new(AtomicU64::new(1_000_000)))),
+        );
+        let mut cx = noop_cx();
+        assert!(matches!(Pin::new(&mut w).poll(&mut cx), Poll::Ready(())));
+        drop(w);
+        assert_eq!(c.pending_polls_read.load(Ordering::Relaxed), 0);
+        assert_eq!(c.wait_cycles_read.load(Ordering::Relaxed), 0);
+        assert_eq!(c.wait_ns_read.load(Ordering::Relaxed), 0);
+        // 对向方向计数不受影响
+        assert_eq!(c.pending_polls_write.load(Ordering::Relaxed), 0);
+        assert_eq!(c.wait_cycles_write.load(Ordering::Relaxed), 0);
+    }
+
+    /// D3:一 Pending 后 Ready:poll=1、cycle=1、时长按受控时钟结算,
+    /// Ready 后 drop 不重复累计。
+    #[test]
+    fn readiness_watch_one_pending_then_ready_settles() {
+        let c = Arc::new(PumpCounters::default());
+        let ticks = Arc::new(AtomicU64::new(100));
+        let mut w = ReadinessWatch::new(
+            ScriptFut::new(vec![Poll::Pending, Poll::Ready(())]),
+            c.clone(),
+            WaitDir::Write,
+            Arc::new(FakeClock(ticks.clone())),
+        );
+        let mut cx = noop_cx();
+        assert!(matches!(Pin::new(&mut w).poll(&mut cx), Poll::Pending));
+        ticks.store(100 + 1_000_000, Ordering::SeqCst); // 受控挂起 1ms
+        assert!(matches!(Pin::new(&mut w).poll(&mut cx), Poll::Ready(())));
+        drop(w);
+        assert_eq!(c.pending_polls_write.load(Ordering::Relaxed), 1);
+        assert_eq!(c.wait_cycles_write.load(Ordering::Relaxed), 1);
+        assert_eq!(c.wait_ns_write.load(Ordering::Relaxed), 1_000_000);
+    }
+
+    /// D4:多次 Pending:poll 数(3)与周期数(1)不同且精确;时长 =
+    /// 首次 Pending → 结束(受控时钟精确断言)。
+    #[test]
+    fn readiness_watch_multi_pending_distinguishes_polls_and_cycles() {
+        let c = Arc::new(PumpCounters::default());
+        let ticks = Arc::new(AtomicU64::new(1_000));
+        let mut w = ReadinessWatch::new(
+            ScriptFut::new(vec![
+                Poll::Pending,
+                Poll::Pending,
+                Poll::Pending,
+                Poll::Ready(()),
+            ]),
+            c.clone(),
+            WaitDir::Read,
+            Arc::new(FakeClock(ticks.clone())),
+        );
+        let mut cx = noop_cx();
+        // 三次 Pending,期间受控推进时钟(周期起点固定在首次 = 1000)
+        for t in [1_010u64, 1_020, 1_030] {
+            assert!(matches!(Pin::new(&mut w).poll(&mut cx), Poll::Pending));
+            ticks.store(t, Ordering::SeqCst);
+        }
+        ticks.store(1_060, Ordering::SeqCst);
+        assert!(matches!(Pin::new(&mut w).poll(&mut cx), Poll::Ready(())));
+        drop(w);
+        assert_eq!(c.pending_polls_read.load(Ordering::Relaxed), 3);
+        assert_eq!(c.wait_cycles_read.load(Ordering::Relaxed), 1);
+        assert_eq!(c.wait_ns_read.load(Ordering::Relaxed), 60);
+    }
+
+    /// D5:等待被 drop(未就绪即丢弃):已发生挂起必须结算,不因丢弃遗失。
+    #[test]
+    fn readiness_watch_drop_after_pending_settles() {
+        let c = Arc::new(PumpCounters::default());
+        let ticks = Arc::new(AtomicU64::new(7));
+        let mut w = ReadinessWatch::new(
+            ScriptFut::new(vec![Poll::Pending, Poll::Pending]),
+            c.clone(),
+            WaitDir::Read,
+            Arc::new(FakeClock(ticks.clone())),
+        );
+        let mut cx = noop_cx();
+        assert!(matches!(Pin::new(&mut w).poll(&mut cx), Poll::Pending));
+        ticks.store(7 + 42, Ordering::SeqCst);
+        drop(w); // 未 Ready 即 drop(取消形态)
+        assert_eq!(c.pending_polls_read.load(Ordering::Relaxed), 1);
+        assert_eq!(c.wait_cycles_read.load(Ordering::Relaxed), 1);
+        assert_eq!(c.wait_ns_read.load(Ordering::Relaxed), 42);
+    }
+
+    /// 屏障伪 future:首次 poll 置位并恒 Pending(select 取消集成形态用)。
+    struct BarrierPendingFut(Arc<AtomicBool>);
+    impl Future for BarrierPendingFut {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    /// D5:select 取消路径。取消仅在包装 future ≥1 次 Pending 后触发
+    /// (屏障 + yield,无 sleep 抢跑);被 pin 的 wrapper 由显式词法作用域
+    /// 持有,**析构完成后**才断言:poll ≥ 1、cycle=1、FakeClock 精确结算、
+    /// Drop 不重复累计。
+    #[tokio::test]
+    async fn readiness_watch_select_cancel_settles_no_leak() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let polled = Arc::new(AtomicBool::new(false));
+        let armed = polled.clone();
+        tokio::spawn(async move {
+            while !armed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            let _ = tx.send(());
+        });
+        let c = Arc::new(PumpCounters::default());
+        let ticks = Arc::new(AtomicU64::new(1_000));
+        {
+            let w = ReadinessWatch::new(
+                BarrierPendingFut(polled),
+                c.clone(),
+                WaitDir::Read,
+                Arc::new(FakeClock(ticks.clone())),
+            );
+            tokio::pin!(w);
+            tokio::select! {
+                _ = &mut w => panic!("屏障 future 不应就绪"),
+                _ = rx => {}
+            }
+            ticks.store(1_500, Ordering::SeqCst); // 受控挂起窗口 500ns
+        } // 作用域结束:wrapper 析构(PinnedDrop 结算)先于下方断言
+        ticks.store(9_999, Ordering::SeqCst); // 若 Drop 重复结算,此值会被计入
+        assert!(c.pending_polls_read.load(Ordering::Relaxed) >= 1);
+        assert_eq!(c.wait_cycles_read.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            c.wait_ns_read.load(Ordering::Relaxed),
+            500,
+            "取消前已发生的等待必须精确结算且不重复"
+        );
+    }
+
+    /// D6:默认无统计路径(计数全 None,与生产 RH_SPLICE_STATS 未设等价,
+    /// 不经 env):默认臂(Batched)传输 + 半关闭不退化。
+    #[tokio::test]
+    async fn splice_relay_stats_off_transfers_and_half_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (user_cli, user_srv) = tcp_pair().await;
+        let (tgt_conn, mut tgt_echo) = tcp_pair().await;
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match tgt_echo.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tgt_echo.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let relay = tokio::spawn(async move {
+            splice_relay_inner(
+                &user_srv,
+                &tgt_conn,
+                SpliceHooks::default(),
+                PumpMode::Batched,
+            )
+            .await
+            .unwrap();
+        });
+        let payload = vec![0xc1u8; 128 * 1024];
+        let (mut r_half, mut w_half) = user_cli.into_split();
+        let recv = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let _ = r_half.read_to_end(&mut got).await;
+            got
+        });
+        w_half.write_all(&payload).await.unwrap();
+        w_half.shutdown().await.unwrap();
+        let got = recv.await.unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert!(got.iter().all(|&b| b == 0xc1));
+        relay.await.unwrap();
     }
 }

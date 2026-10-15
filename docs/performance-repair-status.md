@@ -1,79 +1,60 @@
-# 性能修复状态(2026-10-14,kcp-boundary 七轮收官 + TCP 监听生命周期后)
+# 性能修复状态(2026-10-14,c84f631 收口轮 full-accept 后)
 
-**结论:原始性能目标未完成,不宣称绝对无缺陷。**本轮完成主代理 [kcp-main-review](../benchmark/runs/goal-repair/kcp-main-review/README.md) 六项确定性失败的全部修复,及其后六批追加复核(shutdown 交付、listener 释放、未交付会话、demux 自锁、TCP 未交付 mux、punch 父取消)与 TCP 监听生命周期并行修复;最终源码全工作区测试/clippy exit=0。但四套 E2E 与三机性能矩阵**未在当前源码重跑**,G1/G2/G6 以旧构建数据一律未达标;本轮定向通过 ≠ 全矩阵验收。上一版 56 行已存档 [performance-repair-history-3.md](performance-repair-history-3.md)(SHA256 `aebfa707…`,本轮 cp 后 shasum 核验);1059 行全文在 history.md、44 行简报在 history-2.md。
+**结论:固定性能目标仍未完成。**基线 `c84f63174cd2ebafd994c4fafacd5beba4a0240b`(分支 `fix/performance-closure-c84f631`,HEAD 即该检查点,本轮**无新提交**;旧版"无 git 提交、HEAD 仍 `c3ca4bd`"的说法已随检查点落库而过期)。本轮在既有授权内完成:风险项 A–E 全部修复并红→绿、验收装置落地、三机 full-accept(candidate-r0)真实执行——四套 E2E 全绿、Linux 全 workspace 测试/构建 exit=0、六协议全矩阵逐条测量;但 **G1/G2/G6 及 G5 的 kcp 单缺口未达标**(§3),candidatePassed=false,不以单项改善替代结论。上一版 79 行已原样存档 [performance-repair-history-4.md](performance-repair-history-4.md)(SHA256 `d81a6729…`,cp 后 shasum 核验);更早为 history-3/history-2/history.md,后缀唯一、均不再重写。本轮明细见 [performance-closure-c84-report.md](performance-closure-c84-report.md)。
 
-## 0. 当前源码与证据对应(先读)
+## 0. 授权边界(更正旧版 §7)
 
-- 本会话复核:`crates/rh-transport/src/kcp.rs` SHA256 `16b721555dc53afdaea177cfef7c2ca4cc2ee1430f92099972bd97a0a7b380ec`(4221 行)= kcp-boundary 第七轮最终稿;`crates/rh-transport/src/tcp.rs` `575d9a1f…` = TCP 监听生命周期最终稿。
-- **上轮 kcp-improvement 的 75 文件 manifest(kcp.rs `bd3a8b9c…`)成为历史**:其后 kcp.rs 经七轮、tcp.rs 经两轮补修,其三机验收/identity 证据不再代表当前源码;final-linux(-r2) 的 74 文件清单更旧。当前源码尚无对应的远端构建与验收 manifest。
-- 旧 136(本地)与 148(Linux)全绿**不覆盖**主代理六项——六项正是在 148 绿的 `bd3a8b9c` 上确定性复现(red.log 0 passed/6 failed,exit=101)。不得再以旧全绿抵扣六项覆盖。
-- 无 git 提交:HEAD 仍 `c3ca4bd`(本会话 `git log` 核实)。
+- 原授权已覆盖红线内修复、三机测试与最终完整验收(E2E+六协议全矩阵)——candidate-r0 即按此执行完毕。旧版"完整验收重跑……现有授权未覆盖"为虚假阻断,已删除。
+- 仍需另行授权的仅剩:sysctl(rmem_max/wmem_max 等)、网卡/拓扑变更、内核升级、权限提升。
 
-## 1. 主代理六项确定性失败逐项(基线 red.log exit=101;修复全程见 [kcp-boundary/README.md](../benchmark/runs/goal-repair/kcp-boundary/README.md))
+## 1. 当前源码与身份(本会话实读/实测)
 
-| # | 失败(原判定) | 状态 | 修复与默认回归 | 当前源验证 |
-|---|---|---|---|---|
-| 1 | 超大写永远 Pending | 已修 | 第一轮 partial write 前缀接受;`main_review_tests::oversized_write_must_make_partial_progress` | 最终源全量含此测试通过(§3) |
-| 2 | 空读缓冲阻塞 | 已修 | 第一轮 `remaining()==0` 即 Ready;`…empty_readbuf_on_idle_stream_must_complete` | 同上 |
-| 3 | 回插超字节容量 | 已修 | 第一轮在途记账+第三轮 S1 总预算含在途;`…failed_send_reinsertion_must_respect_byte_cap`+`complete_backlog_budget_counts_inflight_packet` | 同上 |
-| 4 | 在途包被新包超前 | 已修 | 第一轮串行 drain 所有权+第三轮 S1;`…draining_datagram_must_not_be_overtaken` | 同上 |
-| 5 | idle 发送任务持 socket 不退 | 已修 | 第一轮 Drop notify+退避兜底;`…idle_backlog_worker_must_release_after_producer_drop` | 同上 |
-| 6 | 未 ACK 绕过背压 | 已修 | 第一轮 `wait_snd≤512` 站立限额+第三轮 E1 精确上界 864,256B;`…no_ack_peer_must_backpressure_total_pending_writes`+`e1_send_path_total_bound_is_exact` | 同上 |
+- `git log/rev-parse`:HEAD=`c84f63174cd2…`,无新 commit;本轮改动全部为工作树未提交状态(kcp.rs、api.rs、state.rs、data.rs、loadgen.py、kcp_loopback_bench.rs、tests/tcp_listener_lifecycle.rs,新增 benchmark/closure_c84.py、test_closure_c84.py、两份 docs)。
+- kcp.rs:基线 `16b72155…`(=baseline-local 快照)→ 当前工作树 `610dd1e9…`(shasum 实测,含 A/B/C/D+关闭假成功修正);candidate-r0 构建的 kcp.rs 与当前逐字节一致(独立复核抽查,报告 §3)。
+- candidate-r0(最终 Linux 构建):tree_hash `6e8f720b…`(build-inputs 80 项)、sources.sha256 `24f655e9…`(76 文件)、rh-server `2912ab8c…`、rh-client `dd1ecb18…`;rustc/cargo 1.98.1、内核 5.15.0-47、nofile 65535(run-index.json)。
+- **时序注意**:candidate-r0 快照=16:25–18:04;其后 20:04–20:41 的 test-only 修(listener 探针)与会话失败计数器(state.rs/data.rs)不在该构建内,只做了定向回归与本机全量(§4),未重跑强验收。
 
-- 红→绿:首轮独立复现 13 failed/18 passed(exit=101)→ 修复后绿;主代理六项**原样探针**独立复跑绿最近一次在第二轮最终稿 `5d448955`(boundary-original-six-green.log:6 passed/0 failed;该日志未附显式 exit 行)。**未验部分如实:主代理未在最终 `16b72155` 上重录六项原样探针**;六项以工作区默认回归身份在最终源全量测试通过(本会话解析 stdout 含全部六名+pa6/pa7)。
+## 2. 本轮五项修复(A–E)与追加项(红绿明细见报告 §1–§2)
 
-## 2. 追加复核项(主代理逐批点名,全部落为默认回归;细节见 kcp-boundary README 各轮)
+| 项 | 内容 | 红 → 绿(路径在报告 §2) |
+|---|---|---|
+| A | KCP poll_shutdown 只关本地写侧(半关闭保读,修 F5) | 基线 0/1 exit101 → 1/1 EXIT=0 |
+| B | unread read_buf 不刷新 idle(停滞有界回收,修 F6);idle 终止不得伪报成功关闭 | 基线 0/2 → 1/1;候选期新红 0/1 exit101 → 1/1 |
+| C | PunchOutput WouldBlock 有界队列,复用 connect 的 UdpBacklog/drain(修 F9) | 基线 repro 5 failed → 67/0;**c2 守卫首两轮 66/1 偶发红、第三轮绿,未闭环** |
+| D | ACK 合批(recv_many,按 batching-plan 修订版) | 单因果对照 t1 306.9→664.9、t4 317.3→644.6 Mbps,CPU/2、flush/10、低载 p50 持平;保留 |
+| E | 2007/3005 区分自身/外部端口占用(api.rs/state.rs) | 新守护 8 例+全 bin 20/20,api:: 连续 5 次全绿(修前无测试,属允许的"修前即绿") |
 
-- **shutdown 丢弃已接受数据**(SHUTDOWN-ADDENDUM):第二轮真契约(排空+`wait_snd()==0` 才 Ready);红 exit=101 → b09 真实对端 256KiB 逐字节绿。
-- **KCP listener drop 后仍占端口**:第二轮 `DemuxCtl` closing/会话表收敛;b10 红 AddrInUse → 绿。
-- **未 accept 会话滞留**(KCP-UNACCEPTED-REVIEW):第四轮 accept 时才 wrap mux、ready 释放即整体取消;红 exit=101(unaccepted-red.log)→ 绿;主代理独立复绿 kcp-unaccepted-independent-green.log。
-- **demux 满路径 SessionMap 自锁**(DEMUX-FULL-DEADLOCK r3):第五轮锁内只查表/注册、锁外 spawn/投递;红 exit=71(WATCHDOG)→ 绿;主代理独立复绿 demux-full-independent-green(-r2).log。
-- **TCP listener drop 泄漏 + 未交付 mux 滞留**(TCP-QUEUED-REVIEW,并行任务,tcp.rs 唯一改动源):句柄 Drop 关停 accept 泵、accept 交付才构造 mux;红 0/3、4/2(exit=101)→ 6/6 ×3(exit=0);终态 `575d9a1f…`,主代理探针 queued_tcp_ready 修复后 exit=0([tcp-listener-lifecycle/RUNS.md](../benchmark/runs/goal-repair/tcp-listener-lifecycle/RUNS.md))。端口观察任务曾记"该项修复仍待办",以实际源码与终态日志为准:已修。
-- **punch 父取消轮询任务永生**(PUNCH-PARENT-CANCEL,最后阻断):第七轮 `PunchCancel` RAII 守卫(kcp.rs:1433,Drop 对双 abort 通道 notify_one;成功路径显式解除武装)。红 parent-cancel-red.log(快照 `0d43257e`+pa6)0/1 exit=101 `socket_refs=2`;主代理探针同快照 check-r2.log `socket_refs=2 released=false EXIT=1` → 当前源 final-green.log `socket_refs=1 released=true EXIT=0`(11:08,前后同探针对照)。pa6/pa7 入默认回归;复核方定向复现成功路径 `strong_count==3` EXIT=0。
-- **保留未修(审计自身定性)**:F5(poll_shutdown 成功终止读侧,生产不可达)/F6(idle 被未消费数据推迟)/F9(PunchOutput WouldBlock 假成功)——理由与位置见 README 第六轮;F2/F3/F4/F7/F8 修复未重动(复核抽查行号一致)。
+追加:**F** 验收装置 lab(closure_c84.py 自检 14/14、stdlib 单测、linux-baseline attempt1 EMFILE 原样保留、r2 targeted-baseline test/build exit=0);**G** TCP listener 测试混杂修复(Linux 3/10 挂起→test-only 因果化修,linux-fix-r2 10×ROUND_EXIT=0;机理未定论,旧失败日志保留);**H** 会话失败计数器 rabbithole_session_failures_total(rh-server 23/0,为 G5 1/12288 归因)。
 
-## 3. 本轮验证(命令与真实退出码;「最终源」= kcp.rs 11:00 落盘之后)
+## 3. 固定门槛 G1–G7(candidate-r0 实测;verify_goal exit=1,明细报告 §5)
 
-- 全工作区:`cargo test --workspace --locked --offline` **exit=0,177 passed/0 failed/2 ignored**(checks/kcp-boundary-workspace-test-77c8lvoo,11:03>11:00;本会话逐行累加 7+15+11+12+82+4+10+1+6+1+28,含六项+pa6/pa7+b10)。
-- clippy:`cargo clippy --workspace --all-targets --locked --offline` **exit=0**(checks/kcp-boundary-clippy-uo6mpehh,11:03)。
-- 定向:kcp 模块 **52/52**、rh-transport lib **82/82**、集成 goal_repair_mux+ws_mux_repro **10+1** 全 exit=0(kcp-boundary/green-*.log);红 parent-cancel-red.log exit=101。
-- loopback 诊断 bench(32MiB×3):单流中位 **355.4**、4 流 **354.7** Mbps(loopback-bench-after.log;诊断性,不替代三机验收)。
-- 红线在位:quinn 65536(`quic.rs:24`)、64KiB 转发缓冲、未设 carrier socket 缓冲、ws.rs 状态机未动(`c3b67a1e…`)、yamux open_rx Ready(None) 语义未动(`4a9a219a…`)。
+- **G1 TCP nomux 单流 ≥3000:FAIL**——2077/2156 Mbps;CPU 分量达标(server 28.1–30.2%、client 14.6–34.6% 单核,覆盖 98–99%≥95%)→瓶颈不在 CPU。直连同窗口中位 upload 3182/download 2957(download 直连亦 <3000)。
+- **G2 TLS mux 单流 ≥2500:FAIL**——1229/1801 Mbps。
+- **G3 六协议单流正吞吐:PASS**(mux=1,relay=splice)。
+- **G4 1200B UDP 损失<1%:PASS**——六协议中位 0%(各 n=3,排空去重,sent==recv_unique)。
+- **G5 4096 verified+5 轮保持:FAIL 仅 kcp**——verified=[4095,4096,4096](s3 建连 4096、应用层首验 4095,保持期未恢复,1/12288);tcp/tls/ws/wss/quic-mux 与 tcp-nomux 对照均 4096×3。
+- **G6 配对保留率 ≥80%:FAIL**——verify-goal-report 原件逐条 22/36 条件 <80%(独立复核概述称 21,以原件为准):tcp/tls/ws 单流 34–67%、wss 另含 4 流 52.6–72.3%、quic 全档 19.9–29.9%、kcp 全档 13.6–22.9%。
+- **G7 ≥3 次有效配对:PASS**——每条件 3/3、invalid=0;独立抽查 252 个 raw exit 全 0、窗口重叠 0。
+- 机械结果:accept runner exit=0(5955s);closure verify 18/19(exit=1);verify_goal exit=1。
 
-## 4. E2E 与 Linux 现状(如实,不沿用旧通过)
+## 4. 未解决/未验证(如实,不以计划替代)
 
-- 四套件 E2E(e2e.sh 73/0、resilience 19/0、transports 12/0、relay-modes 21/0,exit 全 0)最近一次全绿在 final-linux-r2,**属改动前旧构建**(server `26c4704d`/client `087bcb8c`)。**当前源码(kcp.rs/tcp.rs 改动后)未重跑四套件**——正确性现状以 §3 全量测试为准,E2E 级验收待跑。
-- Linux 三机:性能候选未过门槛,**本轮未执行新的远端测试**;若历史验收器重跑结果与旧输出不一致,先核对 source/版本差异,不得混构建归因。
-- 「早期 WS 缺锁」「未跑 Linux」「G6=24」均为已被后续证据取代的旧状态(WS 不变量锁已落、final-linux-r2 已跑、round-2 实为 25/36 档 FAIL),不再列为现状。
+1. G1/G2/G6 软件侧缺口未修:本轮对吞吐路径**零改动**(诊断对照 refsplice/copy 与 rh 同噪声带,无热点证据,不伪造归因);候选方向见报告 §6/§7。
+2. G5 kcp 1/12288 原因未定(不能写"超窗瞬态");下次运行带 H 计数器归因。
+3. listener Linux 挂起机理未定论(内核拆除竞态孤儿未排除);10/10 绿非数学证明;旧 3/10 失败日志并存保留。
+4. C 项 c2_punch 守卫偶发(3 轮中 2 红)未根治。
+5. termark exec 60s/-1 根因在工具侧不可查;已按"不判死+pid 文件恢复"处置(accept 内 11 次恢复均成功);该新增恢复路径未被深审(独立复核观察)。
+6. candidate-r0 之后的增量改动未重新强验收(本机 `cargo test --workspace` 15 套 206/0/2、clippy exit=0 为 mac 定向;Linux 全量以 candidate-r0 为准)。
+7. tcp-nomux 16s upload 时 client CPU 66–69% 接近饱和——解读 G6 多流时不得全归因转发路径。
 
-## 5. 性能目标 G1–G7(验收门槛 [performance-repair-acceptance.md](performance-repair-acceptance.md) §1)
+## 5. 需用户决定(未授权不执行)
 
-- **G1 TCP nomux 单流双向 ≥3000:FAIL**(CPU 口径 <50% 达标)。round-2 旧构建 1943/2113;final-lowat 生产诊断三档+默认中位 1845–2302,全部 <3000,CPU 最高 36.9%;LOWAT 档位作为 G1 手段已证伪。**当前源码未重测**。
-- **G2 TLS mux 单流双向 ≥2500:FAIL**。round-2 1172/1752;当前源码未重测。
-- **G3/G4/G5:曾在 kcp-improve 构建 PASS**(六协议正吞吐;1200B UDP 0.0%×3;4096 隧道 alive 5 轮/setup 9.76s),但该构建旧于当前源七轮补修,**不构成当前源的同一码验收**,需随全矩阵重跑。
-- **G6 配对保留率 ≥80%:FAIL**。round-2(旧构建)25/36 档 <80%;KCP kcp-improve 实测 12.1–14.8%(OLD 4.2–6.2%);tcp/tls/ws/wss/quic 在最新源未重测。
-- **G7(≥3 次配对中位):不能报全过**。kcp-improvement 对照 OLD 两档不足 3 有效配对(4 个 exit=1 漏判,RAW-ERRATA 已勘误)。
-- **当前源码完整六协议矩阵(逐协议×方向×流数)未跑**;本轮全部通过证据均为定向/单元级,不得泛化为全矩阵。
+1. sysctl 解锁实验;2. 网卡/拓扑变更;3. 内核升级;4. 权限提升。软件侧可证伪实验(单流转发路径归因、quic/kcp 用户态旋钮 targeted A/B)红线内可继续,无需另授权。
 
-## 6. KCP 遗留与观察(下一轮候选,均未关闭)
+## 证据索引(路径即结论,全文见报告)
 
-- **ACK 合批:未实施**。方案(batching-plan.md,基线=当前 `16b72155`)审查 3 项阻断:①tokio 1.53.2 `recv_many` 为 append 语义,方案必须写明每轮 `batch.clear()` 否则 Vec 无界增长;②通道已关闭且空时 `recv_many` 立即返回 0,必须映射 `if n==0 break` 否则热转到 90s 空闲超时;③b12 单包 1 flush 现行为已成立、不可能红,须改列冻结守护或删红绿措辞。另 2 项注记(b11 喂纯 ACK 包、门槛(e)低负载盲区)。按审查修订方案后方可实施。
-- **NEW rh-server 隧道窗口 ~156–169% 单核口径进程 CPU**(OLD 31–53%):多线程进程占用,**未证明单线程饱和或整机饱和**;疑似每包一 ACK 数据报放大,归因待合批实验的计数器证据。
-- ghost-20004 已排除:是压测装置自身把 vhost `http_port` 写为 20004(peer.sh:187),非 trial_bind/DB 不同步;auto_range 分配已实测跳过自占端口(ghost-20004-verify/ repro+skip-proof)。遗留低严重性:2007 报错不区分"被自身 vhost/web/metrics 占用"与"被外部进程占用",创建路径无端口预检(api.rs:842),非阻断。
-- 服务端 demux try_send 满丢包(靠 kcp 重传)、RECORD.md 延迟表值与引用日志不一致(方向性结论不变)——见 history-3 §3,未重动。
-
-## 7. 需用户决定(未授权不执行)
-
-1. sysctl 解锁实验(rmem_max/wmem_max 等)——环境改动与恢复范围。
-2. 网卡/拓扑变更(如 vmxnet3 USO)——平台级决策;软件侧仍有可证伪实验(合批、falsifiable 归因)未做完,不以"无实验剩余"为由跳过。
-3. **当前源码完整验收重跑**:四套件 E2E + 六协议性能矩阵(G1/G2/G6 及 G3–G5/G7 同源落地)——现有授权未覆盖。
-4. KCP 合批实验是否按修订方案开轮(含 b12 分类修正)。
-5. 红线内可继续:tls 单流差额归因(perf 级采样需授权)、KCP 80% 保留率路径(合批+CPU 归因)。
-
-## 证据索引
-
-- 六项+追加复核:`benchmark/runs/goal-repair/{kcp-main-review,kcp-boundary}/`(红/绿日志、快照、README 七轮)。
-- TCP:`benchmark/runs/goal-repair/tcp-listener-lifecycle/`(RUNS.md 三组红绿+终态 575d9a1f)。
-- 最终源全量/clippy:`benchmark/runs/goal-repair/checks/kcp-boundary-{workspace-test-77c8lvoo,clippy-uo6mpehh}/`。
-- 端口观察:`benchmark/runs/goal-repair/ghost-20004-verify/`;性能旧数据:round-2/final-lowat/kcp-improvement(含 RAW-ERRATA)。
-- 历史:history.md(1059 行)、history-2.md(44 行)、history-3.md(56 行,`aebfa707…`)。
+- 最终验收:`benchmark/runs/performance-closure-c84/candidate-r0/`(run-index.json、verify-goal-report.txt、evidence/×7、logs/、events.jsonl)。
+- 机械检查:`…/checks/{linux-full-accept-atoctbgz,linux-artifact-verify-m3l3wbp3,fixed-performance-goal-xxdxm43w,optimized-workspace-1d0gosuv,optimized-clippy-soaiwyhy}`。
+- A–C 红绿:`…/main-independent/`、`…/kcp/{red,candidate-tests,shutdown-guard}/`;D:`…/kcp/counter-ab-isolated/analysis.json`;E:`…/ports/`。
+- 装置:`…/lab/README.md`;基线:`…/baseline-local/`、`…/linux-baseline(-r2)/`;listener:`…/{listener-probe,tcp-cancel-race}/`;计数器:`…/session-failure-counter/`。
+- 旧证据(goal-repair/kcp-boundary 等)仅背景,索引见 history-4 §证据索引;本文件不重复其内容。

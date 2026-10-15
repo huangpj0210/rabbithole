@@ -337,14 +337,18 @@ mod tests {
         use std::time::Duration;
         use tokio::io::AsyncWriteExt;
         let (a, b) = tokio::io::duplex(64);
-        let ws = tokio_tungstenite::WebSocketStream::from_partially_read(Box::new(a) as BoxedIo, vec![], Role::Client, None)
-            .await;
+        let ws = tokio_tungstenite::WebSocketStream::from_partially_read(
+            Box::new(a) as BoxedIo,
+            vec![],
+            Role::Client,
+            None,
+        )
+        .await;
         let mut c = WsIo::new(ws);
         let reader = tokio::spawn(async move {
             let mut b = b;
             let mut out = Vec::new();
-            let _ =
-                tokio::time::timeout(Duration::from_secs(5), b.read_to_end(&mut out)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), b.read_to_end(&mut out)).await;
             out
         });
 
@@ -370,7 +374,8 @@ mod tests {
         let mut want = p1.clone();
         want.extend_from_slice(&p2);
         assert_eq!(
-            joined, want,
+            joined,
+            want,
             "背压 Pending 重试不得重复入队、不得丢载荷;帧数={}",
             frames.len()
         );
@@ -386,13 +391,17 @@ mod tests {
     async fn ws_send_queued_manual_poll_single_frame() {
         use std::time::Duration;
         let (a, b) = tokio::io::duplex(8);
-        let ws = tokio_tungstenite::WebSocketStream::from_partially_read(Box::new(a) as BoxedIo, vec![], Role::Client, None)
-            .await;
+        let ws = tokio_tungstenite::WebSocketStream::from_partially_read(
+            Box::new(a) as BoxedIo,
+            vec![],
+            Role::Client,
+            None,
+        )
+        .await;
         let reader = tokio::spawn(async move {
             let mut b = b;
             let mut out = Vec::new();
-            let _ =
-                tokio::time::timeout(Duration::from_secs(5), b.read_to_end(&mut out)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), b.read_to_end(&mut out)).await;
             out
         });
 
@@ -402,9 +411,12 @@ mod tests {
         let n = {
             let mut c = WsIo::new(ws);
             let mut pinned = std::pin::pin!(c);
-            tokio::time::timeout(Duration::from_secs(5), std::future::poll_fn(|cx| {
-                tokio::io::AsyncWrite::poll_write(pinned.as_mut(), cx, &payload)
-            }))
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                std::future::poll_fn(|cx| {
+                    tokio::io::AsyncWrite::poll_write(pinned.as_mut(), cx, &payload)
+                }),
+            )
             .await
             .expect("deadline: manual write")
             .expect("manual write")

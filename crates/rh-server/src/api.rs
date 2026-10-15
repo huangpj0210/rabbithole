@@ -840,7 +840,15 @@ async fn create_service_inner(
                     trial_bind_udp(bind_ip, spec.bind_port)
                 };
             if !trial_ok {
-                return Err((2007, "端口绑定失败:端口已被占用".into()));
+                let msg = bind_failure_message(
+                    &state,
+                    "端口绑定失败:端口已被占用",
+                    proto,
+                    bind_ip,
+                    spec.bind_port,
+                )
+                .await;
+                return Err((2007, msg));
             }
         }
     } else if matches!(
@@ -1024,7 +1032,15 @@ async fn update_service(
                 trial_bind_udp(new_ip, spec.bind_port)
             };
         if !trial_ok {
-            return err(3005, "端口绑定失败");
+            let msg = bind_failure_message(
+                &state,
+                "端口绑定失败",
+                spec.kind.as_str(),
+                new_ip,
+                spec.bind_port,
+            )
+            .await;
+            return err(3005, &msg);
         }
     }
     let rev = match state
@@ -1187,6 +1203,32 @@ fn trial_bind_udp(ip: std::net::IpAddr, port: u16) -> bool {
     true
 }
 
+/// 2007/3005 消息细化:命中本服务自身配置/在用的监听 → 附加来源(名称/地址)提示;
+/// 未命中 → 原样返回通用文案(外部进程占用口径),数字码与 JSON 形状不变。
+/// 静态配置来源只声明"配置保留",不冒充实时进程检测;OS 试绑仍是最终裁定。
+async fn bind_failure_message(
+    state: &Arc<AppState>,
+    base: &str,
+    proto: &str,
+    ip: std::net::IpAddr,
+    port: u16,
+) -> String {
+    match state.classify_port_occupation(proto, ip, port).await {
+        Some(hit) => {
+            let how = if hit.live {
+                "正在监听"
+            } else {
+                "配置监听"
+            };
+            format!(
+                "{base};占用方:本服务自身 {}({} {})",
+                hit.label, how, hit.addr
+            )
+        }
+        None => base.to_string(),
+    }
+}
+
 async fn create_bind_checked(
     state: &Arc<AppState>,
     _client_id: &str,
@@ -1224,7 +1266,15 @@ async fn create_bind_checked(
             trial_bind_udp(bind_ip, spec.bind_port)
         };
     if !trial_ok {
-        return Err((2007, "端口绑定失败".into()));
+        let msg = bind_failure_message(
+            state,
+            "端口绑定失败",
+            spec.kind.as_str(),
+            bind_ip,
+            spec.bind_port,
+        )
+        .await;
+        return Err((2007, msg));
     }
     Ok(())
 }
@@ -2388,4 +2438,390 @@ pub(crate) async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> Re
         buffer,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    //! E(2007/3005 自身/外部占用区分)定向回归:独立临时端口 + 内存 DB,
+    //! 直接调用 handler 公开路径(create/update/enable/disable)与最小 helper,
+    //! 由真实 bind 驱动试绑失败;数字码与 JSON 形状断言保持不变。
+    use super::*;
+    use crate::config::{MetricsConfig, ServerConfig, SshGatewayConfig};
+    use std::net::{IpAddr, TcpListener};
+
+    const CID: &str = "diag-e-client";
+    const LO: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    /// 挑一个避开常见固定端口(8080=web 默认/9100=metrics 默认)的空闲端口(探测后释放)。
+    fn free_port() -> u16 {
+        loop {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            if p != 8080 && p != 9100 {
+                return p;
+            }
+        }
+    }
+
+    /// 真实占住一个 TCP 端口(模拟外部进程/其他持有者)。返回 (端口, 持有的 listener)。
+    fn hold_tcp() -> (u16, TcpListener) {
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        (l.local_addr().unwrap().port(), l)
+    }
+
+    async fn diag_state(cfg: ServerConfig) -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "diag-e", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        Arc::new(AppState::new(cfg, db))
+    }
+
+    async fn auth_headers(state: &Arc<AppState>) -> HeaderMap {
+        let token = mint_jwt(state, "admin", 1).await.unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    fn spec(kind: &str, name: &str, port: u16) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": name,
+            "kind": kind,
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+        }))
+        .unwrap()
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn create(state: &Arc<AppState>, s: ProxySpec) -> serde_json::Value {
+        let h = auth_headers(state).await;
+        body_json(create_service(State(state.clone()), h, Json(s)).await).await
+    }
+
+    async fn update(state: &Arc<AppState>, id: i64, s: ProxySpec) -> serde_json::Value {
+        let h = auth_headers(state).await;
+        body_json(update_service(State(state.clone()), h, Path(id), Json(s)).await).await
+    }
+
+    async fn enable(state: &Arc<AppState>, id: i64) -> serde_json::Value {
+        let h = auth_headers(state).await;
+        body_json(enable_service(State(state.clone()), h, Path(id)).await).await
+    }
+
+    async fn disable(state: &Arc<AppState>, id: i64) -> serde_json::Value {
+        let h = auth_headers(state).await;
+        body_json(disable_service(State(state.clone()), h, Path(id)).await).await
+    }
+
+    /// 在指定端口拉起真实 metrics 监听(teardown 后监听释放是异步的,短暂重试)。
+    async fn start_metrics(state: &Arc<AppState>, port: u16) {
+        for _ in 0..40 {
+            if state
+                .metrics_listen_start(&MetricsConfig {
+                    enable_prometheus: true,
+                    bind_addr: "127.0.0.1".into(),
+                    port,
+                })
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("metrics listen start failed on 127.0.0.1:{port}");
+    }
+
+    #[tokio::test]
+    async fn e_2007_names_self_listener() {
+        // 格1:metrics —— 本进程真实在跑的监听(热启停记录的地址)
+        let m = free_port();
+        let state = diag_state(ServerConfig::default()).await;
+        start_metrics(&state, m).await;
+        let v = create(&state, spec("tcp", "diag-metrics", m)).await;
+        assert_eq!(v["code"], 2007, "{v}");
+        let msg = v["message"].as_str().unwrap();
+        assert_eq!(
+            msg,
+            format!(
+                "端口绑定失败:端口已被占用;占用方:本服务自身 Prometheus 指标监听(正在监听 127.0.0.1:{m})"
+            )
+        );
+        // 停止后记录清除,不再归属 metrics(热改即时反映)
+        state.metrics_listen_stop().await;
+        assert!(state.classify_port_occupation("tcp", LO, m).await.is_none());
+
+        // 格2:Web 管理后台(静态配置保留口径)
+        let (w, hold) = hold_tcp();
+        let mut cfg = ServerConfig::default();
+        cfg.web.bind_addr = "127.0.0.1".into();
+        cfg.web.port = w;
+        let state = diag_state(cfg).await;
+        let v = create(&state, spec("tcp", "diag-web", w)).await;
+        assert_eq!(v["code"], 2007, "{v}");
+        let msg = v["message"].as_str().unwrap();
+        assert_eq!(
+            msg,
+            format!(
+                "端口绑定失败:端口已被占用;占用方:本服务自身 Web 管理后台(配置监听 127.0.0.1:{w})"
+            )
+        );
+        drop((hold, state));
+
+        // 格3:vhost http(与控制面同 bind_addr;0=关闭不占用,>0 才保留)
+        let (h, hold) = hold_tcp();
+        let mut cfg = ServerConfig::default();
+        cfg.bind_addr = "127.0.0.1".into();
+        cfg.vhost.http_port = h;
+        let state = diag_state(cfg).await;
+        let v = create(&state, spec("tcp", "diag-vhost", h)).await;
+        assert_eq!(v["code"], 2007, "{v}");
+        let msg = v["message"].as_str().unwrap();
+        assert!(msg.contains("vhost HTTP 共享监听"), "{msg}");
+        assert!(msg.contains(&format!("配置监听 127.0.0.1:{h}")), "{msg}");
+        drop((hold, state));
+    }
+
+    #[tokio::test]
+    async fn e_2007_external_occupation_message() {
+        let (x, hold) = hold_tcp();
+        let state = diag_state(ServerConfig::default()).await;
+        // 该端口不在任何自身启用配置中:无自身归属(未启用字段不保留占用)
+        assert!(state.classify_port_occupation("tcp", LO, x).await.is_none());
+        let v = create(&state, spec("tcp", "diag-ext", x)).await;
+        assert_eq!(v["code"], 2007, "{v}");
+        // 外部占用:数字码/JSON 形状/通用文案均保持不变
+        assert_eq!(v["message"], "端口绑定失败:端口已被占用");
+        assert!(v["data"].is_null());
+        drop((hold, state));
+    }
+
+    #[tokio::test]
+    async fn e_udp_on_tcp_held_port_no_false_conflict() {
+        let (x, hold) = hold_tcp();
+        let mut cfg = ServerConfig::default();
+        cfg.web.bind_addr = "127.0.0.1".into();
+        cfg.web.port = x;
+        let state = diag_state(cfg).await;
+        // TCP 视角:自身 web 配置命中
+        assert!(state.classify_port_occupation("tcp", LO, x).await.is_some());
+        // UDP 视角:协议族独立(TCP/UDP 命名空间),不构成冲突
+        assert!(state.classify_port_occupation("udp", LO, x).await.is_none());
+        // 真实路径:TCP 被占不影响 UDP 规则创建
+        let v = create(&state, spec("udp", "diag-udp", x)).await;
+        assert_eq!(v["code"], 0, "{v}");
+        drop((hold, state));
+    }
+
+    #[tokio::test]
+    async fn e_update_3005_same_classification() {
+        let state = diag_state(ServerConfig::default()).await;
+        let p = free_port();
+        let v = create(&state, spec("tcp", "diag-upd", p)).await;
+        assert_eq!(v["code"], 0, "{v}");
+        let id = v["data"]["id"].as_i64().unwrap();
+
+        // 自身:metrics 真实占住 m → 3005 指名自身来源(与创建同口径)
+        let m = free_port();
+        start_metrics(&state, m).await;
+        let v = update(&state, id, spec("tcp", "diag-upd", m)).await;
+        assert_eq!(v["code"], 3005, "{v}");
+        let msg = v["message"].as_str().unwrap();
+        assert_eq!(
+            msg,
+            format!("端口绑定失败;占用方:本服务自身 Prometheus 指标监听(正在监听 127.0.0.1:{m})")
+        );
+
+        // 外部:不在自身配置的端口 → 通用文案不变
+        let (x, hold) = hold_tcp();
+        let v = update(&state, id, spec("tcp", "diag-upd", x)).await;
+        assert_eq!(v["code"], 3005, "{v}");
+        assert_eq!(v["message"], "端口绑定失败");
+        drop((hold, state));
+    }
+
+    #[tokio::test]
+    async fn e_group_shared_no_trial_misreport() {
+        let state = diag_state(ServerConfig::default()).await;
+        let p = free_port();
+        let mut a = spec("tcp", "diag-grp-a", p);
+        a.group = Some("g1".into());
+        let v = create(&state, a).await;
+        assert_eq!(v["code"], 0, "{v}");
+        // 同组第二成员:组共享监听已在位,短路试绑,不误报 2007
+        let mut b = spec("tcp", "diag-grp-b", p);
+        b.group = Some("g1".into());
+        let v = create(&state, b).await;
+        assert_eq!(v["code"], 0, "{v}");
+        // 非同组成员同端口:仍走既有 2006(本次改动不波及)
+        let v = create(&state, spec("tcp", "diag-grp-c", p)).await;
+        assert_eq!(v["code"], 2006, "{v}");
+    }
+
+    #[tokio::test]
+    async fn e_auto_allocate_untouched() {
+        // 自动分配的 OS 探测跳过语义不被破坏:自身 metrics 实占范围端点,
+        // 分配结果落在范围内且避开被占端口
+        let m = free_port();
+        let x = free_port();
+        let (lo, hi) = if m < x { (m, x) } else { (x, m) };
+        let mut cfg = ServerConfig::default();
+        cfg.ports.auto_range = Some(format!("{lo}-{hi}"));
+        let state = diag_state(cfg).await;
+        start_metrics(&state, m).await;
+        let v = create(&state, spec("tcp", "diag-auto", 0)).await;
+        assert_eq!(v["code"], 0, "{v}");
+        let got = v["data"]["bind_port"].as_u64().unwrap() as u16;
+        assert!(
+            got >= lo && got <= hi && got != m,
+            "allocated {got} not in [{lo},{hi}] avoiding {m}"
+        );
+        assert_eq!(v["data"]["port_auto"], true);
+    }
+
+    #[tokio::test]
+    async fn e_enable_2007_self_classification() {
+        let state = diag_state(ServerConfig::default()).await;
+        let p = free_port();
+        let v = create(&state, spec("tcp", "diag-en", p)).await;
+        assert_eq!(v["code"], 0, "{v}");
+        let id = v["data"]["id"].as_i64().unwrap();
+        let v = disable(&state, id).await;
+        assert_eq!(v["code"], 0, "{v}");
+        // 停用释放端口后由自身 metrics 占住 → enable(复用 create_bind_checked)
+        // 同样指名自身来源
+        start_metrics(&state, p).await;
+        let v = enable(&state, id).await;
+        assert_eq!(v["code"], 2007, "{v}");
+        let msg = v["message"].as_str().unwrap();
+        assert_eq!(
+            msg,
+            format!("端口绑定失败;占用方:本服务自身 Prometheus 指标监听(正在监听 127.0.0.1:{p})")
+        );
+        // enable 失败回滚:规则保持停用
+        let row = state.db.get_proxy(id).await.unwrap().unwrap();
+        assert!(!row.2.enabled);
+    }
+
+    #[tokio::test]
+    async fn e_classify_sources_and_no_phantom_reservation() {
+        // 默认配置(无控制面/extra/vhost/ssh/metrics)不构成任何自身占用
+        let state = diag_state(ServerConfig::default()).await;
+        let any = free_port();
+        assert!(state
+            .classify_port_occupation("tcp", LO, any)
+            .await
+            .is_none());
+        assert!(state
+            .classify_port_occupation("udp", LO, any)
+            .await
+            .is_none());
+
+        // 控制面主监听 kcp(UDP 族)+ extra quic(UDP 族)+ vhost https/tcpmux(TCP 族)
+        let k = free_port();
+        let q = free_port();
+        let hs = free_port();
+        let tm = free_port();
+        let mut cfg = ServerConfig::default();
+        cfg.bind_addr = "127.0.0.1".into();
+        cfg.bind_protocol = "kcp".into();
+        cfg.bind_port = k;
+        cfg.extra_listeners = vec![crate::config::ListenerConfig {
+            protocol: "quic".into(),
+            bind_port: q,
+            bind_addr: Some("127.0.0.1".into()),
+            multiplex: None,
+            tls: None,
+        }];
+        cfg.vhost.https_port = hs;
+        cfg.vhost.tcpmux_port = tm;
+        let state = diag_state(cfg).await;
+
+        let hit = state.classify_port_occupation("udp", LO, k).await.unwrap();
+        assert!(hit.label.contains("控制面主监听(kcp)"), "{}", hit.label);
+        assert_eq!(hit.addr, std::net::SocketAddr::from((LO, k)));
+        assert!(!hit.live);
+        // 族隔离:TCP 查询不命中 UDP 监听
+        assert!(state.classify_port_occupation("tcp", LO, k).await.is_none());
+
+        let hit = state.classify_port_occupation("udp", LO, q).await.unwrap();
+        assert!(hit.label.contains("附加传输监听(quic)"), "{}", hit.label);
+
+        let hit = state.classify_port_occupation("tcp", LO, hs).await.unwrap();
+        assert!(hit.label.contains("vhost HTTPS"), "{}", hit.label);
+        let hit = state.classify_port_occupation("tcp", LO, tm).await.unwrap();
+        assert!(hit.label.contains("tcpmux"), "{}", hit.label);
+
+        // 异地址不误判:web 绑 127.0.0.1,查 127.0.0.3 同端口 → 无冲突;
+        // 通配查询侧与具体监听冲突(bind_conflicts 通配/具体双向口径)
+        let w = free_port();
+        let mut cfg2 = ServerConfig::default();
+        cfg2.web.bind_addr = "127.0.0.1".into();
+        cfg2.web.port = w;
+        let state2 = diag_state(cfg2).await;
+        let other: IpAddr = "127.0.0.3".parse().unwrap();
+        assert!(state2
+            .classify_port_occupation("tcp", other, w)
+            .await
+            .is_none());
+        let un = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        assert!(state2
+            .classify_port_occupation("tcp", un, w)
+            .await
+            .is_some());
+        drop(state2);
+
+        // SSH 网关:热配置 enabled 才命中,关闭后不保留占用
+        let s = free_port();
+        state.hot.write().await.ssh_gateway = SshGatewayConfig {
+            enabled: true,
+            bind_port: s,
+            bind_addr: "127.0.0.1".into(),
+            ..Default::default()
+        };
+        let hit = state.classify_port_occupation("tcp", LO, s).await.unwrap();
+        assert!(hit.label.contains("SSH 网关"), "{}", hit.label);
+        state.hot.write().await.ssh_gateway.enabled = false;
+        assert!(state.classify_port_occupation("tcp", LO, s).await.is_none());
+
+        // metrics 陈旧配置不得作为归属依据:hot.metrics 指向 stale 而实际监听在
+        // live_p → 只命中 live_p;未监听时 stale 也不命中
+        let stale = free_port();
+        let live_p = free_port();
+        state.hot.write().await.metrics = MetricsConfig {
+            enable_prometheus: true,
+            bind_addr: "127.0.0.1".into(),
+            port: stale,
+        };
+        assert!(state
+            .classify_port_occupation("tcp", LO, stale)
+            .await
+            .is_none());
+        start_metrics(&state, live_p).await;
+        let hit = state
+            .classify_port_occupation("tcp", LO, live_p)
+            .await
+            .unwrap();
+        assert!(hit.label.contains("Prometheus"), "{}", hit.label);
+        assert!(hit.live);
+        assert!(state
+            .classify_port_occupation("tcp", LO, stale)
+            .await
+            .is_none());
+    }
 }

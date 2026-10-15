@@ -85,13 +85,49 @@ async fn expect_closed_soon(
     }
 }
 
+/// post-drop 探针的源端口守卫(LINUX-LISTENER-PROBE-REVIEW.md 的平台事实)。
+///
+/// Linux 上不带显式 bind 的 `connect` 由内核自动分配临时源端口,该端口可能
+/// 恰好等于刚随 listener 释放的目的端口,形成 127.0.0.1:P ↔ 127.0.0.1:P 的
+/// TCP 自连接:connect 成功、读到自己写的数据、永不 EOF。这会让回归 3 的
+/// "post-drop probe 2s 无 EOF"在 listener 已正确拆除时也 panic,把平台混杂
+/// 误判为产品泄漏(真实失败与自连接混杂无法区分,故原失败保留为未定归因)。
+///
+/// 这里显式 `TcpSocket::new_v4` + bind 127.0.0.1:0,确认源端口 != 服务端口
+/// (bind0 撞上刚释放的服务端口概率极小,有界重选),使 4 元组 local != peer,
+/// 自连接在构造上不可能。connect 的结果语义不变:被拒(Refused)或 Ok 后仍
+/// 必须在原 2s 内观察到关闭。
+async fn connect_with_distinct_source(server_addr: std::net::SocketAddr) -> io::Result<TcpStream> {
+    const MAX_ATTEMPTS: usize = 8;
+    let mut last_collision: Option<io::Error> = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind("127.0.0.1:0".parse().unwrap())?;
+        let local = socket.local_addr()?;
+        if local.port() == server_addr.port() {
+            // 极小概率:bind0 恰好选中刚释放的服务端口,销毁重选
+            drop(socket);
+            last_collision = Some(io::Error::other(format!(
+                "probe source port collided with server port {} ({} attempts)",
+                server_addr.port(),
+                MAX_ATTEMPTS
+            )));
+            continue;
+        }
+        return socket.connect(server_addr).await;
+    }
+    Err(last_collision.expect("bounded retry loop must record a collision"))
+}
+
 /// 回归 1:零会话 public bind → drop 句柄 → 原地址重绑。
 /// 复刻主代理确定性复现(listener_drop_probe.rs 的 TCP 部分):
 /// 原实现 pump 脱离所有者持有 listener,AddrInUse 永不解除 → 红。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_session_drop_releases_bind_addr() {
     let cfg = tcp_cfg();
-    let listener = tcp::listen_stream(&cfg, mux_streams()).await.expect("listen");
+    let listener = tcp::listen_stream(&cfg, mux_streams())
+        .await
+        .expect("listen");
     let addr = listener.local_addr().expect("local_addr");
     // 零会话:不做任何连接,直接 drop 唯一句柄
     drop(listener);
@@ -109,7 +145,9 @@ async fn zero_session_drop_releases_bind_addr() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_stream_survives_listener_drop() {
     let cfg = tcp_cfg();
-    let mut listener = tcp::listen_stream(&cfg, mux_streams()).await.expect("listen");
+    let mut listener = tcp::listen_stream(&cfg, mux_streams())
+        .await
+        .expect("listen");
     let addr = listener.local_addr().expect("local_addr");
 
     let body = async {
@@ -171,11 +209,15 @@ async fn accepted_stream_survives_listener_drop() {
 async fn drop_with_pending_handshake_leaves_no_residue() {
     let mut cfg = tcp_cfg();
     cfg.multiplex = true; // 服务端会 peek 首 4 字节,静默客户端 → 握手挂起
-    let listener = tcp::listen_stream(&cfg, mux_streams()).await.expect("listen");
+    let listener = tcp::listen_stream(&cfg, mux_streams())
+        .await
+        .expect("listen");
     let addr = listener.local_addr().expect("local_addr");
 
     // 静默客户端:连接但不发任何字节 → 服务端握手停在 peek_prefix
-    let mut silent = TcpStream::connect(addr).await.expect("silent client connect");
+    let mut silent = TcpStream::connect(addr)
+        .await
+        .expect("silent client connect");
     // 给泵一个调度窗口把该连接 accept 出去并进入 peek
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -184,7 +226,9 @@ async fn drop_with_pending_handshake_leaves_no_residue() {
 
         // a) 不再接新连接:被拒(Refused)可接受;极端竞态下被 accept 也必须
         //    立即被关闭,而不是当成正常接入等握手。
-        match TcpStream::connect(addr).await {
+        //    探针显式 bind 源端口且 != 服务端口,排除 Linux TCP 自连接混杂;
+        //    失败消息记录 local/peer tuple,便于区分真泄漏与平台行为。
+        match connect_with_distinct_source(addr).await {
             Err(e) => {
                 assert!(
                     matches!(
@@ -197,9 +241,41 @@ async fn drop_with_pending_handshake_leaves_no_residue() {
                 );
             }
             Ok(mut probe) => {
+                let local = probe.local_addr().ok();
+                let peer = probe.peer_addr().ok();
+                assert_ne!(
+                    local, peer,
+                    "post-drop probe must never be a TCP self-connect (local={local:?} peer={peer:?})"
+                );
+                // 连接已建立但必须拆除。只读不足以证明泄漏:drop 到泵 future
+                // 实际析构(监听 fd 关闭)之间存在调度窗口,SYN 在窗口内完成握手
+                // 的连接此后只归内核——Linux 5.15 对这类"拆除竞态孤儿"可能不向
+                // 对端发任何段(inet_csk_listen_stop 的 ANK 注释/inet_child_forget
+                // 的半开 req 路径),只读会静默挂起,把平台行为误判为产品持有。
+                // 先写后读:写入强制内核裁决四元组——对端 socket 已不存在必回
+                // RST(2s 内观察到关闭);若真有用户空间持有(泵未被 abort/child
+                // 泄漏/外进程重绑同端口存活),写入被持有方缓冲/消费,读仍挂 →
+                // 仍红。不 sleep、不放大超时、不改变拒绝语义。
+                let wrote = probe.write_all(b"probe123").await;
                 let mut b = [0u8; 8];
-                expect_closed_soon("post-drop probe connection", probe.read(&mut b), Duration::from_secs(2))
-                    .await;
+                let what = format!(
+                    "post-drop probe connection after write (local={local:?} peer={peer:?} wrote={wrote:?})"
+                );
+                match wrote {
+                    // 写阶段即观察到对端拆除(如 darwin 对 backlog 残留发 RST):
+                    // closed,与读到 Reset/EOF 等价
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionAborted
+                        ) => {}
+                    Err(e) => panic!("{what}: unexpected write error (not a close signal): {e}"),
+                    Ok(()) => {
+                        expect_closed_soon(&what, probe.read(&mut b), Duration::from_secs(2)).await;
+                    }
+                }
             }
         }
 
@@ -237,7 +313,9 @@ async fn drop_with_pending_handshake_leaves_no_residue() {
 async fn completed_handshake_unconsumed_reclaimed_on_drop() {
     let mut cfg = tcp_cfg();
     cfg.multiplex = true;
-    let listener = tcp::listen_stream(&cfg, mux_streams()).await.expect("listen");
+    let listener = tcp::listen_stream(&cfg, mux_streams())
+        .await
+        .expect("listen");
     let addr = listener.local_addr().expect("local_addr");
 
     // 标准 yamux Ping(SYN,id=123),与主代理 r2 探针逐字节一致
@@ -292,7 +370,9 @@ async fn completed_handshake_unconsumed_reclaimed_on_drop() {
 async fn queue_full_drop_reclaims_queued_and_backpressured() {
     let mut cfg = tcp_cfg();
     cfg.multiplex = true;
-    let mut listener = tcp::listen_stream(&cfg, mux_streams()).await.expect("listen");
+    let mut listener = tcp::listen_stream(&cfg, mux_streams())
+        .await
+        .expect("listen");
     let addr = listener.local_addr().expect("local_addr");
 
     const CAP: usize = 512; // tcp.rs ready 通道容量
@@ -388,7 +468,9 @@ async fn queue_full_drop_reclaims_queued_and_backpressured() {
 async fn delivered_yamux_mux_built_at_accept_still_works() {
     let mut cfg = tcp_cfg();
     cfg.multiplex = true;
-    let mut listener = tcp::listen_stream(&cfg, mux_streams()).await.expect("listen");
+    let mut listener = tcp::listen_stream(&cfg, mux_streams())
+        .await
+        .expect("listen");
     let addr = listener.local_addr().expect("local_addr");
 
     let c_cfg = ClientTransportConfig {
@@ -400,7 +482,10 @@ async fn delivered_yamux_mux_built_at_accept_still_works() {
     let client_mux = connect(&c_cfg).await.expect("client connect");
     let mut c_stream = client_mux.open_stream().await.expect("client open stream");
     // 先写:帧在服务端 accept 之前就已缓冲(PrependedIo + TCP 缓冲)
-    c_stream.write_all(b"lazy-mux-echo").await.expect("client write");
+    c_stream
+        .write_all(b"lazy-mux-echo")
+        .await
+        .expect("client write");
 
     let body = async {
         let inc = tokio::time::timeout(Duration::from_secs(3), listener.accept())
@@ -416,12 +501,70 @@ async fn delivered_yamux_mux_built_at_accept_still_works() {
             .await
             .expect("server read pre-accept-buffered bytes");
         assert_eq!(&buf[..13], b"lazy-mux-echo");
-        s_stream.write_all(b"lazy-mux-pong").await.expect("server write");
+        s_stream
+            .write_all(b"lazy-mux-pong")
+            .await
+            .expect("server write");
         c_stream
             .read_exact(&mut buf[..13])
             .await
             .expect("client read echo");
         assert_eq!(&buf[..13], b"lazy-mux-pong");
+    };
+    tokio::time::timeout(Duration::from_secs(8), body)
+        .await
+        .expect("test deadline (8s)");
+}
+
+/// 守卫(机制锁定,确定性构造,无竞态):回归 3 的 post-drop 探针以
+/// "先写后读"判定关闭,依据是平台事实——握手已完成、但从未被用户空间
+/// accept 的连接,在其监听 socket 关闭后,对端可能得不到任何通知
+/// (Linux 5.15 `inet_csk_listen_stop` 的 ANK 注释:既未按规格发 FIN 也
+/// 未实现 abort 变体;darwin 则对 backlog 残留发 RST)。这类"拆除竞态
+/// 孤儿"一旦被写入,内核必须裁决四元组:对端 socket 已不存在 → RST
+/// (RFC 793 未知连接语义);若仍被用户空间持有则数据被缓冲/消费。
+///
+/// 本测试用裸 std listener 确定性构造该类:connect 仅入 kernel backlog、
+/// 永不 accept → close listener → 写 8 字节 → 必须在 2s 内观察到关闭
+/// (写 Reset/BrokenPipe/Aborted,或读 EOF/Reset)。无 sleep、无竞态窗口:
+/// connect 在 close 之前完成,连接归属内核 backlog 而非任何用户任务。
+/// 绿色前提对 darwin/RST-at-close 与 Linux/拆除竞态孤儿两类内核行为均成立;
+/// 红 = 写入后连接仍被"某个用户空间持有者"保活 → 真持有,不是平台混杂。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backlog_orphan_close_is_observable_after_write() {
+    // 裸 std listener:确知该连接永远不会被 accept(没有泵、没有任务)
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("std bind");
+    let addr = listener.local_addr().expect("std local_addr");
+
+    let body = async {
+        // 握手完成即止:连接只存在于 kernel backlog
+        let mut probe = TcpStream::connect(addr).await.expect("backlog connect");
+        let local = probe.local_addr().ok();
+        let peer = probe.peer_addr().ok();
+        assert_ne!(
+            local, peer,
+            "must not be a self-connect (local={local:?} peer={peer:?})"
+        );
+
+        drop(listener); // fd 关闭:此后连接的存续只可能是内核孤儿或外部持有
+
+        let wrote = probe.write_all(b"probe123").await;
+        let what =
+            format!("backlog orphan after write (local={local:?} peer={peer:?} wrote={wrote:?})");
+        let mut b = [0u8; 8];
+        match wrote {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionAborted
+                ) => {}
+            Err(e) => panic!("{what}: unexpected write error (not a close signal): {e}"),
+            Ok(()) => {
+                expect_closed_soon(&what, probe.read(&mut b), Duration::from_secs(2)).await;
+            }
+        }
     };
     tokio::time::timeout(Duration::from_secs(8), body)
         .await

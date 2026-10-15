@@ -320,7 +320,7 @@ def run_concurrent(args) -> dict:
     class Conn:
         __slots__ = ("s", "state", "outbuf", "inbuf", "connect_t0",
                      "await_deadline", "next_ping_at", "rounds_done",
-                     "alive", "finished")
+                     "alive", "finished", "idx", "ping_t0", "err_note")
 
         def __init__(self, s):
             self.s = s
@@ -333,6 +333,31 @@ def run_concurrent(args) -> dict:
             self.rounds_done = 0
             self.alive = True
             self.finished = False
+            self.idx = -1            # ★c84-diag:连接序号(失败可观测性)
+            self.ping_t0 = 0.0       # ★c84-diag:最近一次 PING 发出时刻
+            self.err_note = ""       # ★c84-diag:失败详情(EOF/timeout/badline/senderr)
+
+    # ★c84-diag:逐连接失败原因留痕(只观测,不改变任何 deadline/口径;
+    # 上限 64 条防膨胀;原因分类与 verify_failed/hold_lost 计数一一对应)
+    failures: list[dict] = []
+    verify_rtts: list[float] = []
+
+    def note_failure(c: Conn, reason: str, extra: str = "") -> None:
+        now = time.perf_counter()
+        try:
+            lport = c.s.getsockname()[1]
+        except OSError:
+            lport = 0
+        rec = {
+            "idx": c.idx, "local_port": lport, "state": c.state,
+            "reason": reason, "detail": extra[:120],
+            "connect_age_ms": round((now - c.connect_t0) * 1e3, 1),
+            "await_age_ms": round((now - c.ping_t0) * 1e3, 1)
+            if c.ping_t0 else None,
+            "inbuf_head": bytes(c.inbuf[:16]).decode("latin1"),
+        }
+        if len(failures) < 64:
+            failures.append(rec)
 
     sel = selectors.DefaultSelector()
     conns: list[Conn] = []
@@ -373,8 +398,9 @@ def run_concurrent(args) -> dict:
                 k = c.s.send(c.outbuf)
             except BlockingIOError:
                 return
-            except OSError:
+            except OSError as exc:
                 c.alive = False
+                note_failure(c, "senderr", f"errno={exc.errno} {exc}")
                 if c.state == "conn":
                     connect_failed += 1
                 elif c.state in ("ver_w", "ver_r"):
@@ -388,6 +414,7 @@ def run_concurrent(args) -> dict:
 
     def queue_ping(c: Conn, now: float) -> None:
         c.outbuf += b"PING\n"
+        c.ping_t0 = now            # ★c84-diag:RTT/await 计时锚
         c.await_deadline = now + verify_timeout
         set_interest(c)
 
@@ -401,6 +428,7 @@ def run_concurrent(args) -> dict:
             data = b""
         if not data:               # 对端关闭
             c.alive = False
+            note_failure(c, "EOF")
             if c.state in ("ver_w", "ver_r"):
                 verify_failed += 1
             else:
@@ -413,6 +441,7 @@ def run_concurrent(args) -> dict:
             c.inbuf = bytearray(rest)
             if line.strip() != b"PONG":
                 c.alive = False
+                note_failure(c, "badline", f"line={bytes(line[:24])!r}")
                 if c.state == "ver_r":
                     verify_failed += 1
                 else:
@@ -422,6 +451,8 @@ def run_concurrent(args) -> dict:
             # 收到合法 PONG
             c.await_deadline = 0.0
             if c.state == "ver_r":
+                if c.ping_t0:
+                    verify_rtts.append((now - c.ping_t0) * 1e3)
                 initial_verified += 1
                 c.state = "hold"
                 c.next_ping_at = now + hold_tick
@@ -447,6 +478,7 @@ def run_concurrent(args) -> dict:
             rc = exc.errno or errno.EIO
         if rc in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
             c = Conn(s)
+            c.idx = len(conns)
             c.connect_t0 = time.perf_counter()
             conns.append(c)
             sel.register(s, selectors.EVENT_WRITE, c)
@@ -514,6 +546,7 @@ def run_concurrent(args) -> dict:
             elif c.await_deadline and now > c.await_deadline:
                 # 期望的 PONG 未按期到达
                 c.alive = False
+                note_failure(c, "timeout")
                 if c.state == "ver_r":
                     verify_failed += 1
                 elif c.state == "hold":
@@ -534,6 +567,7 @@ def run_concurrent(args) -> dict:
     for c in open_conns:
         if not c.finished:
             c.alive = False
+            note_failure(c, "overall_timeout")
             if c.state == "conn":
                 connect_failed += 1
             elif c.state in ("ver_w", "ver_r"):
@@ -565,6 +599,11 @@ def run_concurrent(args) -> dict:
         "ended_us": ended_us,
     }
     out.update({f"connect_{k}": v for k, v in summarize(lat).items()})
+    # ★c84-diag:逐连接失败留痕 + 初次往返 RTT 分布(观测字段;
+    # verify_goal 的 G5 判定字段完全不变)
+    out["failures"] = failures
+    if verify_rtts:
+        out["verify_rtt_ms"] = summarize(verify_rtts)
     return out
 
 

@@ -1315,7 +1315,10 @@ mod tests {
             .iter()
             .filter(|h| h.flags().contains(header::FIN))
             .count();
-        assert_eq!(fins, 1, "repeated close must be idempotent, headers: {hdrs:?}");
+        assert_eq!(
+            fins, 1,
+            "repeated close must be idempotent, headers: {hdrs:?}"
+        );
         // SYN 也只能出现一次
         let syns = hdrs
             .iter()
@@ -1345,7 +1348,11 @@ mod tests {
         drive_to_pending(&mut conn, &mut cx);
 
         let hdrs = stream1_data_headers(&st);
-        assert_eq!(hdrs.len(), 2, "empty write + close = 2 frames, got {hdrs:?}");
+        assert_eq!(
+            hdrs.len(),
+            2,
+            "empty write + close = 2 frames, got {hdrs:?}"
+        );
         assert!(
             hdrs[0].flags().contains(header::SYN) && !hdrs[0].flags().contains(header::FIN),
             "empty write carries SYN only, got {:?}",

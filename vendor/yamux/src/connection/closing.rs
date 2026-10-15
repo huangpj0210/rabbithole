@@ -375,11 +375,17 @@ mod tests {
         ));
         stream_receivers.push(receiver(
             &frame_close,
-            StreamCommand::CloseStream { ack: false, syn: false },
+            StreamCommand::CloseStream {
+                ack: false,
+                syn: false,
+            },
         ));
         stream_receivers.push(receiver(
             &frame_close_ack,
-            StreamCommand::CloseStream { ack: true, syn: false },
+            StreamCommand::CloseStream {
+                ack: true,
+                syn: false,
+            },
         ));
         let pending_frames = vec![frame_pending];
         let mut socket = Socket {

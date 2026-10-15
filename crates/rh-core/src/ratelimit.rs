@@ -57,7 +57,8 @@ impl TokenBucket {
         s.tokens -= granted as f64;
         drop(s);
         if granted > 0 {
-            self.consumed_total.fetch_add(granted as u64, Ordering::Relaxed);
+            self.consumed_total
+                .fetch_add(granted as u64, Ordering::Relaxed);
         }
         granted
     }
@@ -185,7 +186,11 @@ mod tests {
         assert_eq!(bucket.consumed_total(), 4096);
         r.consume(1000);
         assert_eq!(r.held(), 3096, "消费后余量可见");
-        assert_eq!(bucket.consumed_total(), 4096, "消费不改变累计(已在 take 计入)");
+        assert_eq!(
+            bucket.consumed_total(),
+            4096,
+            "消费不改变累计(已在 take 计入)"
+        );
         drop(r); // 未消费的 3096 退还
         assert_eq!(bucket.consumed_total(), 1000, "drop 未消费即退");
 

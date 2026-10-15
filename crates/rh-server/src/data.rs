@@ -231,12 +231,20 @@ pub async fn assign_forward(
     };
     let payload = match serde_json::to_vec(&fwd) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(e) => {
+            // G5 1/N 归因:此前零留痕(实践中仅 OOM 级,计数求全)
+            state.metrics.count_session_failure("start_forward_encode");
+            debug!(proxy = rt.id, user_src = %user_src, error = %e, "session failed: encode START_FORWARD");
+            return;
+        }
     };
     if rh_protocol::write_frame(&mut channel, FrameType::START_FORWARD, &payload)
         .await
         .is_err()
     {
+        // G5 1/N 归因:死通道指派失败此前零留痕(单连接丢弃不落日志)
+        state.metrics.count_session_failure("start_forward_write");
+        debug!(proxy = rt.id, user_src = %user_src, "session failed: START_FORWARD write (dead channel)");
         return; // 死连接:上层取下一条/重试
     }
     // B1:剥 QuotaIo 壳(route_data_stream 包装;仅 TcpPool→assign_forward
@@ -320,7 +328,19 @@ pub async fn assign_forward(
     let _ = local_addr_override;
     state.metrics.count_relay_path("copy");
     debug!(proxy = rt.id, "relay path: copy");
-    copy_relay_pair(user, channel, bucket, client_bucket, rt.rule_cancel.clone()).await;
+    copy_relay_pair(
+        user,
+        channel,
+        bucket,
+        client_bucket,
+        rt.rule_cancel.clone(),
+        RelayFailCtx {
+            metrics: state.metrics.clone(),
+            proxy: rt.id,
+            user_src: user_src.to_string(),
+        },
+    )
+    .await;
 }
 
 /// 规则取消后的收尾(shutdown)等待上限:poll_shutdown 可能永久 Pending
@@ -388,12 +408,15 @@ where
 /// 有界收尾(CANCEL_CLOSE_GRACE)+ 先完成侧异常(panic/错误)立即
 /// 终止对向泵(对向可能在等一个永远不来的数据/EOF,不得永存);
 /// clean EOF 保持无界半关闭等待(红线)。
+/// c84 G5 1/N 归因:异常终止(IO 错误/panic)经 rabbithole_session_
+/// failures_total 计数 + 单条 debug;规则取消与 clean EOF 不计。
 async fn copy_relay_pair(
     user: BoxedIo,
     channel: BoxedIo,
     bucket: Option<Arc<TokenBucket>>,
     client_bucket: Option<Arc<TokenBucket>>,
     rule_cancel: tokio_util::sync::CancellationToken,
+    fail: RelayFailCtx,
 ) {
     use std::sync::atomic::Ordering;
     let (mut u_r, mut u_w) = tokio::io::split(user);
@@ -407,6 +430,11 @@ async fn copy_relay_pair(
     //(与 rh-transport mux.rs mux_relay 同款收敛保证)。
     let up_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dn_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 规则取消与 IO 错误同置 *_errored(现有收敛语义不动);单独记取消,
+    // 供失败计数剔除管理操作(禁用/删除规则不是会话失败)。
+    let up_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dn_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let up_cancel_flag = up_cancelled.clone();
     let up_err = up_errored.clone();
     let t1 = tokio::spawn(async move {
         // 规则取消(禁用/删除)级联关闭在途转发(§4.1);取消路径收尾
@@ -415,6 +443,9 @@ async fn copy_relay_pair(
             clean = copy_limited(&mut u_r, &mut c_w, bucket2, cb2) => (false, clean),
             _ = cancel.cancelled() => (true, false),
         };
+        if by_cancel {
+            up_cancel_flag.store(true, Ordering::SeqCst);
+        }
         if !clean {
             up_err.store(true, Ordering::SeqCst);
         }
@@ -430,12 +461,16 @@ async fn copy_relay_pair(
     });
     let cancel2 = rule_cancel;
     let cancel2_tail = cancel2.clone();
+    let dn_cancel_flag = dn_cancelled.clone();
     let dn_err = dn_errored.clone();
     let t2 = tokio::spawn(async move {
         let (by_cancel, clean) = tokio::select! {
             clean = copy_limited(&mut c_r, &mut u_w, bucket, client_bucket) => (false, clean),
             _ = cancel2.cancelled() => (true, false),
         };
+        if by_cancel {
+            dn_cancel_flag.store(true, Ordering::SeqCst);
+        }
         if !clean {
             dn_err.store(true, Ordering::SeqCst);
         }
@@ -461,9 +496,84 @@ async fn copy_relay_pair(
         _ => g2.panicked() || dn_errored.load(Ordering::SeqCst),
     };
     if abnormal {
+        count_relay_failure(
+            &fail,
+            first == 1,
+            if first == 1 {
+                g1.panicked()
+            } else {
+                g2.panicked()
+            },
+            if first == 1 {
+                up_errored.load(Ordering::SeqCst)
+            } else {
+                dn_errored.load(Ordering::SeqCst)
+            },
+            if first == 1 {
+                up_cancelled.load(Ordering::SeqCst)
+            } else {
+                dn_cancelled.load(Ordering::SeqCst)
+            },
+        );
         return;
     }
-    let _ = tokio::join!(g1, g2);
+    let _ = tokio::join!(&mut g1, &mut g2);
+    // 先完成侧 clean EOF:对向(后完成)若以 IO 错误/panic 结束同样计数
+    //(clean EOF 与规则取消不计,见 count_relay_failure)。
+    let second_up = first == 2;
+    count_relay_failure(
+        &fail,
+        second_up,
+        if second_up {
+            g1.panicked()
+        } else {
+            g2.panicked()
+        },
+        if second_up {
+            up_errored.load(Ordering::SeqCst)
+        } else {
+            dn_errored.load(Ordering::SeqCst)
+        },
+        if second_up {
+            up_cancelled.load(Ordering::SeqCst)
+        } else {
+            dn_cancelled.load(Ordering::SeqCst)
+        },
+    );
+}
+
+/// G5 1/N 归因:relay 异常终止计数。IO 错误/panic 计为会话失败
+/// (rabbithole_session_failures_total{reason} + 单条 debug 明细);
+/// 规则取消(禁用/删除)与 clean EOF 不计——管理操作/正常结束
+/// 不得淹没单连接 1/N 信号(c84 diagnostics README:36-40)。
+fn count_relay_failure(
+    ctx: &RelayFailCtx,
+    dir_up: bool,
+    panicked: bool,
+    errored: bool,
+    cancelled: bool,
+) {
+    let reason = if panicked {
+        "relay_pump_panic"
+    } else if errored && !cancelled {
+        if dir_up {
+            "relay_up_error"
+        } else {
+            "relay_down_error"
+        }
+    } else {
+        return; // 规则取消(或仅取消触发的收敛):非会话失败
+    };
+    let dir = if dir_up { "up" } else { "down" };
+    ctx.metrics.count_session_failure(reason);
+    debug!(proxy = ctx.proxy, user_src = %ctx.user_src, dir, reason, "session failed: relay abnormal end");
+}
+
+/// 会话失败归因上下文(计数器 + debug 明细字段)。
+struct RelayFailCtx {
+    metrics: Arc<crate::state::Metrics>,
+    proxy: u64,
+    user_src: String,
 }
 
 /// 返回 true = 以 clean EOF 结束(对向写端关闭,半关闭语义);
@@ -920,6 +1030,9 @@ async fn serve_tcp_user(
 ) {
     let _ = sock.set_nodelay(true);
     if !rt.healthy.load(Ordering::Relaxed) {
+        // G5 1/N 归因:健康摘除此前零留痕,计数+单条 debug
+        state.metrics.count_session_failure("health_fast_fail");
+        debug!(proxy = rt.id, peer = %peer, "session failed: health fast-fail");
         return; // 健康摘除:快速失败
     }
     // 组选路
@@ -928,9 +1041,16 @@ async fn serve_tcp_user(
         None => rt,
     };
     let Some(channel) = get_channel(&state, &target_rt).await else {
+        // G5 1/N 归因:池等待超时/签发失败此前零留痕(4096 突发下
+        // 最 plausible 的单连接静默丢弃点)
+        state.metrics.count_session_failure("channel_unavailable");
+        debug!(proxy = target_rt.id, peer = %peer, "session failed: no data channel");
         return; // 池空超时:快速失败
     };
     let Some(_conn_guard) = try_open_user_conn(&state, Some(&target_rt)) else {
+        // G5 1/N 归因:配额拒绝(max_conns/flow_limit)此前零留痕
+        state.metrics.count_session_failure("quota_rejected");
+        debug!(proxy = target_rt.id, peer = %peer, "session failed: client quota");
         return; // F2 配额超限:直接断开
     };
     state
@@ -1174,6 +1294,20 @@ fn conv_proxy_proto(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::
 mod tests {
     use super::*;
 
+    /// 会话失败计数用的独立 Metrics(与生产实例同构造)。
+    fn test_metrics() -> Arc<crate::state::Metrics> {
+        Arc::new(crate::state::Metrics::new())
+    }
+
+    /// copy_relay_pair 会话失败归因上下文(计数断言用独立 Metrics)。
+    fn test_fail_ctx() -> RelayFailCtx {
+        RelayFailCtx {
+            metrics: test_metrics(),
+            proxy: 0,
+            user_src: String::new(),
+        }
+    }
+
     /// Drop 探针 IO(审计 src/main.rs 同款手法):子泵终止(所有权释放)时翻转。
     struct DropIo {
         inner: tokio::io::DuplexStream,
@@ -1248,7 +1382,14 @@ mod tests {
         });
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let parent = tokio::spawn(copy_relay_pair(user, channel, None, None, cancel));
+        let parent = tokio::spawn(copy_relay_pair(
+            user,
+            channel,
+            None,
+            None,
+            cancel,
+            test_fail_ctx(),
+        ));
 
         // 建立流:user 侧写入 → 通道对端收到(copy 双向在跑)
         a_peer.write_u8(1).await.unwrap();
@@ -1348,7 +1489,14 @@ mod tests {
         let channel: BoxedIo = Box::new(c_local);
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut parent = tokio::spawn(copy_relay_pair(user, channel, None, None, cancel.clone()));
+        let mut parent = tokio::spawn(copy_relay_pair(
+            user,
+            channel,
+            None,
+            None,
+            cancel.clone(),
+            test_fail_ctx(),
+        ));
 
         // 建立流:user 侧写入 → 通道对端收到(copy 双向在跑)
         use tokio::io::AsyncWriteExt as _;
@@ -1393,7 +1541,14 @@ mod tests {
         let channel: BoxedIo = Box::new(c_local);
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut parent = tokio::spawn(copy_relay_pair(user, channel, None, None, cancel.clone()));
+        let mut parent = tokio::spawn(copy_relay_pair(
+            user,
+            channel,
+            None,
+            None,
+            cancel.clone(),
+            test_fail_ctx(),
+        ));
 
         // 双向在跑:user 写 → 通道对端收到
         use tokio::io::AsyncWriteExt as _;
@@ -1496,6 +1651,7 @@ mod tests {
             None,
             None,
             cancel.clone(),
+            test_fail_ctx(),
         ));
 
         // 通道侧数据抵达 → t2(c_r→u_w)写用户侧得 Err → 错误路径;
@@ -1510,6 +1666,166 @@ mod tests {
         assert!(
             d_user.load(std::sync::atomic::Ordering::SeqCst),
             "copy 错误路径必须释放用户侧 IO"
+        );
+    }
+
+    // G5 1/N 归因(c84 candidate-r0 diagnostics README:36-40):copy 路径
+    // 异常终止必须计入 rabbithole_session_failures_total——IO 错误按方向
+    // 计 1 次;规则取消与 clean EOF 不得误计(管理操作/正常结束会淹没
+    // 单连接 1/N 信号)。panic 路径见 copy_relay_panic_contained 同款注入。
+    #[tokio::test]
+    async fn session_failure_counter_counts_io_error_once() {
+        let (_a_peer_hold, a_local) = tokio::io::duplex(4096);
+        let (mut c_peer, c_local) = tokio::io::duplex(4096);
+        let user: BoxedIo = Box::new(WriteErrShutdownPendIo {
+            inner: a_local,
+            dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let metrics = test_metrics();
+        let mut parent = tokio::spawn(copy_relay_pair(
+            user,
+            Box::new(c_local),
+            None,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            RelayFailCtx {
+                metrics: metrics.clone(),
+                proxy: 7,
+                user_src: "1.2.3.4:5".to_string(),
+            },
+        ));
+        use tokio::io::AsyncWriteExt as _;
+        c_peer.write_all(b"boom").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), &mut parent)
+            .await
+            .expect("copy 错误路径必须收敛")
+            .unwrap();
+        // dn(c_r→u_w 写用户侧 Err)恰计 1;对向(被 abort)不重复计
+        assert_eq!(
+            metrics
+                .session_failures_total
+                .with_label_values(&["relay_down_error"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .session_failures_total
+                .with_label_values(&["relay_up_error"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .session_failures_total
+                .with_label_values(&["relay_pump_panic"])
+                .get(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn session_failure_counter_ignores_rule_cancel_and_clean_eof() {
+        // clean EOF:两侧对端全部 drop → 双向自然 EOF,零计数
+        {
+            let (a_peer, a_local) = tokio::io::duplex(4096);
+            let (c_peer, c_local) = tokio::io::duplex(4096);
+            let metrics = test_metrics();
+            let relay = copy_relay_pair(
+                Box::new(a_local),
+                Box::new(c_local),
+                None,
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                RelayFailCtx {
+                    metrics: metrics.clone(),
+                    proxy: 0,
+                    user_src: String::new(),
+                },
+            );
+            drop(a_peer);
+            drop(c_peer);
+            tokio::time::timeout(Duration::from_secs(3), relay)
+                .await
+                .expect("clean EOF 双向必须收敛");
+            assert_eq!(
+                metrics
+                    .session_failures_total
+                    .with_label_values(&["relay_up_error"])
+                    .get(),
+                0
+            );
+            assert_eq!(
+                metrics
+                    .session_failures_total
+                    .with_label_values(&["relay_down_error"])
+                    .get(),
+                0
+            );
+        }
+        // 规则取消(在途断开):零计数
+        {
+            let (_a_peer, a_local) = tokio::io::duplex(4096);
+            let (_c_peer, c_local) = tokio::io::duplex(4096);
+            let metrics = test_metrics();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut parent = tokio::spawn(copy_relay_pair(
+                Box::new(a_local),
+                Box::new(c_local),
+                None,
+                None,
+                cancel.clone(),
+                RelayFailCtx {
+                    metrics: metrics.clone(),
+                    proxy: 0,
+                    user_src: String::new(),
+                },
+            ));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(3), &mut parent)
+                .await
+                .expect("规则取消必须收敛")
+                .unwrap();
+            assert_eq!(
+                metrics
+                    .session_failures_total
+                    .with_label_values(&["relay_up_error"])
+                    .get(),
+                0
+            );
+            assert_eq!(
+                metrics
+                    .session_failures_total
+                    .with_label_values(&["relay_down_error"])
+                    .get(),
+                0
+            );
+            assert_eq!(
+                metrics
+                    .session_failures_total
+                    .with_label_values(&["relay_pump_panic"])
+                    .get(),
+                0
+            );
+        }
+    }
+
+    // 指标注册与 reason 标签(G5 1/N 归因的常驻 /metrics 信号)。
+    #[test]
+    fn session_failures_metric_registered_with_reason_label() {
+        use prometheus::Encoder as _;
+        let m = crate::state::Metrics::new();
+        m.count_session_failure("channel_unavailable");
+        m.count_session_failure("channel_unavailable");
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&m.registry.gather(), &mut buf)
+            .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("rabbithole_session_failures_total{reason=\"channel_unavailable\"} 2"),
+            "指标必须以 rabbithole_session_failures_total{{reason}} 暴露,实际:\n{text}"
         );
     }
 
@@ -1777,7 +2093,14 @@ mod tests {
         });
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut parent = tokio::spawn(copy_relay_pair(user, channel, None, None, cancel));
+        let mut parent = tokio::spawn(copy_relay_pair(
+            user,
+            channel,
+            None,
+            None,
+            cancel,
+            test_fail_ctx(),
+        ));
 
         // channel→user 方向数据抵达 → t2 写用户侧 panic
         use tokio::io::AsyncWriteExt as _;

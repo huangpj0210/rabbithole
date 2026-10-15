@@ -3,10 +3,13 @@
 //! - 服务端:单 UDP 端口,kcp 头部的 conv 字段做会话分离;未知 conv 的
 //!   合法 kcp 报文触发建会话并交给 accept 队列。
 //! - 客户端:随机 conv,直接开始发送(首包即隐式握手)。
-//! - 会话驱动:事件(用户写 notify / 入包)+ 2ms tick 调用 kcp.update;
-//!   有新写入/新入包/待发数据时立即 flush(kcp 0.6.0 interval 下限
-//!   10ms,等 interval 会把写延迟放大到毫秒级)。协议层心跳(PING)
-//!   维持活跃,SESSION_IDLE_TIMEOUT 内无任何入站报文则回收。
+//! - 会话驱动:事件(用户写 notify / 入站批 recv_many)+ 2ms tick 调用
+//!   kcp.update;有新写入/新入包/待发数据时立即 flush(kcp 0.6.0
+//!   interval 下限 10ms,等 interval 会把写延迟放大到毫秒级)。同一
+//!   唤醒批量消费已到达入包(≤BATCH_CAP,有 1 条即返回不凑满),
+//!   整批仅 1×update+1×flush。SESSION_IDLE_TIMEOUT 内无「进展」则
+//!   回收:无待交付时进展=任何入包;有待交付时进展=应用实际消费
+//!   (活跃慢消费者受保护,无人消费的滞留数据不再无限续命)。
 //! - 有界性(两个方向,均为站立不变量而非每轮配额):
 //!   发送侧 = 前端 write_queue(条数/字节上限)+ KCP 待发
 //!   (MAX_KCP_PENDING_SEGS,按 kcp.wait_snd() 即 snd_buf+snd_queue
@@ -16,7 +19,13 @@
 //! - UDP 输出:全部经同一积压队列由唯一 drain 任务串行发送(FIFO 由
 //!   构造保证,无直发插队);kernel 缓冲满(WouldBlock)有界排队、
 //!   超限按容量策略丢包计数(kcp RTO 重传);真实错误/短写致命化,
-//!   记录后经 kcp flush 传播终止会话并浮出到 IO,不静默吞掉。
+//!   记录后经 kcp flush 传播终止会话并浮出到 IO,不静默吞掉。connect
+//!   与 NAT 打洞(punch)输出复用同一 backlog/drain 状态机:打洞
+//!   Rotating 阶段每报发往弹出时刻的候选地址,learn 后锁定;
+//!   WouldBlock 入队补送(至多一次),假成功丢报不存在。
+//! - 半关闭:poll_shutdown 只关本地写侧 —— 交付完成(队列排空 + 全部
+//!   段被确认)即返回 Ok,会话继续服务读侧直到正常 EOF/idle/错误;
+//!   成功关写不再连带终止读端。
 //! - 生命周期:每个 spawn 的任务都有 owner 与退出路径 —— 会话任务随
 //!   用户句柄归零/通道关闭/错误退出;drain 任务随生产者(UdpOutput)
 //!   释放或致命错误退出;各接收循环 select 会话 shutdown 通知退出,
@@ -77,6 +86,83 @@ fn now_ms() -> u32 {
         .unwrap_or(0)
 }
 
+// ---------------- 诊断计数(零行为变更,仅观测) ----------------
+
+/// KCP 诊断计数快照(测试/基准可读,Relaxed 语义):
+/// 会话任务唤醒轮数、入包消费数、kcp input/update/flush 调用数、
+/// UDP send 尝试(fast-path 直发 + drain 队列发送)与 recvfrom 次数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KcpCounters {
+    pub wakeups: u64,
+    pub packets_consumed: u64,
+    pub input_calls: u64,
+    pub update_calls: u64,
+    pub flush_calls: u64,
+    pub send_attempts: u64,
+    pub recvfrom_calls: u64,
+}
+
+struct KcpCountersStatic {
+    wakeups: AtomicU64,
+    packets_consumed: AtomicU64,
+    input_calls: AtomicU64,
+    update_calls: AtomicU64,
+    flush_calls: AtomicU64,
+    send_attempts: AtomicU64,
+    recvfrom_calls: AtomicU64,
+}
+
+impl KcpCountersStatic {
+    const fn new() -> Self {
+        Self {
+            wakeups: AtomicU64::new(0),
+            packets_consumed: AtomicU64::new(0),
+            input_calls: AtomicU64::new(0),
+            update_calls: AtomicU64::new(0),
+            flush_calls: AtomicU64::new(0),
+            send_attempts: AtomicU64::new(0),
+            recvfrom_calls: AtomicU64::new(0),
+        }
+    }
+    fn snapshot(&self) -> KcpCounters {
+        KcpCounters {
+            wakeups: self.wakeups.load(Ordering::Relaxed),
+            packets_consumed: self.packets_consumed.load(Ordering::Relaxed),
+            input_calls: self.input_calls.load(Ordering::Relaxed),
+            update_calls: self.update_calls.load(Ordering::Relaxed),
+            flush_calls: self.flush_calls.load(Ordering::Relaxed),
+            send_attempts: self.send_attempts.load(Ordering::Relaxed),
+            recvfrom_calls: self.recvfrom_calls.load(Ordering::Relaxed),
+        }
+    }
+    fn reset(&self) {
+        self.wakeups.store(0, Ordering::Relaxed);
+        self.packets_consumed.store(0, Ordering::Relaxed);
+        self.input_calls.store(0, Ordering::Relaxed);
+        self.update_calls.store(0, Ordering::Relaxed);
+        self.flush_calls.store(0, Ordering::Relaxed);
+        self.send_attempts.store(0, Ordering::Relaxed);
+        self.recvfrom_calls.store(0, Ordering::Relaxed);
+    }
+}
+
+static COUNTERS: KcpCountersStatic = KcpCountersStatic::new();
+
+/// 进程级 KCP 诊断计数快照(基准/bench 用;进程内全部会话聚合)。
+pub fn counters() -> KcpCounters {
+    COUNTERS.snapshot()
+}
+
+/// 清零进程级诊断计数(基准测量窗起点)。
+pub fn counters_reset() {
+    COUNTERS.reset()
+}
+
+/// 同一唤醒批量消费入站包的上限(≤通道容量 256):单轮工作量 =
+/// 64×input(O(包长)) + 1 update + ≤256KiB recv + 1 flush,天然有界;
+/// recv_many 有 ≥1 条即返回,不凑满、不加等待。
+const BATCH_CAP: usize = 64;
+
 /// 队列内字节总数(条数上限之外的第二个容量维度)。
 fn backlog_bytes(q: &VecDeque<Vec<u8>>) -> usize {
     q.iter().map(|p| p.len()).sum()
@@ -96,6 +182,16 @@ struct Guarded {
     /// 裸 drop(未 shutdown)不置位,走 handles==0 即时取消 ——
     /// 两种语义刻意分离:显式成功关闭保证交付,取消不保证。
     closing: bool,
+    /// 本地写侧已成功关闭(A):显式 shutdown 完成(队列排空 + wait_snd==0)
+    /// 时置位并唤醒等待者,但会话**继续**服务读侧(入包交付/窗口 ACK/
+    /// dead_link/idle/句柄归零照常)—— 成功关写不得杀读侧。`closed`
+    /// 仅会话真终止(错误/idle/句柄归零/通道关闭)时置位,之后读端
+    /// 排空存量才见 EOF。
+    write_closed: bool,
+    /// 应用消费进展(B):poll_read 实际消费 n>0 字节时自增。会话侧以
+    /// 「consume_seq 是否变化」作为有待交付数据时的唯一活跃证据,
+    /// 无人消费的 read_buf 不再无限刷新空闲时钟。
+    consume_seq: u64,
     /// 已接受写序号(poll_write/punch 哨兵每入队一段递增)
     write_seq: u64,
     /// 会话侧完成 flush(数据已交给 kcp 输出)的序号,poll_flush 依据
@@ -128,6 +224,10 @@ struct Shared {
     notify: Notify,
     shutdown: Notify,
     handles: AtomicUsize,
+    /// 本会话诊断计数(测试隔离读,避免进程级计数被并行测试污染)
+    stats: KcpCountersStatic,
+    /// 入站批缓冲容量高水位(D 守护:跨轮复用不增长)
+    batch_cap_hwm: AtomicU64,
 }
 
 /// KCP 会话的字节流句柄。
@@ -167,6 +267,8 @@ impl AsyncRead for KcpIo {
                     buf.put_slice(&b[..n - an]);
                 }
                 s.read_buf.drain(..n);
+                // B:应用消费进展记账(有待交付时的唯一活跃证据)
+                s.consume_seq += 1;
             }
             let below_low_water = s.read_buf.len() < READ_LOW_WATER;
             drop(s);
@@ -200,7 +302,8 @@ impl AsyncWrite for KcpIo {
         if s.closed {
             return Poll::Ready(Err(other_err("kcp session closed")));
         }
-        if s.closing {
+        // closing 或写侧已成功关闭(A):继续写必须报错(半关闭写端语义)
+        if s.closing || s.write_closed {
             return Poll::Ready(Err(other_err("kcp session shutting down")));
         }
         // 空写与空读一致:立即 Ok(0),且不占用队列槽位/字节额度。
@@ -237,6 +340,12 @@ impl AsyncWrite for KcpIo {
         if s.write_queue.is_empty() && s.write_seq <= s.flushed_seq {
             return Poll::Ready(Ok(()));
         }
+        // 真终止兜底:会话已亡(closed),flushed_seq 不会再被推进,
+        // 未完成的 flush 契约不得永远 Pending(错误路径已被上方 error
+        // 分支截获;此处覆盖剩余 corner,如通道关闭时写已入队未搬运)。
+        if s.closed {
+            return Poll::Ready(Err(other_err("kcp session closed before flush completion")));
+        }
         s.write_waker = Some(cx.waker().clone());
         let need_kick = !s.write_queue.is_empty();
         drop(s);
@@ -247,9 +356,11 @@ impl AsyncWrite for KcpIo {
         }
         Poll::Pending
     }
-    /// 显式半关闭:不无条件 Ready。置 closing 后由会话在
+    /// 显式半关闭(只关本地写侧,A):置 closing 后由会话在
     /// 「write_queue 排空 + kcp wait_snd()==0(全部段被对端确认,
-    /// 即真实对端已完整收到)」时置 closed 并唤醒本 poll → Ready(Ok)。
+    /// 即真实对端已完整收到)」时置 write_closed 并唤醒本 poll →
+    /// Ready(Ok)。此后**读侧继续可用**:对端仍可发数据,会话照常
+    /// 交付/ACK,直到正常 EOF(读端排空后 closed)、idle 超时或错误。
     /// 正常路径不加强制超时;对端死亡经重传 dead_link 以 Err 浮出,
     /// 不吞错误。裸 drop 不走此路径(handles==0 即时取消,不保证交付)。
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -258,6 +369,9 @@ impl AsyncWrite for KcpIo {
             return Poll::Ready(Err(other_err(e)));
         }
         if s.closed {
+            return Poll::Ready(Ok(()));
+        }
+        if s.write_closed {
             return Poll::Ready(Ok(()));
         }
         let newly_closing = !s.closing;
@@ -440,7 +554,10 @@ impl UdpBacklog {
         {
             drop(q);
             self.dropped_full.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(len = pkt.len(), "kcp udp backlog full: drop (kcp retransmits)");
+            tracing::debug!(
+                len = pkt.len(),
+                "kcp udp backlog full: drop (kcp retransmits)"
+            );
             return false;
         }
         q.push_back(pkt.to_vec());
@@ -478,10 +595,12 @@ impl UdpBacklog {
         let mut q = self.state.lock().unwrap();
         self.inflight_bytes.fetch_sub(pkt.len(), Ordering::Relaxed);
         self.inflight_packets.fetch_sub(1, Ordering::Relaxed);
-        if backlog_bytes(&q) + pkt.len() > MAX_BACKLOG_BYTES || q.len() + 1 > MAX_BACKLOG_PACKETS
-        {
+        if backlog_bytes(&q) + pkt.len() > MAX_BACKLOG_BYTES || q.len() + 1 > MAX_BACKLOG_PACKETS {
             self.dropped_full.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(len = pkt.len(), "kcp udp backlog requeue over budget: drop self");
+            tracing::warn!(
+                len = pkt.len(),
+                "kcp udp backlog requeue over budget: drop self"
+            );
             return;
         }
         q.push_front(pkt);
@@ -495,6 +614,7 @@ impl UdpBacklog {
 /// - 发送成功计 sent;WouldBlock 放回队头(容量安全)返回 Blocked;
 /// - 短写/真实错误:致命 —— 记录错误并返回 Fatal,由 worker 收敛
 ///   退出、会话侧经 flush 传播终止。不吞、不盲目重试。
+#[derive(Debug)]
 enum DrainSt {
     Empty,
     Blocked,
@@ -523,10 +643,7 @@ fn drain_once(
             // UDP 报文原子发送;短写属于异常,致命化(修复前仅计数后
             // continue,违反不吞真实错误约束)
             Ok(n) => {
-                bl.note_fatal(
-                    format!("kcp udp short write {n}/{}", pkt.len()),
-                    pkt.len(),
-                );
+                bl.note_fatal(format!("kcp udp short write {n}/{}", pkt.len()), pkt.len());
                 return DrainSt::Fatal;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -543,8 +660,14 @@ fn drain_once(
 
 /// 积压 drain 任务:socket 可写时按序发出(唯一串行发送所有权)。
 ///
-/// 生命周期:owner = 生产者(UdpOutput,随 Kcp 存亡)。
-/// - 生产者 drop 时 UdpOutput::drop notify 唤醒本任务,复查引用计数
+/// 目的址泛化(C):connect 已连 / 固定对端 / 打洞轮询状态机 ——
+/// connect 与 punch 复用同一 backlog/drain 状态机,不另起一套。
+/// Rotating 阶段每个数据报发往「弹出时刻」peer.current() 的候选,
+/// Learned 后锁定;pop→send 一次、WouldBlock 回插队头,同一 pending
+/// 报至多送达一次。
+///
+/// 生命周期:owner = 生产者(UdpOutput/PunchOutput,随 Kcp 存亡)。
+/// - 生产者 drop 时 Drop notify 唤醒本任务,复查引用计数
 ///   后退出,不泄漏 backlog/socket/task;
 /// - 致命错误后退出(剩余队列随 Arc 释放回收,kcp 语义上可重传的
 ///   数据本就保留在对端协议状态之外——未 ACK 段在对端 snd_buf);
@@ -552,12 +675,25 @@ fn drain_once(
 ///
 /// 空闲等待持有 Arc 期间不监听 writable(常可写的 socket 会忙循环),
 /// 只等入队通知 + 存活复查定时。
-fn spawn_udp_backlog_drain(
-    sock: Arc<UdpSocket>,
-    peer: SocketAddr,
-    connected: bool,
-    backlog: Arc<UdpBacklog>,
-) {
+#[derive(Clone)]
+enum Dest {
+    /// 客户端 socket 已 connect:必须用 try_send(否则 EISCONN)
+    Connected,
+    Peer(SocketAddr),
+    Punch(Arc<PunchPeer>),
+}
+
+impl Dest {
+    fn try_send(&self, sock: &UdpSocket, pkt: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Dest::Connected => sock.try_send(pkt),
+            Dest::Peer(p) => sock.try_send_to(pkt, *p),
+            Dest::Punch(p) => sock.try_send_to(pkt, p.current()),
+        }
+    }
+}
+
+fn spawn_udp_backlog_drain(sock: Arc<UdpSocket>, dest: Dest, backlog: Arc<UdpBacklog>) {
     let weak = Arc::downgrade(&backlog);
     tokio::spawn(async move {
         let mut recheck = Duration::from_millis(10);
@@ -570,11 +706,8 @@ fn spawn_udp_backlog_drain(
                 break;
             }
             let st = drain_once(&bl, |pkt| {
-                if connected {
-                    sock.try_send(pkt)
-                } else {
-                    sock.try_send_to(pkt, peer)
-                }
+                COUNTERS.send_attempts.fetch_add(1, Ordering::Relaxed);
+                dest.try_send(&sock, pkt)
             });
             // bl 自身持一个 strong 引用:仅剩自己(计数 1)说明生产者
             // 已全部释放 —— 队列属主已亡,退出回收。
@@ -619,56 +752,71 @@ struct UdpOutput {
     backlog: Arc<UdpBacklog>,
 }
 
+/// 生产者写出策略(connect 对端与 punch 轮询共用,C):致命错误检查 →
+/// 队列/在途全空时直发快路径(此刻不存在可被插队的包,FIFO 平凡成立;
+/// 每数据报一次任务跳换会把 loopback 吞吐打掉近一个数量级)→ 否则有界
+/// 入队。UDP 报文原子发送,短写属于异常:显式报错,返回 Ok(n) 会让
+/// kcp 的 write_all 把剩余字节当第二个报文发出,损坏对端流。入队返回
+/// Ok 是 kcp 输出契约(同步回调不可阻塞,报错即终止会话,只有容量满
+/// 可丢,kcp RTO 重传兜底)。WouldBlock 假成功就此消除:入队计数可
+/// 观察、drain 补送至多一次。
+fn output_write_via_backlog(
+    backlog: &UdpBacklog,
+    direct: impl FnOnce(&[u8]) -> std::io::Result<usize>,
+    buf: &[u8],
+) -> std::io::Result<usize> {
+    // 致命错误:向 kcp 报错,经 flush 传播终止会话(不吞)。
+    if let Some(e) = backlog.fatal_error() {
+        return Err(other_err(e));
+    }
+    if backlog.is_idle() {
+        COUNTERS.send_attempts.fetch_add(1, Ordering::Relaxed);
+        match direct(buf) {
+            Ok(n) if n == buf.len() => return Ok(n),
+            Ok(n) => {
+                return Err(std::io::Error::other(format!(
+                    "kcp udp short write {n}/{}",
+                    buf.len()
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let _ = backlog.push(buf);
+    Ok(buf.len())
+}
+
 impl UdpOutput {
     /// 启动本输出的唯一串行发送任务(drain):sock/peer/connected 的
     /// 读取权移交 drain(它是唯一发送者),生产者只经 backlog 入队。
     /// 必须在 move 进 Kcp 之前调用一次,且每个 backlog 恰好一个 drain。
     fn spawn_drain(&self) {
-        spawn_udp_backlog_drain(
-            self.sock.clone(),
-            self.peer,
-            self.connected,
-            self.backlog.clone(),
-        );
+        let dest = if self.connected {
+            Dest::Connected
+        } else {
+            Dest::Peer(self.peer)
+        };
+        spawn_udp_backlog_drain(self.sock.clone(), dest, self.backlog.clone());
     }
 }
 
 impl Write for UdpOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // 致命错误:向 kcp 报错,经 flush 传播终止会话(不吞)。
-        if let Some(e) = self.backlog.fatal_error() {
-            return Err(other_err(e));
-        }
-        // 快路径:队列与在途全空时直发(此时不存在可被插队的包,FIFO
-        // 平凡成立;每数据报一次任务跳换会把 loopback 吞吐打掉近一个
-        // 数量级)。任何排队/在途包存在 → 一律入队由 drain 串行发送:
-        // 修复前「只看队列为空」会在 drain 已弹出队首、尚未发出时被
-        // 新包插队,FIFO 不成立(主代理断言 4)。
-        if self.backlog.is_idle() {
-            let r = if self.connected {
-                self.sock.try_send(buf)
-            } else {
-                self.sock.try_send_to(buf, self.peer)
-            };
-            match r {
-                Ok(n) if n == buf.len() => return Ok(n),
-                // UDP 报文原子发送,短写属于异常:显式报错。返回 Ok(n) 会让
-                // kcp 的 write_all 把剩余字节当第二个报文发出,损坏对端流。
-                Ok(n) => {
-                    return Err(std::io::Error::other(format!(
-                        "kcp udp short write {n}/{}",
-                        buf.len()
-                    )))
+        let sock = self.sock.clone();
+        let peer = self.peer;
+        let connected = self.connected;
+        output_write_via_backlog(
+            &self.backlog,
+            move |b| {
+                if connected {
+                    sock.try_send(b)
+                } else {
+                    sock.try_send_to(b, peer)
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e),
-            }
-        }
-        // 入队(WouldBlock 或有排队/在途):容量策略丢包(kcp RTO
-        // 重传),计数与日志可观测;返回 Ok 是 kcp 输出契约
-        // (同步回调不可阻塞,报错即终止会话,只有容量满可丢)。
-        let _ = self.backlog.push(buf);
-        Ok(buf.len())
+            },
+            buf,
+        )
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -690,40 +838,74 @@ enum SessionCmd {
 }
 
 async fn run_session<O: std::io::Write>(
+    kcp: Kcp<O>,
+    inbound: mpsc::Receiver<SessionCmd>,
+    shared: Arc<Shared>,
+) {
+    run_session_with_idle_timeout(kcp, inbound, shared, SESSION_IDLE_TIMEOUT).await
+}
+
+/// 可注入空闲超时的会话主循环(测试传 100-300ms;生产默认 90s 不变)。
+async fn run_session_with_idle_timeout<O: std::io::Write>(
     mut kcp: Kcp<O>,
     mut inbound: mpsc::Receiver<SessionCmd>,
     shared: Arc<Shared>,
+    idle_timeout: Duration,
 ) {
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_activity = Instant::now();
+    // B:应用消费进展观察(consume_seq 上次见值;有待交付数据时唯一
+    // 的活跃证据)。初始读一次,后续按「变化」判定。
+    let mut last_consume_seq = shared.guarded.lock().unwrap().consume_seq;
     // kcp recv 缓冲复用:peeksize→recv 每消息一次分配改为复用
     let mut recv_scratch: Vec<u8> = Vec::new();
     // 会话终止原因(真实错误浮出到 IO;None = 正常收尾)
     let mut error: Option<String> = None;
+    // 非错误退出的具体原因(通道提前结束/idle):收尾假成功守卫用。
+    // 正常收尾(write_closed 已确认或写侧本就干净)= None。
+    let mut exit_reason: Option<&'static str> = None;
     // 段预算精确化:单次喂入不超过剩余段余量 × mss,使站立不变量
     // wait_snd ≤ MAX_KCP_PENDING_SEGS 精确成立(此前「先判后整 64KiB」
     // 可越过上限约 56 段)。
     let mss = kcp.mss().max(1);
+    // D:入站批缓冲(容量 BATCH_CAP,Vec 跨轮复用;recv_many 有 ≥1 条
+    // 即返回,不凑满、不加等待 —— 低负载单包即时推进不变)。
+    let mut batch: Vec<SessionCmd> = Vec::with_capacity(BATCH_CAP);
 
     loop {
-        let mut got_packet = false;
+        batch.clear();
         tokio::select! {
             _ = ticker.tick() => {}
-            cmd = inbound.recv() => {
-                match cmd {
-                    Some(SessionCmd::Packet(pkt)) => {
-                        last_activity = Instant::now();
-                        got_packet = true;
-                        // input 错误(段格式/conv 不一致)由 demux 前置过滤,
-                        // 此处按可丢弃网络杂音处理,不终止会话。
-                        let _ = kcp.input(&pkt);
-                    }
-                    None => break,
+            n = inbound.recv_many(&mut batch, BATCH_CAP) => {
+                // 通道已关闭且空:立即退出,不在 select 热转到 idle 超时。
+                if n == 0 {
+                    exit_reason = Some("inbound channel closed");
+                    break;
                 }
             }
             _ = shared.notify.notified() => {}
         }
+        shared.stats.wakeups.fetch_add(1, Ordering::Relaxed);
+        COUNTERS.wakeups.fetch_add(1, Ordering::Relaxed);
+        let got_packet = !batch.is_empty();
+        for cmd in batch.drain(..) {
+            let SessionCmd::Packet(pkt) = cmd;
+            shared
+                .stats
+                .packets_consumed
+                .fetch_add(1, Ordering::Relaxed);
+            COUNTERS.packets_consumed.fetch_add(1, Ordering::Relaxed);
+            shared.stats.input_calls.fetch_add(1, Ordering::Relaxed);
+            COUNTERS.input_calls.fetch_add(1, Ordering::Relaxed);
+            // input 错误(段格式/conv 不一致)由 demux 前置过滤,
+            // 此处按可丢弃网络杂音处理,不终止会话。
+            let _ = kcp.input(&pkt);
+        }
+        // D 守护观测:批缓冲容量高水位(复用不增长)
+        shared
+            .batch_cap_hwm
+            .fetch_max(batch.capacity() as u64, Ordering::Relaxed);
         // 用户句柄已全部释放:裸 drop 取消语义 —— 不保证交付排队数据,
         // 与显式 shutdown(下方 closing 完成判定,保证交付)刻意分离。
         if shared.handles.load(Ordering::Acquire) == 0 {
@@ -783,6 +965,8 @@ async fn run_session<O: std::io::Write>(
             break;
         }
         // 驱动 kcp(重传/探测/输出)
+        shared.stats.update_calls.fetch_add(1, Ordering::Relaxed);
+        COUNTERS.update_calls.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = kcp.update(now_ms()) {
             error = Some(format!("kcp update: {e}"));
             break;
@@ -828,6 +1012,8 @@ async fn run_session<O: std::io::Write>(
         // 10ms,等 interval 会把每次写延迟放大到毫秒级。
         // idle 会话各条件皆假,不产生额外工作,无忙等/ACK 风暴。
         if user_wrote || got_packet || recv_moved || kcp.wait_snd() > 0 {
+            shared.stats.flush_calls.fetch_add(1, Ordering::Relaxed);
+            COUNTERS.flush_calls.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = kcp.flush() {
                 error = Some(format!("kcp flush: {e}"));
                 break;
@@ -842,33 +1028,67 @@ async fn run_session<O: std::io::Write>(
                 s.wake_write();
             }
         }
-        // 显式半关闭完成判定:请求关闭 + 队列排空 + kcp 全部段已确认
-        // (wait_snd==0,真实对端 kcp 已完整收到)→ 正常收尾。正常路径
-        // 不设超时;无 ACK 的对端由重传 dead_link 以错误浮出后在此之外
-        // 的 error 路径终止,poll_shutdown 返回 Err。
+        // 显式半关闭完成判定(A):请求关闭 + 队列排空 + kcp 全部段已
+        // 确认(wait_snd==0,真实对端 kcp 已完整收到)→ **只关本地写
+        // 侧**:置 write_closed 并唤醒 flush/shutdown 等待者,会话循环
+        // 继续 —— 入包交付、窗口 ACK、dead_link、idle、句柄归零全部
+        // 照常(成功关写不得杀读侧)。正常路径不设超时;无 ACK 的对端
+        // 由重传 dead_link 以 Err 浮出,poll_shutdown 返回 Err。
         {
-            let s = shared.guarded.lock().unwrap();
-            if s.closing && s.write_queue.is_empty() && kcp.wait_snd() == 0 {
-                break;
+            let mut s = shared.guarded.lock().unwrap();
+            if s.closing && !s.write_closed && s.write_queue.is_empty() && kcp.wait_snd() == 0 {
+                s.write_closed = true;
+                s.wake_write();
             }
         }
-        // 空闲判定:读端尚有未交付数据(或 kcp rcv 队列有存货)时会话
-        // 不算空闲 —— 慢消费者触发的流控停摆不得被空闲超时误杀。
+        // 空闲进展判定(B):读端尚有未交付数据(或 kcp rcv 队列有存货)
+        // 时,活跃证据 = 应用消费(consume_seq 变化,≤timeout 内有读的
+        // 慢消费者受保护);待交付存在时的入包(纯窗口探测/重传)不再
+        // 刷新时钟,无人消费且无消费进展按 idle 超时回收(读端存量
+        // 排空后 EOF,退出走现有 shutdown/日志可观察终态)。无待交付时
+        // 维持原语义:任何入包刷新。
         let has_pending_delivery = {
             let s = shared.guarded.lock().unwrap();
             !s.read_buf.is_empty()
         } || kcp.peeksize().is_ok();
         if has_pending_delivery {
+            let s = shared.guarded.lock().unwrap();
+            if s.consume_seq != last_consume_seq {
+                last_consume_seq = s.consume_seq;
+                last_activity = Instant::now();
+            }
+        } else if got_packet {
             last_activity = Instant::now();
         }
-        if last_activity.elapsed() > SESSION_IDLE_TIMEOUT {
+        if last_activity.elapsed() > idle_timeout {
             tracing::debug!("kcp session idle timeout");
+            exit_reason = Some("session idle timeout");
             break;
         }
     }
     // 统一收尾:关闭 + 错误浮出 + 唤醒 IO + 通知接收循环退出。
     {
         let mut s = shared.guarded.lock().unwrap();
+        // 关闭假成功守卫:idle/通道提前结束时,写侧仍有未确认交付
+        // (write_queue 未排空 / kcp 段未被 ACK / 显式 shutdown 请求了
+        // 但 write_closed 未完成),且仍有存活句柄可观察 —— 不得以
+        // error=None 伪 EOF/伪成功 shutdown。已接受字节的交付合同
+        // 要求失败可观察。正常路径不受影响:write_closed 已确认或
+        // 写侧干净 → pending=false;裸 drop 取消(handles==0,无观察者)
+        // 也不注入。真实错误路径 error 已先行置位,此处跳过。
+        if error.is_none() && shared.handles.load(Ordering::Acquire) > 0 {
+            let pending =
+                !s.write_queue.is_empty() || kcp.wait_snd() > 0 || (s.closing && !s.write_closed);
+            if pending {
+                let reason = exit_reason.unwrap_or("session terminated");
+                s.error = Some(format!(
+                    "kcp {reason} with unconfirmed write delivery (queued_writes={} kcp_unacked_segs={} closing_unconfirmed={})",
+                    s.write_queue.len(),
+                    kcp.wait_snd(),
+                    s.closing && !s.write_closed,
+                ));
+            }
+        }
         s.closed = true;
         if error.is_some() {
             s.error.clone_from(&error);
@@ -1015,7 +1235,10 @@ async fn demux_loop(
     loop {
         let (n, peer) = tokio::select! {
             r = udp.recv_from(&mut buf) => match r {
-                Ok(x) => x,
+                Ok(x) => {
+                    COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
+                    x
+                }
                 Err(e) => {
                     // 持续性 socket 错误(如 fd 失效)不退避会忙转烧 CPU
                     tracing::warn!(error = %e, "kcp recv error");
@@ -1174,6 +1397,8 @@ fn new_io() -> (KcpIo, Arc<Shared>) {
             write_waker: None,
             closed: false,
             closing: false,
+            write_closed: false,
+            consume_seq: 0,
             write_seq: 0,
             flushed_seq: 0,
             error: None,
@@ -1181,6 +1406,8 @@ fn new_io() -> (KcpIo, Arc<Shared>) {
         notify: Notify::new(),
         shutdown: Notify::new(),
         handles: AtomicUsize::new(1),
+        stats: KcpCountersStatic::new(),
+        batch_cap_hwm: AtomicU64::new(0),
     });
     (
         KcpIo {
@@ -1235,6 +1462,7 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
                 tokio::select! {
                     r = recv_sock.recv_from(&mut buf) => {
                         let Ok((n, _)) = r else { break };
+                        COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
                         if pkt_tx
                             .send(SessionCmd::Packet(buf[..n].to_vec()))
                             .await
@@ -1305,6 +1533,7 @@ pub async fn punch_listen(udp: Arc<UdpSocket>) -> std::io::Result<Arc<Multiplexe
                 tokio::select! {
                     r = udp.recv_from(&mut b) => {
                         let Ok((n, from)) = r else { break };
+                        COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
                         if from != pinned {
                             continue;
                         }
@@ -1403,23 +1632,49 @@ impl PunchPeer {
     }
 }
 
-/// 打洞输出:peer 经 PunchPeer 状态机(learn 后锁定)。
+/// 打洞输出(C):与 connect 复用同一 UdpBacklog/drain 状态机 ——
+/// peer 经 PunchPeer 状态机(learn 后锁定),WouldBlock 有界入队由
+/// drain 在 socket 可写时按序补送(每个 pending 报至多一次),真实
+/// 错误经 attach_session 错误桥直达会话 IO(idle 会话不等下一次写),
+/// 不再有「try_send_to WouldBlock → Ok(buf.len()) 假成功丢报」。
 struct PunchOutput {
     sock: Arc<UdpSocket>,
     peer: Arc<PunchPeer>,
+    backlog: Arc<UdpBacklog>,
+}
+
+impl PunchOutput {
+    /// 与 UdpOutput::spawn_drain 同款:唯一串行发送任务,目的址为
+    /// Punch(Rotating 每报取弹出时刻候选,Learned 锁定)。
+    fn spawn_drain(&self) {
+        spawn_udp_backlog_drain(
+            self.sock.clone(),
+            Dest::Punch(self.peer.clone()),
+            self.backlog.clone(),
+        );
+    }
 }
 
 impl Write for PunchOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let peer = self.peer.current();
-        match self.sock.try_send_to(buf, peer) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(buf.len()),
-            Err(e) => Err(e),
-        }
+        let sock = self.sock.clone();
+        let peer = self.peer.clone();
+        output_write_via_backlog(
+            &self.backlog,
+            move |b| sock.try_send_to(b, peer.current()),
+            buf,
+        )
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl Drop for PunchOutput {
+    fn drop(&mut self) {
+        // 生产者消亡通知(与 UdpOutput::drop 同款):唤醒 drain 复查
+        // 存活并退出,不持 socket 永挂。
+        self.backlog.notify.notify_one();
     }
 }
 
@@ -1458,13 +1713,18 @@ pub async fn punch_dial(
     let conv = (CONV_COUNTER.fetch_add(1, Ordering::Relaxed) as u32) ^ rand_u32();
     let peer = Arc::new(PunchPeer::new(candidates[0]));
     let (io, shared) = new_io();
-    let mut kcp = Kcp::new_stream(
-        conv,
-        PunchOutput {
-            sock: udp.clone(),
-            peer: peer.clone(),
-        },
-    );
+    // C:打洞输出接入同一积压队列 + 错误桥(idle 会话也能及时收到
+    // 真实输出错误,与 connect/listen 接线一致)
+    let backlog = Arc::new(UdpBacklog::new());
+    backlog.attach_session(&shared);
+    let output = PunchOutput {
+        sock: udp.clone(),
+        peer: peer.clone(),
+        backlog: backlog.clone(),
+    };
+    output.spawn_drain();
+    drop(backlog);
+    let mut kcp = Kcp::new_stream(conv, output);
     kcp.set_mtu(MTU).ok();
     kcp.set_wndsize(256, 256);
     kcp.set_nodelay(true, 2, 2, true);
@@ -1495,6 +1755,7 @@ pub async fn punch_dial(
                 tokio::select! {
                     r = udp.recv_from(&mut buf) => {
                         let Ok((n, from)) = r else { break };
+                        COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
                         let pkt = &buf[..n];
                         if n >= KCP_OVERHEAD && (81..=84).contains(&pkt[4]) {
                             if peer.learn(from) {
@@ -1735,7 +1996,10 @@ mod kcp_regress {
     }
 
     fn rec_contains(rec: &Arc<Mutex<Vec<u8>>>, needle: &[u8]) -> bool {
-        rec.lock().unwrap().windows(needle.len()).any(|w| w == needle)
+        rec.lock()
+            .unwrap()
+            .windows(needle.len())
+            .any(|w| w == needle)
     }
 
     fn rec_pos(rec: &Arc<Mutex<Vec<u8>>>, needle: &[u8]) -> Option<usize> {
@@ -1749,10 +2013,7 @@ mod kcp_regress {
     #[tokio::test(start_paused = true)]
     async fn t01_poll_write_notifies_session_immediately() {
         let (mut io, shared) = new_io();
-        assert!(matches!(
-            poll_w(&mut io, b"hello"),
-            Poll::Ready(Ok(5))
-        ));
+        assert!(matches!(poll_w(&mut io, b"hello"), Poll::Ready(Ok(5))));
         // 暂停时钟:若只能靠 tick 唤醒,1ms 内 notified 不会完成
         let got = tokio::time::timeout(Duration::from_millis(1), shared.notify.notified()).await;
         assert!(got.is_ok(), "poll_write 入队后必须 notify 会话任务");
@@ -1821,7 +2082,10 @@ mod kcp_regress {
         }
         assert!(ok, "一次唤醒必须拾取全部积压写");
         let (a, b, c) = (rec_pos(&rec, P1), rec_pos(&rec, P2), rec_pos(&rec, P3));
-        assert!(a < b && b < c, "流式输出顺序必须保持: {a:?} < {b:?} < {c:?}");
+        assert!(
+            a < b && b < c,
+            "流式输出顺序必须保持: {a:?} < {b:?} < {c:?}"
+        );
         task.abort();
     }
 
@@ -1908,7 +2172,10 @@ mod kcp_regress {
             s.closed = true;
         }
         let (p, n) = poll_r(&mut io, &mut rest);
-        assert!(matches!(p, Poll::Ready(Ok(()))), "关闭后必须 EOF 而非 Pending");
+        assert!(
+            matches!(p, Poll::Ready(Ok(()))),
+            "关闭后必须 EOF 而非 Pending"
+        );
         assert_eq!(n, 0);
     }
 
@@ -2082,7 +2349,7 @@ mod kcp_regress {
         assert!(!backlog.is_empty(), "包必须入积压而不是丢弃");
         assert!(backlog.fatal_error().is_none(), "容量排队不是错误");
         // 对端开始消费 → drain 任务经 writable 通知清空积压
-        spawn_udp_backlog_drain(sender, peer_addr, false, backlog.clone());
+        spawn_udp_backlog_drain(sender, Dest::Peer(peer_addr), backlog.clone());
         let reader = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
@@ -2093,10 +2360,7 @@ mod kcp_regress {
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while backlog.sent.load(Ordering::Relaxed) < 1 || !backlog.is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "对端消费后积压必须在 10s 内发出"
-            );
+            assert!(Instant::now() < deadline, "对端消费后积压必须在 10s 内发出");
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         reader.abort();
@@ -2116,7 +2380,10 @@ mod kcp_regress {
         }
         assert_eq!(ok, MAX_BACKLOG_BYTES / 1200, "字节上限先生效");
         assert!(bl.bytes() <= MAX_BACKLOG_BYTES);
-        assert_eq!(bl.dropped_full.load(Ordering::Relaxed) as usize, attempts - ok);
+        assert_eq!(
+            bl.dropped_full.load(Ordering::Relaxed) as usize,
+            attempts - ok
+        );
         assert_eq!(bl.enqueued.load(Ordering::Relaxed) as usize, ok);
         // 诊断快照:测试/日志可读,不是无人观察的 private atomic
         let s = bl.stats();
@@ -2201,7 +2468,11 @@ mod kcp_regress {
                             x ^= x << 13;
                             x ^= x >> 7;
                             x ^= x << 17;
-                            assert_eq!(*b, (x >> 24) as u64 as u8, "stream {stream_id} 偏移 {got} 数据损坏");
+                            assert_eq!(
+                                *b,
+                                (x >> 24) as u64 as u8,
+                                "stream {stream_id} 偏移 {got} 数据损坏"
+                            );
                         }
                         got += want as u64;
                     }
@@ -2310,7 +2581,10 @@ mod main_review_tests {
         let mut cx = Context::from_waker(&waker);
         let bytes = vec![7; MAX_WRITE_QUEUE_BYTES + 1];
         let result = Pin::new(&mut io).poll_write(&mut cx, &bytes);
-        assert!(matches!(result, Poll::Ready(Ok(n)) if n > 0 && n <= MAX_WRITE_QUEUE_BYTES), "empty queue oversized write cannot ever progress: {result:?}");
+        assert!(
+            matches!(result, Poll::Ready(Ok(n)) if n > 0 && n <= MAX_WRITE_QUEUE_BYTES),
+            "empty queue oversized write cannot ever progress: {result:?}"
+        );
     }
 
     #[test]
@@ -2321,7 +2595,10 @@ mod main_review_tests {
         let mut empty = [];
         let mut rb = ReadBuf::new(&mut empty);
         let result = Pin::new(&mut io).poll_read(&mut cx, &mut rb);
-        assert!(matches!(result, Poll::Ready(Ok(()))), "zero-capacity read blocks on an idle stream: {result:?}");
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "zero-capacity read blocks on an idle stream: {result:?}"
+        );
     }
 
     #[test]
@@ -2340,10 +2617,16 @@ mod main_review_tests {
         });
         assert!(matches!(result, DrainSt::Blocked));
         let bytes: usize = bl.state.lock().unwrap().iter().map(Vec::len).sum();
-        assert!(bytes <= MAX_BACKLOG_BYTES, "backlog exceeded byte cap after requeue: {bytes} > {MAX_BACKLOG_BYTES}");
+        assert!(
+            bytes <= MAX_BACKLOG_BYTES,
+            "backlog exceeded byte cap after requeue: {bytes} > {MAX_BACKLOG_BYTES}"
+        );
         // 更强:完整预算(排队+在途)在回插后同样不得超上限
         let total = bytes + bl.inflight_bytes.load(Ordering::Relaxed);
-        assert!(total <= MAX_BACKLOG_BYTES, "queued+inflight exceeded byte cap: {total} > {MAX_BACKLOG_BYTES}");
+        assert!(
+            total <= MAX_BACKLOG_BYTES,
+            "queued+inflight exceeded byte cap: {total} > {MAX_BACKLOG_BYTES}"
+        );
     }
 
     #[tokio::test]
@@ -2366,12 +2649,15 @@ mod main_review_tests {
         });
         assert!(matches!(state, DrainSt::Empty));
         let mut buf = [0u8; 16];
-        let (n, _) =
-            tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(&buf[..n], b"old", "new datagram bypassed in-flight FIFO head");
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"old",
+            "new datagram bypassed in-flight FIFO head"
+        );
     }
 
     #[tokio::test]
@@ -2381,7 +2667,11 @@ mod main_review_tests {
         let backlog = Arc::new(UdpBacklog::new());
         let weak_sock = Arc::downgrade(&sock);
         let weak_backlog = Arc::downgrade(&backlog);
-        spawn_udp_backlog_drain(sock.clone(), peer.local_addr().unwrap(), false, backlog.clone());
+        spawn_udp_backlog_drain(
+            sock.clone(),
+            Dest::Peer(peer.local_addr().unwrap()),
+            backlog.clone(),
+        );
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }
@@ -2443,7 +2733,10 @@ mod main_review_tests {
         let output = output.lock().unwrap();
         let delivered = output.windows(payload.len()).any(|w| w == payload);
         task.abort();
-        assert!(delivered, "shutdown returned Ok, then dropping io discarded all previously accepted bytes");
+        assert!(
+            delivered,
+            "shutdown returned Ok, then dropping io discarded all previously accepted bytes"
+        );
     }
 
     #[tokio::test]
@@ -2676,7 +2969,10 @@ mod boundary_tests {
         let session = tokio::spawn(run_session(kcp, pkt_rx, shared));
         // 确认会话与接收任务均已运行(等若干 tick)
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(Arc::strong_count(&sock_b) >= 3, "前置:接收任务/输出/drain 持有 socket");
+        assert!(
+            Arc::strong_count(&sock_b) >= 3,
+            "前置:接收任务/输出/drain 持有 socket"
+        );
         // 丢弃唯一用户句柄 → 会话结束 → shutdown → 接收任务/drain 退出
         drop(io);
         tokio::time::timeout(Duration::from_secs(2), session)
@@ -3108,7 +3404,9 @@ mod boundary_tests {
             let mut buf = vec![0u8; 64 * 1024];
             while got < TOTAL {
                 let want = buf.len().min(TOTAL - got);
-                io2.read_exact(&mut buf[..want]).await.expect("server read_exact");
+                io2.read_exact(&mut buf[..want])
+                    .await
+                    .expect("server read_exact");
                 for b in &buf[..want] {
                     x ^= x << 13;
                     x ^= x >> 7;
@@ -3122,7 +3420,11 @@ mod boundary_tests {
         let x = tokio::time::timeout(Duration::from_secs(10), read_all)
             .await
             .expect("服务端读取未在 10s 内完成(shutdown 后数据未完整交付)");
-        assert_eq!(x, digest_of_positions(TOTAL), "shutdown 成功后服务端必须已完整收到");
+        assert_eq!(
+            x,
+            digest_of_positions(TOTAL),
+            "shutdown 成功后服务端必须已完整收到"
+        );
     }
 
     /// shutdown 已请求后继续写必须报错(半关闭写端语义)。
@@ -3159,9 +3461,12 @@ mod boundary_tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             ..Default::default()
         };
-        let listener = listen(&cfg, std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
-            .await
-            .unwrap();
+        let listener = listen(
+            &cfg,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap();
         let addr = listener.local_addr();
         drop(listener);
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3251,8 +3556,8 @@ mod stronger_tests {
         drain_once(&bl, |_| {
             let _ = bl.push(&packet);
             let q = bl.state.lock().unwrap();
-            observed = q.iter().map(Vec::len).sum::<usize>()
-                + bl.inflight_bytes.load(Ordering::Relaxed);
+            observed =
+                q.iter().map(Vec::len).sum::<usize>() + bl.inflight_bytes.load(Ordering::Relaxed);
             Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
         });
         assert!(
@@ -3286,7 +3591,9 @@ mod stronger_tests {
         }
         assert!(backlog.push(b"an-ack-datagram"));
         assert!(matches!(
-            drain_once(&backlog, |_| Err(std::io::Error::other("injected-udp-fatal"))),
+            drain_once(&backlog, |_| Err(std::io::Error::other(
+                "injected-udp-fatal"
+            ))),
             DrainSt::Fatal
         ));
         let mut one = [0u8; 1];
@@ -3331,7 +3638,10 @@ mod stronger_tests {
             .expect("错误桥后空闲会话必须自行退出")
             .expect("join");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(weak_sock.upgrade().is_none(), "会话/kcp/输出/drain 全部退出后 socket 必须释放");
+        assert!(
+            weak_sock.upgrade().is_none(),
+            "会话/kcp/输出/drain 全部退出后 socket 必须释放"
+        );
     }
 
     fn backlog_push_poison(weak: &std::sync::Weak<UdpBacklog>) -> bool {
@@ -3727,9 +4037,7 @@ mod unaccepted_tests {
         let mut released = false;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(2) {
-            if sessions.lock().unwrap().is_empty()
-                && UdpSocket::bind(server_addr).await.is_ok()
-            {
+            if sessions.lock().unwrap().is_empty() && UdpSocket::bind(server_addr).await.is_ok() {
                 released = true;
                 break;
             }
@@ -3744,7 +4052,6 @@ mod unaccepted_tests {
             .expect("demux 必须退出");
     }
 }
-
 
 /// 主代理 DEMUX-FULL-DEADLOCK:真实 demux ready 满队列/关闭路径不得
 /// 自锁 SessionMap(旧实现 demux_loop 持锁调 spawn_server_session,
@@ -3802,10 +4109,7 @@ mod independent_full_tests {
             sessions,
         ));
         for conv in [1001u32, 1002] {
-            sender
-                .send_to(&kcp_ack_packet(conv), addr)
-                .await
-                .unwrap();
+            sender.send_to(&kcp_ack_packet(conv), addr).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             if conv == 1001 {
                 assert_eq!(
@@ -3861,18 +4165,12 @@ mod independent_full_tests {
             sessions,
         ));
         // 第一个会话进 ready;消费后关闭队列
-        sender
-            .send_to(&kcp_ack_packet(2001), addr)
-            .await
-            .unwrap();
+        sender.send_to(&kcp_ack_packet(2001), addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_ok(), "first session enters ready");
         drop(rx);
         // 第二个 conv:注册 + spawn 后 try_send 命中 Closed 失败分支
-        sender
-            .send_to(&kcp_ack_packet(2002), addr)
-            .await
-            .unwrap();
+        sender.send_to(&kcp_ack_packet(2002), addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         ctl.closing.store(true, Ordering::Release);
         ctl.wake.notify_one();
@@ -3957,10 +4255,7 @@ mod punch_audit_tests {
             assert!(Instant::now() < deadline, "会话退出后必须清空 map");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            ctl.is_retired(conv),
-            "会话退出后 conv 必须进入退休表"
-        );
+        assert!(ctl.is_retired(conv), "会话退出后 conv 必须进入退休表");
         // 同 conv 复活报文:不得重建(修复前会再入 ready)
         sender.send_to(&ack_packet(conv), addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3989,7 +4284,15 @@ mod punch_audit_tests {
         let (tx, rx) = mpsc::channel::<SessionCmd>(16);
         sessions.lock().unwrap().insert(conv, (tx.clone(), peer));
         spawn_server_session(
-            conv, tx, rx, sessions.clone(), udp, peer, &accept_tx, 0, ctl.clone(),
+            conv,
+            tx,
+            rx,
+            sessions.clone(),
+            udp,
+            peer,
+            &accept_tx,
+            0,
+            ctl.clone(),
         );
         assert!(accept_rx.try_recv().is_ok(), "预填项");
         assert!(accept_rx.try_recv().is_err(), "被拒会话不得入队");
@@ -4135,10 +4438,7 @@ mod punch_audit_tests {
         let _ = tokio::time::timeout(Duration::from_secs(10), echo)
             .await
             .expect("echo join");
-        assert_eq!(
-            echo_digest, expect_digest,
-            "2MiB 逐字节完整性(经停读-恢复)"
-        );
+        assert_eq!(echo_digest, expect_digest, "2MiB 逐字节完整性(经停读-恢复)");
     }
 
     /// PUNCH-PARENT-CANCEL(主代理实测复现,确定性红绿):调用方
@@ -4217,5 +4517,934 @@ mod punch_audit_tests {
             "成功路径会话必须存活: refs={}",
             Arc::strong_count(&dial_sock)
         );
+    }
+}
+
+/// performance-closure-c84 本轮回归(A 半关闭 / B 空闲进展 / C 打洞
+/// 积压 / D 入站合批)。红证据:benchmark/runs/performance-closure-c84/
+/// kcp/red/repro-baseline-red.log(c84f631 副本确定性复现:5 红 + 5 守护)。
+/// b12/b_channel/b_idle/b_bound/b_fairness/d_reuse 为冻结守护(允许修前绿),
+/// 其余在基线上失败、修复后转绿。
+#[cfg(test)]
+mod c84_closure_tests {
+    use super::*;
+    use futures::task::noop_waker;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const MSS: usize = MTU - KCP_OVERHEAD;
+
+    fn poll_w(io: &mut KcpIo, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let w = noop_waker();
+        let mut cx = Context::from_waker(&w);
+        Pin::new(io).poll_write(&mut cx, buf)
+    }
+
+    async fn yield16() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    struct DiscardOutput;
+    impl Write for DiscardOutput {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 双端经 mpsc 交叉连接的确定性线对(无真实 UDP/内核抖动)。
+    struct WireOut(mpsc::Sender<SessionCmd>);
+    impl Write for WireOut {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .try_send(SessionCmd::Packet(b.to_vec()))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RecVecOut(Arc<Mutex<Vec<Vec<u8>>>>);
+    impl Write for RecVecOut {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(b.to_vec());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 对已发段 sn 的纯 ACK 报文(cmd=82,无 payload);ts 回显该段 ts
+    /// (真实 ACK 语义,避免 update_ack 以 epoch 差算 rtt 溢出)。
+    fn ack_for(conv: u32, sn: u32, ts: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 24];
+        p[..4].copy_from_slice(&conv.to_le_bytes());
+        p[4] = 82;
+        p[6..8].copy_from_slice(&256u16.to_le_bytes());
+        p[8..12].copy_from_slice(&ts.to_le_bytes());
+        p[12..16].copy_from_slice(&sn.to_le_bytes());
+        p
+    }
+
+    fn sess(shared: &Arc<Shared>) -> KcpCounters {
+        shared.stats.snapshot()
+    }
+
+    // ================= A:半关闭只关写侧 =================
+
+    /// 真实双端长度协议(c84_review_tests 原样移植;基线红见
+    /// main-independent/halfclose-exact-baseline-red.log):写 7B →
+    /// shutdown Ready → 对端收全 → 25ms 后回 8B → 本端仍必须读到。
+    #[tokio::test]
+    async fn a1_shutdown_write_must_preserve_delayed_reply_read() {
+        let (mut client_io, client_shared) = new_io();
+        let (mut server_io, server_shared) = new_io();
+        let (client_tx, client_rx) = mpsc::channel(256);
+        let (server_tx, server_rx) = mpsc::channel(256);
+        let mut client = Kcp::new_stream(0xCA84, WireOut(server_tx));
+        let mut server = Kcp::new_stream(0xCA84, WireOut(client_tx));
+        for k in [&mut client, &mut server] {
+            k.set_mtu(MTU).unwrap();
+            k.set_wndsize(256, 256);
+            k.set_nodelay(true, 2, 2, true);
+        }
+        let client_session = tokio::spawn(run_session(client, client_rx, client_shared));
+        let server_session = tokio::spawn(run_session(server, server_rx, server_shared));
+        let service = tokio::spawn(async move {
+            let mut request = [0u8; 7];
+            server_io
+                .read_exact(&mut request)
+                .await
+                .expect("server request");
+            assert_eq!(&request, b"REQUEST");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            server_io
+                .write_all(b"RESPONSE")
+                .await
+                .expect("server reply");
+            server_io.flush().await.expect("server reply flush");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            client_io.write_all(b"REQUEST").await?;
+            client_io.shutdown().await?;
+            let mut response = [0u8; 8];
+            client_io.read_exact(&mut response).await?;
+            assert_eq!(&response, b"RESPONSE");
+            std::io::Result::Ok(())
+        })
+        .await;
+        service.abort();
+        client_session.abort();
+        server_session.abort();
+        let _ = tokio::join!(service, client_session, server_session);
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "successful write shutdown must still accept delayed reply: {result:?}"
+        );
+    }
+
+    /// write_closed 后:poll_flush/poll_shutdown Ready(Ok)、poll_write Err;
+    /// 会话错误(error)可见性优先于 write_closed(flush/read/shutdown 全 Err)。
+    #[test]
+    fn a2_flush_ready_and_error_visible_after_write_closed() {
+        let (mut io, shared) = new_io();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.closing = true;
+            s.write_closed = true;
+            s.write_seq = 3;
+            s.flushed_seq = 3;
+        }
+        let w = noop_waker();
+        let mut cx = Context::from_waker(&w);
+        assert!(matches!(
+            Pin::new(&mut io).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut io).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(
+            matches!(
+                Pin::new(&mut io).poll_write(&mut cx, b"x"),
+                Poll::Ready(Err(_))
+            ),
+            "写侧已关,继续写必须报错"
+        );
+        // 错误可见性优先:真实错误浮出而非被「已关写」掩盖
+        shared.guarded.lock().unwrap().error = Some("boom-visible".into());
+        let e = Pin::new(&mut io).poll_flush(&mut cx);
+        assert!(
+            matches!(&e, Poll::Ready(Err(er)) if er.to_string().contains("boom-visible")),
+            "flush 必须先报会话错误: {e:?}"
+        );
+        assert!(matches!(
+            Pin::new(&mut io).poll_shutdown(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        let mut rbuf = [0u8; 4];
+        let mut rb = ReadBuf::new(&mut rbuf);
+        assert!(matches!(
+            Pin::new(&mut io).poll_read(&mut cx, &mut rb),
+            Poll::Ready(Err(_))
+        ));
+    }
+
+    /// 真实 UDP 对:shutdown 成功后丢弃句柄 → 句柄归零 → session/inbound/
+    /// drain 全部退出、socket 释放(b06 语义在「显式关闭完成」路径上)。
+    #[tokio::test]
+    async fn a3_drop_after_shutdown_releases_tasks_and_socket() {
+        const TOTAL: usize = 64 * 1024;
+        let conv = 0x5EC5_00A3u32;
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_addr = client_sock.local_addr().unwrap();
+        client_sock.connect(server_addr).await.unwrap();
+
+        let (mut io, shared) = new_io();
+        let backlog = Arc::new(UdpBacklog::new());
+        backlog.attach_session(&shared);
+        let output = UdpOutput {
+            sock: client_sock.clone(),
+            peer: server_addr,
+            connected: true,
+            backlog: backlog.clone(),
+        };
+        output.spawn_drain();
+        drop(backlog);
+        let mut kcp = Kcp::new_stream(conv, output);
+        kcp.set_mtu(MTU).ok();
+        kcp.set_wndsize(256, 256);
+        kcp.set_nodelay(true, 2, 2, true);
+        let (pkt_tx, pkt_rx) = mpsc::channel::<SessionCmd>(256);
+        {
+            let pkt_tx = pkt_tx;
+            let recv_sock = client_sock.clone();
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    tokio::select! {
+                        r = recv_sock.recv_from(&mut buf) => {
+                            let Ok((n, _)) = r else { break };
+                            if pkt_tx
+                                .send(SessionCmd::Packet(buf[..n].to_vec()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        _ = shared.shutdown.notified() => break,
+                    }
+                }
+            });
+        }
+        let session = tokio::spawn(run_session(kcp, pkt_rx, shared));
+
+        // 对端会话(喂包,ACK 回流)
+        let (io2, shared2) = new_io();
+        let backlog2 = Arc::new(UdpBacklog::new());
+        backlog2.attach_session(&shared2);
+        let output2 = UdpOutput {
+            sock: server_sock.clone(),
+            peer: client_addr,
+            connected: false,
+            backlog: backlog2.clone(),
+        };
+        output2.spawn_drain();
+        drop(backlog2);
+        let mut kcp2 = Kcp::new_stream(conv, output2);
+        kcp2.set_mtu(MTU).ok();
+        kcp2.set_wndsize(256, 256);
+        kcp2.set_nodelay(true, 2, 2, true);
+        let (pkt_tx2, pkt_rx2) = mpsc::channel::<SessionCmd>(256);
+        {
+            let pkt_tx2 = pkt_tx2;
+            let recv_sock = server_sock.clone();
+            let shared2 = shared2.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    tokio::select! {
+                        r = recv_sock.recv_from(&mut buf) => {
+                            let Ok((n, from)) = r else { break };
+                            if from == client_addr
+                                && n >= KCP_OVERHEAD
+                                && kcp::get_conv(&buf[..n]) == conv
+                                && pkt_tx2
+                                    .send(SessionCmd::Packet(buf[..n].to_vec()))
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        _ = shared2.shutdown.notified() => break,
+                    }
+                }
+            });
+        }
+        let session2 = tokio::spawn(run_session(kcp2, pkt_rx2, shared2));
+
+        let data: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        io.write_all(&data).await.expect("write_all");
+        tokio::time::timeout(Duration::from_secs(10), io.shutdown())
+            .await
+            .expect("shutdown 必须在 10s 内完成(真实 ACK 回流)")
+            .expect("shutdown 不应报错");
+        // 写侧已关、会话仍存活:丢弃句柄 → 句柄归零 → 全部任务收敛
+        drop(io);
+        tokio::time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("shutdown 完成后句柄归零,会话必须退出")
+            .expect("join");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            Arc::strong_count(&client_sock),
+            1,
+            "会话/接收循环/drain 退出后 socket 必须释放"
+        );
+        // 服务端仍能完整读全部字节(交付不受关写影响)
+        let mut io2 = io2;
+        let mut got = Vec::with_capacity(TOTAL);
+        let read_all = async {
+            let mut buf = vec![0u8; 64 * 1024];
+            while got.len() < TOTAL {
+                let want = buf.len().min(TOTAL - got.len());
+                io2.read_exact(&mut buf[..want]).await.expect("srv read");
+                got.extend_from_slice(&buf[..want]);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), read_all)
+            .await
+            .expect("服务端读取未在 10s 内完成");
+        assert_eq!(got, data, "shutdown 后交付完整性");
+        drop(io2);
+        session2.abort();
+        let _ = session2.await;
+    }
+
+    // ================= B:无人消费不再无限续命 =================
+
+    /// read_buf 预置数据 + 零消费 + 无入包 → 有界时间内回收,
+    /// closed 可观察,存量排空后 EOF。
+    #[tokio::test]
+    async fn b_unconsumed_stall_reclaims() {
+        let (mut io, shared) = new_io();
+        shared.guarded.lock().unwrap().read_buf.push_back(7u8);
+        let (keep_tx, rx) = mpsc::channel::<SessionCmd>(4);
+        let kcp = Kcp::new_stream(0xDB01, DiscardOutput);
+        let mut session = tokio::spawn(run_session_with_idle_timeout(
+            kcp,
+            rx,
+            shared.clone(),
+            Duration::from_millis(150),
+        ));
+        let exited = tokio::time::timeout(Duration::from_millis(600), &mut session)
+            .await
+            .is_ok();
+        if !exited {
+            session.abort();
+            let _ = session.await;
+        }
+        assert!(exited, "read_buf 无人消费且无入包:会话必须在有界时间内回收");
+        assert!(
+            shared.guarded.lock().unwrap().closed,
+            "回收后 closed 必须可观察"
+        );
+        // 存量仍可读,排空后 EOF(正常 EOF 语义保持)
+        let mut one = [0u8; 1];
+        tokio::time::timeout(Duration::from_millis(200), io.read_exact(&mut one))
+            .await
+            .expect("存量读超时")
+            .expect("存量读");
+        assert_eq!(one[0], 7);
+        let e = tokio::time::timeout(Duration::from_millis(200), io.read(&mut one)).await;
+        assert!(
+            matches!(&e, Ok(Err(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof)
+                || matches!(&e, Ok(Ok(0))),
+            "排空后应 EOF: {e:?}"
+        );
+        drop(io);
+        drop(keep_tx);
+    }
+
+    /// 活跃慢消费者(每个 idle 窗口内有读)跨多个窗口存活;
+    /// 停止消费后有界回收。
+    #[tokio::test]
+    async fn b_slow_consumer_survives_then_reclaims_after_stop() {
+        let (mut io, shared) = new_io();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            for i in 0..64u8 {
+                s.read_buf.push_back(i);
+            }
+        }
+        let (keep_tx, rx) = mpsc::channel::<SessionCmd>(4);
+        let kcp = Kcp::new_stream(0xDB02, DiscardOutput);
+        let mut session = tokio::spawn(run_session_with_idle_timeout(
+            kcp,
+            rx,
+            shared.clone(),
+            Duration::from_millis(150),
+        ));
+        // 慢消费:每 50ms 读 1 字节,跨 4× idle 窗口存活
+        for _ in 0..12 {
+            let mut one = [0u8; 1];
+            tokio::time::timeout(Duration::from_millis(200), io.read_exact(&mut one))
+                .await
+                .expect("slow read timeout")
+                .expect("slow read");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!session.is_finished(), "活跃慢消费者(窗口内有读)不得被回收");
+        }
+        // 停止消费:有界回收
+        let exited = tokio::time::timeout(Duration::from_millis(600), &mut session)
+            .await
+            .is_ok();
+        if !exited {
+            session.abort();
+            let _ = session.await;
+        }
+        drop(io);
+        drop(keep_tx);
+        assert!(exited, "停止消费后必须在有界时间内回收(读端存量排空后 EOF)");
+    }
+
+    /// 无流量无待交付:维持原语义按 idle 超时回收(冻结守护)。
+    #[tokio::test]
+    async fn b_idle_no_traffic_recycles_unchanged() {
+        let (io, shared) = new_io();
+        let (keep_tx, rx) = mpsc::channel::<SessionCmd>(4);
+        let kcp = Kcp::new_stream(0xDB03, DiscardOutput);
+        let mut session = tokio::spawn(run_session_with_idle_timeout(
+            kcp,
+            rx,
+            shared.clone(),
+            Duration::from_millis(150),
+        ));
+        let t0 = Instant::now();
+        let exited = tokio::time::timeout(Duration::from_millis(600), &mut session)
+            .await
+            .is_ok();
+        if !exited {
+            session.abort();
+            let _ = session.await;
+        }
+        drop(io);
+        drop(keep_tx);
+        assert!(exited, "无流量无待交付:必须按 idle 超时回收");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(140),
+            "不得先于 idle 窗口退出"
+        );
+    }
+
+    /// 无人消费 + 持续入站灌数据:读端缓冲贴精确上界且不越界
+    /// (MAX_READ_BUF 界不动;确定性线对,守护)。
+    #[tokio::test]
+    async fn b_read_buf_bound_exact_under_stall() {
+        const TOTAL: usize = 512 * 1024;
+        let (mut cio, _cs) = new_io();
+        let (_sio, sshared) = new_io();
+        let (ctx, crx) = mpsc::channel::<SessionCmd>(4096);
+        let (stx, srx) = mpsc::channel::<SessionCmd>(4096);
+        let mut ckcp = Kcp::new_stream(0xDB04, WireOut(stx));
+        let mut skcp = Kcp::new_stream(0xDB04, WireOut(ctx));
+        for k in [&mut ckcp, &mut skcp] {
+            k.set_mtu(MTU).unwrap();
+            k.set_wndsize(256, 256);
+            k.set_nodelay(true, 2, 2, true);
+        }
+        tokio::spawn(run_session_with_idle_timeout(
+            ckcp,
+            crx,
+            _cs,
+            Duration::from_secs(30),
+        ));
+        tokio::spawn(run_session_with_idle_timeout(
+            skcp,
+            srx,
+            sshared.clone(),
+            Duration::from_secs(30),
+        ));
+        // 服务端应用从不读(确定性线对无损,ACK 持续回流,写不必须停顿;
+        // 本测守护的不变量是:无人消费下读端缓冲贴上界且不越界)
+        let chunk = vec![5u8; 16 * 1024];
+        let mut written = 0usize;
+        while written < TOTAL {
+            let n = tokio::time::timeout(Duration::from_secs(10), cio.write(&chunk))
+                .await
+                .expect("write timeout(窗口应回流)")
+                .expect("write err");
+            written += n;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let len = sshared.guarded.lock().unwrap().read_buf.len();
+        assert!(
+            len <= MAX_READ_BUF,
+            "stall 下读端缓冲 {len} 超上界 {MAX_READ_BUF}"
+        );
+        assert!(
+            len > MAX_READ_BUF - MTU,
+            "stall 时读端必须贴近精确上界: {len}"
+        );
+    }
+
+    // ================= C:打洞输出有界积压 =================
+
+    /// WouldBlock 必须入队(计数可观察)并由 drain 补送恰好一次,
+    /// 不再假成功丢报(基线红:repro-baseline-red.log c_punch_*)。
+    /// macOS loopback 无法稳定造真实 kernel EAGAIN(实测 prime 后
+    /// 200k×MTU 发送无一 WouldBlock,UDP 满缓冲静默丢弃;探针 0/3),
+    /// WouldBlock 分支按合同注入断言 —— 不冒充内核复现(设计文档同款)。
+    #[tokio::test]
+    async fn c1_punch_wouldblock_enqueues_not_fake_ok() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sender.writable().await.expect("writable prime");
+        let probe = vec![0xC1u8; 64];
+        let backlog = Arc::new(UdpBacklog::new());
+        let mut out = PunchOutput {
+            sock: sender.clone(),
+            peer: Arc::new(PunchPeer::new(peer_addr)),
+            backlog: backlog.clone(),
+        };
+        // 注入 WouldBlock(生产闭包为 sock.try_send_to;此分支语义与
+        // socket 无关):不得假成功丢弃,必须入队且计数可观察。
+        let n = output_write_via_backlog(
+            &backlog,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            &probe,
+        )
+        .expect("WouldBlock 写合同:返回 Ok(入队)");
+        assert_eq!(n, probe.len());
+        let st = backlog.stats();
+        assert_eq!(st.enqueued, 1, "WouldBlock 数据报必须入队(不再假成功)");
+        assert_eq!(st.queued_packets, 1);
+        assert!(st.fatal == 0, "容量排队不是错误");
+        // 对端开始消费 → drain 经 writable 补送,恰好一次(真实 socket)
+        out.spawn_drain();
+        let mut buf = vec![0u8; 65536];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got_probe = 0usize;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, peer.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if n == probe.len() && &buf[..n] == &probe[..] {
+                        got_probe += 1;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert_eq!(got_probe, 1, "补送必须恰好一次: {got_probe}");
+        let st = backlog.stats();
+        assert_eq!(st.sent, 1);
+        assert_eq!(st.queued_packets, 0);
+    }
+
+    /// 阶段内确定性排空:Blocked(tokio 注册后就绪缓存空/瞬态内核
+    /// 压力,实测负载下可出现)按生产 drain 同语义处理 —— 等 writable
+    /// 后重试;WouldBlock 回插队头,顺序/恰好一次不变。Fatal 立即失败,
+    /// 总时长有界(5s)。测试不依赖「内核永不 WouldBlock」假设。
+    async fn drain_until_empty(sock: &UdpSocket, bl: &Arc<UdpBacklog>, dest: &Dest) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match drain_once(bl, |pkt| dest.try_send(sock, pkt)) {
+                DrainSt::Empty => return,
+                DrainSt::Blocked => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !remaining.is_zero(),
+                        "drain Blocked 超时: stats={:?}",
+                        bl.stats()
+                    );
+                    tokio::time::timeout(remaining, sock.writable())
+                        .await
+                        .expect("writable timeout")
+                        .expect("writable err");
+                }
+                DrainSt::Fatal => panic!("drain Fatal: stats={:?}", bl.stats()),
+            }
+        }
+    }
+
+    /// Rotating 每报发往「弹出时刻」候选;learn 后锁定;每报恰好一次
+    /// 落点正确(生产 drain 发送路径 Dest::Punch,确定性同步 drain_once)。
+    #[tokio::test]
+    async fn c2_punch_rotating_learned_delivery_exactly_once() {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // prime:见 c1 注释(实测并行负载下未 prime 的首送可 Blocked)。
+        sender.writable().await.expect("writable prime");
+        let peer = Arc::new(PunchPeer::new(a_addr));
+        let backlog = Arc::new(UdpBacklog::new());
+        let dest = Dest::Punch(peer.clone());
+
+        // 阶段1:候选=A,两报 → A
+        backlog.push(b"P1");
+        backlog.push(b"P2");
+        drain_until_empty(&sender, &backlog, &dest).await;
+        // 阶段2:rotate → B,两报 → B
+        peer.rotate(b_addr);
+        backlog.push(b"P3");
+        backlog.push(b"P4");
+        drain_until_empty(&sender, &backlog, &dest).await;
+        // 阶段3:learn(A) 锁定,后续 rotate 为 no-op,两报 → A
+        assert!(peer.learn(a_addr));
+        peer.rotate(b_addr);
+        backlog.push(b"P5");
+        backlog.push(b"P6");
+        drain_until_empty(&sender, &backlog, &dest).await;
+
+        async fn read_all(sock: &UdpSocket, expect: &[&[u8]]) {
+            let mut buf = [0u8; 64];
+            for e in expect {
+                let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+                    .await
+                    .expect("recv timeout")
+                    .expect("recv");
+                assert_eq!(&buf[..n], *e, "顺序与落点必须精确");
+            }
+        }
+        read_all(&a, &[b"P1", b"P2", b"P5", b"P6"]).await;
+        read_all(&b, &[b"P3", b"P4"]).await;
+        // 恰好一次:A/B 各收完预期后不得再有报文(短暂静默窗口)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut probe_buf = [0u8; 64];
+        assert!(
+            a.try_recv_from(&mut probe_buf).is_err(),
+            "A 不得收到重复/错位报文"
+        );
+        assert!(
+            b.try_recv_from(&mut probe_buf).is_err(),
+            "B 不得收到重复/错位报文"
+        );
+        let st = backlog.stats();
+        assert_eq!(st.sent, 6, "6 报恰好各发一次");
+        assert_eq!(st.queued_packets, 0);
+    }
+
+    /// drain 真实错误经错误桥直达 punch 会话 IO(idle 会话不等下一次
+    /// 写),后续 PunchOutput::write 报 Err(毒化)。
+    #[tokio::test]
+    async fn c3_punch_fatal_bridges_to_io() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (mut io, shared) = new_io();
+        let backlog = Arc::new(UdpBacklog::new());
+        backlog.attach_session(&shared);
+        let mut out = PunchOutput {
+            sock: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            peer: Arc::new(PunchPeer::new(peer_addr)),
+            backlog: backlog.clone(),
+        };
+        backlog.push(b"x");
+        assert!(matches!(
+            drain_once(&backlog, |_| Err(std::io::Error::other(
+                "punch-fatal-inject"
+            ))),
+            DrainSt::Fatal
+        ));
+        // idle 会话无任何后续写:IO 读侧必须立即感知错误
+        let mut one = [0u8; 1];
+        let r = tokio::time::timeout(Duration::from_millis(200), io.read(&mut one)).await;
+        assert!(
+            matches!(&r, Ok(Err(e)) if e.to_string().contains("punch-fatal-inject")),
+            "fatal 必须经错误桥直达 IO: {r:?}"
+        );
+        assert!(out.write(b"y").is_err(), "毒化后的 punch 输出写必须报错");
+    }
+
+    // ================= 关闭假成功守卫(idle/通道提前结束) =================
+
+    /// 已接受写从未被 ACK、显式 shutdown 未完成时,idle 终止必须
+    /// 可观察 Err,不得 error=None 伪成功关闭(主代理独立红:
+    /// main-independent/shutdown-idle-result-red.log exit101)。
+    #[tokio::test]
+    async fn idle_termination_must_not_report_successful_shutdown_of_unacked_bytes() {
+        let (mut io, shared) = new_io();
+        let mut kcp = Kcp::new_stream(0xFA84, DiscardOutput);
+        kcp.set_mtu(MTU).unwrap();
+        kcp.set_nodelay(true, 2, 2, true);
+        let (_keep_tx, rx) = mpsc::channel(8);
+        let session = tokio::spawn(run_session_with_idle_timeout(
+            kcp,
+            rx,
+            shared,
+            Duration::from_millis(30),
+        ));
+        io.write_all(b"accepted-but-never-acked").await.unwrap();
+        let shutdown = tokio::time::timeout(Duration::from_millis(250), io.shutdown()).await;
+        session.abort();
+        let _ = session.await;
+        assert!(
+            !matches!(shutdown, Ok(Ok(()))),
+            "idle timeout dropped pending ACK state but shutdown incorrectly returned Ok: {shutdown:?}"
+        );
+    }
+
+    /// 已接受写未确认时 inbound 通道提前关闭(demux 丢弃会话而用户
+    /// 句柄仍在):poll_shutdown 与 poll_flush 必须可观察 Err ——
+    /// 不得伪成功,也不得永远 Pending。
+    #[tokio::test]
+    async fn channel_closed_with_pending_writes_must_be_observable_err() {
+        let (mut io, shared) = new_io();
+        let mut kcp = Kcp::new_stream(0xFA85, DiscardOutput);
+        kcp.set_mtu(MTU).unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let session = tokio::spawn(run_session_with_idle_timeout(
+            kcp,
+            rx,
+            shared,
+            // 不靠 idle:由通道关闭触发退出
+            Duration::from_secs(30),
+        ));
+        io.write_all(b"pending-when-channel-closes").await.unwrap();
+        drop(tx);
+        let shutdown = tokio::time::timeout(Duration::from_millis(250), io.shutdown()).await;
+        session.abort();
+        let _ = session.await;
+        assert!(
+            matches!(shutdown, Ok(Err(_))),
+            "通道提前结束且写未确认:shutdown 必须 Err: {shutdown:?}"
+        );
+        let flushed = tokio::time::timeout(Duration::from_millis(250), io.flush()).await;
+        assert!(
+            matches!(flushed, Ok(Err(_))),
+            "真终止后 flush 不得 Pending/伪 Ok: {flushed:?}"
+        );
+    }
+
+    // ================= D:入站合批 =================
+
+    /// 等会话静默:计数连续 stable_n 个 yield 无变化(暂停时钟下仅
+    /// permit 驱动唤醒,permit 排空后不再有轮次)。
+    async fn wait_stable(shared: &Arc<Shared>, stable_n: usize) {
+        let mut last = sess(shared).flush_calls;
+        let mut stable = 0usize;
+        for _ in 0..4000 {
+            tokio::task::yield_now().await;
+            let c = sess(shared).flush_calls;
+            if c == last {
+                stable += 1;
+                if stable >= stable_n {
+                    return;
+                }
+            } else {
+                stable = 0;
+                last = c;
+            }
+        }
+    }
+
+    async fn spin_until(shared: &Arc<Shared>, pred: impl Fn(KcpCounters) -> bool) {
+        for _ in 0..10_000 {
+            if pred(sess(shared)) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn setup_ack_session(
+        conv: u32,
+    ) -> (
+        KcpIo,
+        Arc<Shared>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        mpsc::Sender<SessionCmd>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (io, shared) = new_io();
+        let rec = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let mut kcp = Kcp::new_stream(conv, RecVecOut(rec.clone()));
+        kcp.set_mtu(MTU).unwrap();
+        kcp.set_wndsize(256, 256);
+        kcp.set_nodelay(true, 2, 2, true);
+        let (tx, rx) = mpsc::channel::<SessionCmd>(512);
+        let task = tokio::spawn(run_session(kcp, rx, shared.clone()));
+        yield16().await;
+        (io, shared, rec, tx, task)
+    }
+
+    /// K=8 个纯 ACK(对已发段,无 user_wrote/recv_moved)同一唤醒到达:
+    /// 整批合并为 ≤1 次 flush(基线红:每包一 flush = 8)。
+    #[tokio::test(start_paused = true)]
+    async fn b11_batch_ack_single_flush() {
+        const K: usize = 8;
+        let conv = 0xB11Cu32;
+        let (mut io, shared, rec, tx, task) = setup_ack_session(conv).await;
+        let seg = vec![0xABu8; MSS];
+        for _ in 0..K {
+            io.write_all(&seg).await.unwrap();
+        }
+        spin_until(&shared, |_| rec.lock().unwrap().len() >= K).await;
+        assert!(rec.lock().unwrap().len() >= K, "前置:K 段必须已输出");
+        wait_stable(&shared, 300).await;
+        let sns: Vec<(u32, u32)> = rec
+            .lock()
+            .unwrap()
+            .iter()
+            .take(K)
+            .map(|d| {
+                (
+                    u32::from_le_bytes([d[12], d[13], d[14], d[15]]),
+                    u32::from_le_bytes([d[8], d[9], d[10], d[11]]),
+                )
+            })
+            .collect();
+        let base = sess(&shared);
+        for (sn, ts) in sns {
+            tx.try_send(SessionCmd::Packet(ack_for(conv, sn, ts)))
+                .unwrap();
+        }
+        spin_until(&shared, |c| {
+            c.packets_consumed - base.packets_consumed >= K as u64
+        })
+        .await;
+        wait_stable(&shared, 100).await;
+        let after = sess(&shared);
+        assert_eq!(
+            after.packets_consumed - base.packets_consumed,
+            K as u64,
+            "K 个 ACK 必须全部消费"
+        );
+        let flushes = after.flush_calls - base.flush_calls;
+        assert!(
+            flushes <= 1,
+            "K=8 个纯 ACK 输入必须合并为 ≤1 次 flush: {flushes}"
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// 单个入包:恰 1 轮 + 1 次 flush,不等待凑批(冻结守护,t02 语义
+    /// 在入站侧的镜像)。
+    #[tokio::test(start_paused = true)]
+    async fn b12_single_packet_one_round_one_flush() {
+        let conv = 0xB12Cu32;
+        let (mut io, shared, rec, tx, task) = setup_ack_session(conv).await;
+        let seg = vec![0xCDu8; MSS];
+        io.write_all(&seg).await.unwrap();
+        spin_until(&shared, |_| rec.lock().unwrap().len() >= 1).await;
+        wait_stable(&shared, 300).await;
+        let (sn, ts) = {
+            let g = rec.lock().unwrap();
+            (
+                u32::from_le_bytes([g[0][12], g[0][13], g[0][14], g[0][15]]),
+                u32::from_le_bytes([g[0][8], g[0][9], g[0][10], g[0][11]]),
+            )
+        };
+        let base = sess(&shared);
+        tx.try_send(SessionCmd::Packet(ack_for(conv, sn, ts)))
+            .unwrap();
+        spin_until(&shared, |c| c.packets_consumed - base.packets_consumed >= 1).await;
+        wait_stable(&shared, 100).await;
+        let after = sess(&shared);
+        assert_eq!(after.packets_consumed - base.packets_consumed, 1);
+        assert_eq!(
+            after.flush_calls - base.flush_calls,
+            1,
+            "单包不得等待凑批:恰 1 次 flush"
+        );
+        assert_eq!(after.wakeups - base.wakeups, 1, "单包恰 1 轮");
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// 通道关闭(且空):立即退出,不得热转到 idle 超时(冻结守护)。
+    #[tokio::test(start_paused = true)]
+    async fn b_channel_closed_zero_break() {
+        let (io, shared) = new_io();
+        let (tx, rx) = mpsc::channel::<SessionCmd>(4);
+        let kcp = Kcp::new_stream(0xB13C, DiscardOutput);
+        let task = tokio::spawn(run_session(kcp, rx, shared.clone()));
+        yield16().await;
+        drop(tx);
+        let exited = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .is_ok();
+        assert!(exited, "通道关闭(且空)必须立即退出");
+        assert!(
+            shared.guarded.lock().unwrap().closed,
+            "退出后 closed 可观察"
+        );
+        drop(io);
+    }
+
+    /// 满批入站(>BATCH_CAP)下用户写必须在有界轮内被服务(公平性守护)。
+    #[tokio::test(start_paused = true)]
+    async fn b_full_batch_write_fairness() {
+        let (mut io, shared, rec, tx, task) = setup_ack_session(0xB14C).await;
+        // 通道预置 200 个入站(conv 全 0,kcp.input 容错丢弃,只驱动轮次)
+        let filler = vec![0u8; 24];
+        for _ in 0..200 {
+            tx.try_send(SessionCmd::Packet(filler.clone())).unwrap();
+        }
+        // 满批未清空时用户写到达:有界轮内必须被服务(输出可观察)
+        io.write_all(b"FAIRNESS-USER-WRITE").await.unwrap();
+        let user = b"FAIRNESS-USER-WRITE";
+        let mut found = false;
+        for _ in 0..10_000 {
+            {
+                let g = rec.lock().unwrap();
+                if g.iter().any(|d| d.windows(user.len()).any(|w| w == user)) {
+                    found = true;
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(found, "满批入站下用户写必须有界轮内被服务");
+        spin_until(&shared, |c| c.packets_consumed >= 200).await;
+        assert!(sess(&shared).packets_consumed >= 200, "全部入包最终被消费");
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// 批缓冲跨轮复用不增长:300+ 入包跨多轮消费,容量高水位 ≤ BATCH_CAP。
+    #[tokio::test(start_paused = true)]
+    async fn d_batch_reuse_no_growth() {
+        let (_io, shared, _rec, tx, task) = setup_ack_session(0xB15C).await;
+        let filler = vec![0u8; 24];
+        for _ in 0..200 {
+            tx.try_send(SessionCmd::Packet(filler.clone())).unwrap();
+        }
+        spin_until(&shared, |c| c.packets_consumed >= 200).await;
+        for _ in 0..100 {
+            tx.try_send(SessionCmd::Packet(filler.clone())).unwrap();
+        }
+        spin_until(&shared, |c| c.packets_consumed >= 300).await;
+        assert!(
+            sess(&shared).packets_consumed >= 300,
+            "300 入包必须全部消费"
+        );
+        let hwm = shared.batch_cap_hwm.load(Ordering::Relaxed);
+        assert!(
+            hwm <= BATCH_CAP as u64,
+            "批缓冲容量高水位 {hwm} 不得超过 BATCH_CAP={BATCH_CAP}(跨轮复用不增长)"
+        );
+        task.abort();
+        let _ = task.await;
     }
 }

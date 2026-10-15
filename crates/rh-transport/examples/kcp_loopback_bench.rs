@@ -119,6 +119,7 @@ async fn main() {
     let mut lat_p99 = Vec::new();
     let mut lat_mean = Vec::new();
     for r in 0..reps {
+        kcp::counters_reset();
         let server_cfg = ServerTransportConfig {
             protocol: Protocol::Kcp,
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -140,6 +141,19 @@ async fn main() {
             percentile_u64(s.clone(), 0.5),
             percentile_u64(s.clone(), 0.99)
         );
+        let c = kcp::counters();
+        println!(
+            "COUNTERS rep={} mode=latency bytes_moved={} wakeups={} packets_consumed={} input_calls={} update_calls={} flush_calls={} send_attempts={} recvfrom_calls={}",
+            r,
+            300 * 64 * 2,
+            c.wakeups,
+            c.packets_consumed,
+            c.input_calls,
+            c.update_calls,
+            c.flush_calls,
+            c.send_attempts,
+            c.recvfrom_calls
+        );
         lat_mean.push(mean);
         lat_p50.push(percentile_u64(s.clone(), 0.5));
         lat_p99.push(percentile_u64(s, 0.99));
@@ -154,6 +168,7 @@ async fn main() {
     for streams in [1usize, 4] {
         let mut mbs = Vec::new();
         for r in 0..reps {
+            kcp::counters_reset();
             let server_cfg = ServerTransportConfig {
                 protocol: Protocol::Kcp,
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -178,6 +193,20 @@ async fn main() {
                 mib,
                 elapsed.as_millis(),
                 mbps(bytes, elapsed)
+            );
+            let c = kcp::counters();
+            println!(
+                "COUNTERS rep={} mode=throughput-{} bytes_moved={} wakeups={} packets_consumed={} input_calls={} update_calls={} flush_calls={} send_attempts={} recvfrom_calls={}",
+                r,
+                streams,
+                bytes * 2,
+                c.wakeups,
+                c.packets_consumed,
+                c.input_calls,
+                c.update_calls,
+                c.flush_calls,
+                c.send_attempts,
+                c.recvfrom_calls
             );
             mbs.push(mbps(bytes, elapsed));
         }

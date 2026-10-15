@@ -614,7 +614,10 @@ mod tests {
             .expect("客户端 copy 错误路径必须收敛(即使 poll_shutdown 永久 Pending)")
             .unwrap();
         assert!(d_a.load(Ordering::SeqCst), "错误路径必须释放 a 侧 IO");
-        assert!(d_b.load(Ordering::SeqCst), "对向泵不得永存,b 侧 IO 必须释放");
+        assert!(
+            d_b.load(Ordering::SeqCst),
+            "对向泵不得永存,b 侧 IO 必须释放"
+        );
     }
 
     // B7(客户端侧,与 data.rs relay_mode_copy_disables_chunk_gate 同式):

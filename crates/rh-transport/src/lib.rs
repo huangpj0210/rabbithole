@@ -685,9 +685,12 @@ mod relay_join_tests {
 
         let mut g1 = g1;
         let mut g2 = g2;
-        tokio::time::timeout(std::time::Duration::from_secs(3), join_relay_pumps(&mut g1, &mut g2))
-            .await
-            .expect("单泵 panic 后 join_relay_pumps 必须立即返回(对向不得永存)");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            join_relay_pumps(&mut g1, &mut g2),
+        )
+        .await
+        .expect("单泵 panic 后 join_relay_pumps 必须立即返回(对向不得永存)");
     }
 
     /// 双向正常结束:等两向都自然完成(半关闭语义不提前打断)。
@@ -705,9 +708,12 @@ mod relay_join_tests {
 
         let mut g1 = g1;
         let mut g2 = g2;
-        tokio::time::timeout(std::time::Duration::from_secs(3), join_relay_pumps(&mut g1, &mut g2))
-            .await
-            .expect("双向正常结束必须等两向完成");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            join_relay_pumps(&mut g1, &mut g2),
+        )
+        .await
+        .expect("双向正常结束必须等两向完成");
         assert!(
             second_finished.load(Ordering::SeqCst),
             "先完成的正常泵不得提前打断对向(半关闭语义)"
