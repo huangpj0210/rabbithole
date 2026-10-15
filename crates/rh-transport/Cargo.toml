@@ -32,3 +32,11 @@ sha2 = { workspace = true }
 sha1 = "0.10"
 socket2 = { workspace = true }
 bytes = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# kcp 回归测试用 start_paused(可控时钟)
+tokio = { workspace = true, features = ["test-util"] }
+

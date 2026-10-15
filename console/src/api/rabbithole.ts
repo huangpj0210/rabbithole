@@ -213,6 +213,29 @@ export async function listEvents(params?: { limit?: number; level?: string }): P
 }
 
 // ---------- 服务器配置(热生效子集) ----------
+
+/** [limits] 全九项;0 = 不限(max_pool_size 语义见字段注释)。 */
+export interface LimitsConfig {
+  /** 单条复用连接(yamux/QUIC)并发流硬顶;0 = 不限;新会话生效 */
+  max_mux_streams: number;
+  /** 每客户端并发数据通道上限;0 = 不限;立即生效 */
+  max_data_conns_per_client: number;
+  /** 每代理 UDP 会话上限;0 = 不限;立即生效 */
+  max_udp_sessions_per_proxy: number;
+  /** 每规则池深上限;0 = 不限;仅对新建/更新规则生效 */
+  max_pool_size: number;
+  /** 规则未指定池深时的默认值 */
+  default_pool_size: number;
+  /** 控制帧发送队列深度;新会话生效 */
+  control_send_queue: number;
+  /** 每 IP 认证窗口并发;0 = 不限;立即生效 */
+  unauth_conns_per_ip: number;
+  /** UDP 报文缓冲;0 = 用默认(64KB) */
+  udp_packet_size: number;
+  /** 用户连接等池补拨超时(毫秒) */
+  pool_wait_timeout_ms: number;
+}
+
 export interface ServerConfigView {
   config: Record<string, unknown>;
   hot: {
@@ -225,6 +248,7 @@ export interface ServerConfigView {
       bind_port: number;
     };
     metrics: { enable_prometheus: boolean; bind_addr: string; port: number };
+    limits: LimitsConfig;
   };
   authorized_keys: null | string;
 }
@@ -234,6 +258,7 @@ export interface ServerConfigUpdate {
   log?: { level?: string };
   ssh_gateway?: { enabled?: boolean; bind_addr?: string; bind_port?: number };
   metrics?: { enable_prometheus?: boolean; bind_addr?: string; port?: number };
+  limits?: Partial<LimitsConfig>;
   authorized_keys?: string;
 }
 

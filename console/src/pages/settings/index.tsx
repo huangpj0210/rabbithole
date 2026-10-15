@@ -56,6 +56,13 @@ function intInRange(min: number, max: number, label: string) {
     );
 }
 
+function nonNegativeInt(label: string) {
+  return z
+    .string()
+    .trim()
+    .refine((v) => /^\d+$/.test(v), `${label}须为非负整数`);
+}
+
 /** 宽松 IP 校验:IPv4 四段 0-255;IPv6 支持 :: 缩写与内嵌 IPv4(最终以服务端解析为准)。 */
 function isValidIp(value: string): boolean {
   const v = value.trim();
@@ -85,9 +92,64 @@ const serverSchema = z.object({
   max_services_per_client: intInRange(0, 10000, '每客户端最大转发规则数'),
   log_level: z.enum(LOG_LEVELS),
   authorized_keys: z.string(),
+  // 并发与限流(0 = 不限;范围与后端一致)
+  limit_max_mux_streams: intInRange(0, 16777216, '复用流上限'),
+  limit_max_data_conns_per_client: nonNegativeInt('每客户端并发通道'),
+  limit_max_udp_sessions_per_proxy: nonNegativeInt('每规则 UDP 会话'),
+  limit_unauth_conns_per_ip: nonNegativeInt('认证窗口并发/IP'),
+  limit_max_pool_size: intInRange(0, 255, '池深上限'),
+  limit_default_pool_size: intInRange(0, 255, '默认池深'),
+  limit_control_send_queue: intInRange(16, 65536, '控制帧队列'),
+  limit_udp_packet_size: intInRange(0, 65536, 'UDP 包缓冲'),
+  limit_pool_wait_timeout_ms: intInRange(100, 600000, '等池超时'),
 });
 
 type ServerFormValues = z.infer<typeof serverSchema>;
+
+/** 「并发与限流」九项:标签与说明与后端字段一一对应(0 = 不限)。 */
+const LIMIT_FIELDS = [
+  {
+    name: 'limit_max_mux_streams',
+    label: '复用流上限',
+    infoKey: 'settings.limits.max_mux_streams',
+  },
+  {
+    name: 'limit_max_data_conns_per_client',
+    label: '每客户端并发通道',
+    infoKey: 'settings.limits.max_data_conns_per_client',
+  },
+  {
+    name: 'limit_max_udp_sessions_per_proxy',
+    label: '每规则 UDP 会话',
+    infoKey: 'settings.limits.max_udp_sessions_per_proxy',
+  },
+  {
+    name: 'limit_unauth_conns_per_ip',
+    label: '认证窗口并发/IP',
+    infoKey: 'settings.limits.unauth_conns_per_ip',
+  },
+  { name: 'limit_max_pool_size', label: '池深上限', infoKey: 'settings.limits.max_pool_size' },
+  {
+    name: 'limit_default_pool_size',
+    label: '默认池深',
+    infoKey: 'settings.limits.default_pool_size',
+  },
+  {
+    name: 'limit_control_send_queue',
+    label: '控制帧队列',
+    infoKey: 'settings.limits.control_send_queue',
+  },
+  {
+    name: 'limit_udp_packet_size',
+    label: 'UDP 包缓冲',
+    infoKey: 'settings.limits.udp_packet_size',
+  },
+  {
+    name: 'limit_pool_wait_timeout_ms',
+    label: '等池超时(ms)',
+    infoKey: 'settings.limits.pool_wait_timeout_ms',
+  },
+] as const;
 
 /** 监控指标(独立监听端口)表单。 */
 const metricsSchema = z.object({
@@ -122,6 +184,16 @@ const EMPTY_SERVER_FORM: ServerFormValues = {
   max_services_per_client: '0',
   log_level: 'info',
   authorized_keys: '',
+  // 与服务端默认一致(上游回填/提交用的同一组兜底值)
+  limit_max_mux_streams: '0',
+  limit_max_data_conns_per_client: '0',
+  limit_max_udp_sessions_per_proxy: '0',
+  limit_unauth_conns_per_ip: '64',
+  limit_max_pool_size: '0',
+  limit_default_pool_size: '2',
+  limit_control_send_queue: '256',
+  limit_udp_packet_size: '0',
+  limit_pool_wait_timeout_ms: '10000',
 };
 
 /** 保存结果统一提示:写回失败时运行时仍已生效(与旧版口径一致)。 */
@@ -185,6 +257,15 @@ function ServerConfigCard() {
       max_services_per_client: String(hot.max_services_per_client),
       log_level: level,
       authorized_keys: cfgQ.data.authorized_keys ?? '',
+      limit_max_mux_streams: String(hot.limits?.max_mux_streams ?? 0),
+      limit_max_data_conns_per_client: String(hot.limits?.max_data_conns_per_client ?? 0),
+      limit_max_udp_sessions_per_proxy: String(hot.limits?.max_udp_sessions_per_proxy ?? 0),
+      limit_unauth_conns_per_ip: String(hot.limits?.unauth_conns_per_ip ?? 64),
+      limit_max_pool_size: String(hot.limits?.max_pool_size ?? 0),
+      limit_default_pool_size: String(hot.limits?.default_pool_size ?? 2),
+      limit_control_send_queue: String(hot.limits?.control_send_queue ?? 256),
+      limit_udp_packet_size: String(hot.limits?.udp_packet_size ?? 0),
+      limit_pool_wait_timeout_ms: String(hot.limits?.pool_wait_timeout_ms ?? 10000),
     });
   }, [cfgQ.data, form]);
 
@@ -204,6 +285,17 @@ function ServerConfigCard() {
           max_services_per_client: Number(values.max_services_per_client),
         },
         log: { level: values.log_level },
+        limits: {
+          max_mux_streams: Number(values.limit_max_mux_streams),
+          max_data_conns_per_client: Number(values.limit_max_data_conns_per_client),
+          max_udp_sessions_per_proxy: Number(values.limit_max_udp_sessions_per_proxy),
+          unauth_conns_per_ip: Number(values.limit_unauth_conns_per_ip),
+          max_pool_size: Number(values.limit_max_pool_size),
+          default_pool_size: Number(values.limit_default_pool_size),
+          control_send_queue: Number(values.limit_control_send_queue),
+          udp_packet_size: Number(values.limit_udp_packet_size),
+          pool_wait_timeout_ms: Number(values.limit_pool_wait_timeout_ms),
+        },
         authorized_keys: values.authorized_keys,
       }),
     onSuccess: (result, values) => {
@@ -411,6 +503,37 @@ function ServerConfigCard() {
                   </FormItem>
                 )}
               />
+            </section>
+
+            <section className="space-y-4">
+              <div className="space-y-1">
+                <h3 className="text-sm font-semibold">并发与限流</h3>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  默认全部不设限(0 = 不限),并发上限交由系统层(fd / 内存 / 端口)决定。
+                  标「新会话生效」的项对已接入客户端在下一次重连后应用;QUIC
+                  传输的流上限需重启服务端。
+                </p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                {LIMIT_FIELDS.map((item) => (
+                  <FormField
+                    key={item.name}
+                    control={form.control}
+                    name={item.name}
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          <InfoLabel title={item.label} infoKey={item.infoKey} />
+                        </FormLabel>
+                        <FormControl>
+                          <Input inputMode="numeric" className="w-40" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                ))}
+              </div>
             </section>
 
             <div className="flex items-center gap-3">

@@ -19,8 +19,16 @@ subdomain_host = "rabbithole.test"
 auto_range = "10000-25000"
 
 [limits]
-max_pool_size = 16
+# 并发上限默认全部 0 = 不限(交由系统层 fd/内存/端口兜底);均可在控制台热改。
+# max_mux_streams = 0            # 单复用连接并发流硬顶(0=不限;新会话生效;QUIC 需重启)
+# max_data_conns_per_client = 0  # 每客户端并发数据通道(0=不限;立即生效;自动钳制到流上限-1024)
+# max_udp_sessions_per_proxy = 0 # 每规则 UDP 会话数(0=不限;立即生效)
+# max_pool_size = 0              # 每规则池深上限(0=不限;仅新建/更新规则生效)
 default_pool_size = 2
+# control_send_queue = 256       # 控制帧发送队列(满则背压;新会话生效)
+# unauth_conns_per_ip = 64       # 每 IP 认证窗口并发(0=不限;防匿名洪水,不建议关)
+# udp_packet_size = 65536        # UDP 报文缓冲(实际取 max(1500, 此值))
+# pool_wait_timeout_ms = 10000   # 用户连接等池补拨总时长
 
 [ssh_gateway]
 enabled = false

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # rabbithole E2E 多进程测试套件。
 # 用法: tests/e2e.sh [二进制目录](默认 target/release)
+#       tests/e2e.sh --self-test   # 仅自测便携辅助(不启动 rh-server/client)
 # 自带临时目录与独立端口,不依赖外部状态;每项输出 PASS/FAIL。
 set -u
 BIN_DIR="${1:-$(dirname "$0")/../target/release}"
@@ -10,12 +11,17 @@ SERVER="$ROOT/$BIN_DIR/rh-server"
 CLIENT="$ROOT/$BIN_DIR/rh-client"
 PASS=0; FAIL=0
 PIDS=()
+SKIP_ARCHIVE=0
 
 cleanup() {
+  # 只清理本脚本亲自 spawn 的进程(PIDS 均为 $! 记录,身份确定);
+  # 不做任何按 /tmp/rh-* 模式的广域扫杀(可能是其他会话的服务)。
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
-  # 外部服务由本脚本启动的都在 PIDS 里;日志留档一份便于排查
-  rm -rf /tmp/rh-e2e-last
-  cp -r "$WORK" /tmp/rh-e2e-last 2>/dev/null
+  # 归档目录唯一化:保留每次运行的历史快照,不覆盖其他会话证据
+  if [ "$SKIP_ARCHIVE" != "1" ]; then
+    local ARCHIVE="/tmp/rh-e2e-last-$(date +%Y%m%d-%H%M%S)-$$"
+    cp -r "$WORK" "$ARCHIVE" 2>/dev/null && echo "(环境快照归档: $ARCHIVE)"
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -24,6 +30,88 @@ ok()   { PASS=$((PASS+1)); echo "PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2"; fi; }
 
+# ---------- 便携辅助 ----------
+# 替换 client.toml 的 secret 行(macOS/Linux 通用;密钥经环境变量传递,
+# 不出现在命令行(ps)/错误输出里;必须恰好命中 1 行,否则不写回并报错)。
+update_secret() {  # $1=toml 路径;新密钥经环境变量 UPDATE_SECRET_VAL
+  UPDATE_SECRET_VAL="${UPDATE_SECRET_VAL:?}" python3 - "$1" <<'PYEOF'
+import os, re, sys
+path = sys.argv[1]
+secret = os.environ["UPDATE_SECRET_VAL"]
+with open(path, encoding="utf-8") as fh:
+    lines = fh.readlines()
+pat = re.compile(r'^secret\s*=\s*".*"\s*$')
+hits = [i for i, l in enumerate(lines) if pat.match(l)]
+if len(hits) != 1:
+    sys.stderr.write("update_secret: 期望恰好 1 行 secret,实际 %d 行,未写回\n"
+                     % len(hits))
+    sys.exit(1)
+lines[hits[0]] = 'secret = "%s"\n' % secret
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    fh.writelines(lines)
+os.replace(tmp, path)
+PYEOF
+}
+
+# 端口预检:被占用时报错退出,绝不杀未知进程
+port_free_tcp() { python3 -c 'import socket,sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1]))); s.close(); sys.exit(0)
+except OSError: sys.exit(1)' "$1"; }
+port_free_udp() { python3 -c 'import socket,sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1]))); s.close(); sys.exit(0)
+except OSError: sys.exit(1)' "$1"; }
+
+# ---------- 自测模式(便携辅助自身,不启动被测二进制) ----------
+if [ "${1:-}" = "--self-test" ]; then
+  SKIP_ARCHIVE=1
+  T=$(mktemp -d /tmp/rh-e2e-selftest.XXXXXX)
+  cat > "$T/c.toml" <<'TOML'
+server_addr = "127.0.0.1:18100"
+protocol = "tcp"
+client_id = "abc"
+secret = "OLD-SECRET-VALUE"
+dns_server = "127.0.0.1:19553"
+TOML
+  UPDATE_SECRET_VAL="NEW-SECRET-VALUE" update_secret "$T/c.toml"
+  rc=$?
+  if [ $rc -eq 0 ] \
+     && grep -q '^secret = "NEW-SECRET-VALUE"$' "$T/c.toml" \
+     && [ "$(grep -c '^secret' "$T/c.toml")" = "1" ] \
+     && grep -q '^client_id = "abc"$' "$T/c.toml"; then
+    ok "update_secret: 恰好替换 secret 一行,其余行不动"
+  else
+    bad "update_secret: 替换结果不符"
+  fi
+  # 负例:没有 secret 行时必须拒绝且不写回
+  printf 'a = 1\n' > "$T/d.toml"
+  UPDATE_SECRET_VAL="X" update_secret "$T/d.toml" 2>/dev/null
+  if [ $? -ne 0 ] && [ "$(cat "$T/d.toml")" = "a = 1" ]; then
+    ok "update_secret: 无 secret 行时报错不写回"
+  else
+    bad "update_secret: 缺行行为不符"
+  fi
+  # 负例:两行 secret 必须拒绝(不得静默改写其一)
+  printf 'secret = "a"\nsecret = "b"\n' > "$T/e.toml"
+  UPDATE_SECRET_VAL="X" update_secret "$T/e.toml" 2>/dev/null
+  if [ $? -ne 0 ] && grep -q '^secret = "a"$' "$T/e.toml"; then
+    ok "update_secret: 多行 secret 报错不写回"
+  else
+    bad "update_secret: 多行行为不符"
+  fi
+  # 密钥不出现在本脚本进程的命令行(辅助经 env 传递):静态自证——
+  # helper 从 os.environ 取值,无 argv 携带密钥
+  ok "update_secret: 密钥经环境变量传递(非 argv,不落入 ps/错误输出)"
+  rm -rf "$T"
+  echo "== 自测结果: PASS=$PASS FAIL=$FAIL =="
+  [ "$FAIL" = "0" ]
+  exit $?
+fi
+
 # ---------- 端口(避开常用) ----------
 API_PORT=18080; CTL_PORT=18100; VHOST_HTTP=18081; TCPMUX_PORT=18082
 ECHO_TCP=18091; ECHO_UDP=18092; HTTP_ORIGIN=18093; HDR_PORT=18094
@@ -31,12 +119,26 @@ P_TCP=18301; P_UDP=18302; P_COMP=18303; P_PPRO=18304; P_REFUSED=18305
 DEAD_PORT=18999  # 无监听端口(目标拒连测试)
 MM_PORT=18401; P_MM=18411   # 中间人端口 / multiplex=false 规则端口
 V_STCP=18310; V_SUDP=18311; V_XTCP=18312; V_STCP2=18313
+METRICS_PORT=18450          # Prometheus 独立端口(0fe4069:解耦、无鉴权)
 ADMIN_USER="admin"; ADMIN_PASS="E2e-pass-123"
 
 echo "== rabbithole E2E($WORK)=="
-# 全局卫生:清理先前运行残留的同端口进程(不同 WORK 目录的孤儿)
-for pid in $(ps -eo pid,args | grep -E "rh-(client|server) --config /tmp/rh-" | grep -v grep | grep -v "$WORK" | awk '{print $1}'); do kill "$pid" 2>/dev/null; done
-sleep 0.5
+# 端口预检:全部所需端口必须空闲;被占即报错退出(不杀未知进程——
+# 那可能是其他会话/本机真实服务,广域扫杀是被禁止的清理方式)
+TCP_PORTS="$API_PORT $CTL_PORT $VHOST_HTTP $TCPMUX_PORT $ECHO_TCP $HTTP_ORIGIN $HDR_PORT $P_TCP $P_COMP $P_PPRO $P_REFUSED $MM_PORT $P_MM $V_STCP $V_XTCP $V_STCP2 $DEAD_PORT $METRICS_PORT 19700 19195 19196 18022 18998 19997 19998 19999"
+UDP_PORTS="$ECHO_UDP $P_UDP $V_SUDP 19553"
+for p in $TCP_PORTS; do
+  if ! port_free_tcp "$p"; then
+    echo "ERROR: 端口 $p/tcp 已被占用(预检失败)。可能是先前运行残留或无关服务;不自动清理,请人工排查后重跑。" >&2
+    exit 2
+  fi
+done
+for p in $UDP_PORTS; do
+  if ! port_free_udp "$p"; then
+    echo "ERROR: 端口 $p/udp 已被占用(预检失败)。请人工排查后重跑。" >&2
+    exit 2
+  fi
+done
 
 # ---------- 基础服务 ----------
 python3 - "$ECHO_TCP" <<'EOF' &
@@ -133,6 +235,8 @@ authorized_keys_file = "$WORK/authorized_keys"
 auto_range = "20000-21000"
 [metrics]
 enable_prometheus = true
+bind_addr = "127.0.0.1"
+port = $METRICS_PORT
 [log]
 level = "info"
 EOF
@@ -140,7 +244,7 @@ EOF
 "$SERVER" --config "$WORK/server.toml" admin create "$ADMIN_USER" "$ADMIN_PASS" >/dev/null 2>&1
 check $? "管理员创建"
 "$SERVER" --config "$WORK/server.toml" >"$WORK/server.log" 2>&1 &
-PIDS+=($!)
+SRV_PID=$!; PIDS+=($SRV_PID)   # 记录精确服务端 PID(重启时按 PID 终止)
 sleep 2
 
 api() { curl -s -m 10 -H "Authorization: Bearer $TOKEN" "$@"; }
@@ -181,7 +285,7 @@ dns_server = "127.0.0.1:19553"
 log_level = "info"
 EOF
 "$CLIENT" --config "$WORK/client.toml" >"$WORK/client.log" 2>&1 &
-PIDS+=($!)
+CLIENT_PID=$!; PIDS+=($CLIENT_PID)   # 记录精确客户端 PID(轮换时按 PID 终止)
 sleep 3
 online=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["online"])')
@@ -673,22 +777,27 @@ online_after=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorizatio
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["online"])')
 [ "$online_after" = "False" ]; check $? "轮换后旧会话下线"
 # 用新密钥重连
-sed -i '' "s/^secret = .*/secret = \"$NEW_SECRET\"/" "$WORK/client.toml"
-for pid in $(ps -eo pid,args | grep -F -- "--config $WORK/client.toml" | grep -v grep | awk '{print $1}'); do
-  kill "$pid" 2>/dev/null   # 老客户端(全部实例)
-done
+# 便携写入:Python 原子替换,要求恰好命中 1 行 secret 才写回。
+# (旧 `sed -i ''` 是 BSD 专用语法:GNU sed 把脚本文本当文件名,secret
+# 既没写入,错误信息还把密钥打印进日志。密钥经环境变量传递,不进
+# 命令行/错误输出。)
+UPDATE_SECRET_VAL="$NEW_SECRET" update_secret "$WORK/client.toml"
+check $? "密钥写入 client.toml(便携替换恰好一行)"
+# 仅终止本脚本启动的旧客户端(精确 PID;不做 ps 广域匹配)
+kill "$CLIENT_PID" 2>/dev/null
 "$CLIENT" --config "$WORK/client.toml" >>"$WORK/client.log" 2>&1 &
-PIDS+=($!)
+CLIENT_PID=$!; PIDS+=($CLIENT_PID)
 sleep 4
 online2=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["online"])')
 [ "$online2" = "True" ]; check $? "新密钥重连上线"
 
 # ---------- 重启恢复 ----------
-SRV_PID=$(ps -eo pid,args | grep -F -- "--config $WORK/server.toml" | grep -v grep | awk '{print $1}' | head -1)
-kill "$SRV_PID"; sleep 3
+# 按记录的精确 PID 终止服务端(旧写法 ps 广域匹配 + PIDS[4]=$! 覆盖
+# DNS stub 槽位,导致 DNS 残留进程);新 PID 一律追加,绝不覆盖既有槽位
+kill "$SRV_PID" 2>/dev/null; sleep 3
 "$SERVER" --config "$WORK/server.toml" >>"$WORK/server.log" 2>&1 &
-PIDS[4]=$!
+SRV_PID=$!; PIDS+=($SRV_PID)
 sleep 5
 rec=$(grep -c recovered "$WORK/server.log"); [ "$rec" -ge 1 ]; check $? "服务端重启恢复规则"
 python3 - "$P_TCP" <<'EOF' && ok "重启后 TCP 恢复转发" || bad "重启后 TCP 恢复转发"
@@ -775,10 +884,23 @@ q2=$(api -X POST "http://127.0.0.1:$API_PORT/api/services" -H 'Content-Type: app
 api -X DELETE "http://127.0.0.1:$API_PORT/api/clients/$QID" > /dev/null
 events=$(api "http://127.0.0.1:$API_PORT/api/events?limit=5" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"])>0)')
 [ "$events" = "True" ]; check $? "事件查询"
-metrics=$(curl -s -m 5 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")
-[ "$metrics" -gt 3 ]; check $? "Prometheus 指标暴露(认证)"
-noauth_metrics=$(curl -s -m 5 "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")
-[ "$noauth_metrics" -eq 0 ]; check $? "metrics 未认证拒绝"
+# 指标自 0fe4069 起在独立无鉴权端口暴露(config [metrics] bind_addr/port,
+# 本 E2E 显式配置 METRICS_PORT),不再挂 API 端口下的 /metrics。
+# 1) 独立端口:不带任何认证头必须 HTTP 200 且含 >3 行格式合法的
+#    rabbithole_ 指标样本(名{标签} 数值)。空 body/404 不算成功:
+#    状态码显式校验,样本行格式显式校验。
+mcode=$(curl -s -o "$WORK/metrics.txt" -w "%{http_code}" -m 5 "http://127.0.0.1:$METRICS_PORT/metrics")
+mlines=$(grep -cE '^rabbithole_[a-z_0-9]+(\{[^}]*\})? [0-9]' "$WORK/metrics.txt" 2>/dev/null || true)
+[ "$mcode" = "200" ] && [ "$mlines" -gt 3 ]; check $? "独立 metrics 端口无鉴权暴露(HTTP=$mcode, 样本行=${mlines})"
+# 2) API 端口不再暴露 rabbithole_ 指标:带令牌与不带令牌各验一次,
+#    断言只认 body 内容(0 行指标);实际状态码写入标签供人工核对,
+#    404(路由不存在)或 200 空指标都视为"不再暴露"。
+apic_with=$(curl -s -m 5 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")
+apic_with_code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$API_PORT/metrics")
+[ "$apic_with" -eq 0 ]; check $? "API 端口 /metrics 不再暴露 rabbithole_ 指标(带令牌 HTTP=$apic_with_code)"
+apic_no=$(curl -s -m 5 "http://127.0.0.1:$API_PORT/metrics" | grep -c "rabbithole_")
+apic_no_code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "http://127.0.0.1:$API_PORT/metrics")
+[ "$apic_no" -eq 0 ]; check $? "API 端口 /metrics 无认证亦不暴露 rabbithole_ 指标(HTTP=$apic_no_code)"
 
 # ---------- 首次启动引导 + 修改密码(独立短环境) ----------
 BOOT="$WORK/boot"; mkdir -p "$BOOT"

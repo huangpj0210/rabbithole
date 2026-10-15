@@ -1,0 +1,259 @@
+// Copyright (c) 2018-2019 Parity Technologies (UK) Ltd.
+//
+// Licensed under the Apache License, Version 2.0 or MIT license, at your option.
+//
+// A copy of the Apache License, Version 2.0 is included in the software as
+// LICENSE-APACHE and a copy of the MIT license is included in the software
+// as LICENSE-MIT. You may also obtain a copy of the Apache License, Version 2.0
+// at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
+// at https://opensource.org/licenses/MIT.
+
+//! This crate implements the [Yamux specification][1].
+//!
+//! It multiplexes independent I/O streams over reliable, ordered connections,
+//! such as TCP/IP.
+//!
+//! The two primary objects, clients of this crate interact with, are:
+//!
+//! - [`Connection`], which wraps the underlying I/O resource, e.g. a socket, and
+//!   provides methods for opening outbound or accepting inbound streams.
+//! - [`Stream`], which implements [`futures::io::AsyncRead`] and
+//!   [`futures::io::AsyncWrite`].
+//!
+//! [1]: https://github.com/hashicorp/yamux/blob/master/spec.md
+
+// vendor 改造:frame::io 的 staging 扩展(bytes 标准模式)需要
+// advance_mut;除该处外全 crate 禁 unsafe。
+#![deny(unsafe_code)]
+
+mod chunks;
+mod error;
+mod frame;
+pub mod pool;
+
+pub(crate) mod connection;
+mod tagged_stream;
+
+pub use crate::connection::{Connection, Mode, Packet, Stream, StreamReadHalf, StreamWriteHalf};
+pub use crate::error::ConnectionError;
+pub use crate::frame::{
+    header::{HeaderDecodeError, StreamId},
+    FrameDecodeError, Sequential, Writev2,
+};
+
+const KIB: usize = 1024;
+const MIB: usize = KIB * 1024;
+const GIB: usize = MIB * 1024;
+
+pub const DEFAULT_CREDIT: u32 = 256 * KIB as u32; // as per yamux specification
+
+pub type Result<T> = std::result::Result<T, ConnectionError>;
+
+/// The maximum number of streams we will open without an acknowledgement from the other peer.
+///
+/// This enables a very basic form of backpressure on the creation of streams.
+const MAX_ACK_BACKLOG: usize = 256;
+
+/// Default maximum number of bytes a Yamux data frame might carry as its
+/// payload when being send. Larger Payloads will be split.
+///
+/// The data frame payload size is not restricted by the yamux specification.
+/// Still, this implementation restricts the size to:
+///
+/// 1. Reduce delays sending time-sensitive frames, e.g. window updates.
+/// 2. Minimize head-of-line blocking across streams.
+/// 3. Enable better interleaving of send and receive operations, as each is
+///    carried out atomically instead of concurrently with its respective
+///    counterpart.
+///
+/// For details on why this concrete value was chosen, see
+/// https://github.com/paritytech/yamux/issues/100.
+const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
+
+/// Yamux configuration.
+///
+/// The default configuration values are as follows:
+///
+/// - max. for the total receive window size across all streams of a connection = 1 GiB
+/// - max. number of streams = 512
+/// - read after close = true
+/// - split send size = 16 KiB
+#[derive(Debug, Clone)]
+pub struct Config {
+    max_connection_receive_window: Option<usize>,
+    max_num_streams: usize,
+    read_after_close: bool,
+    split_send_size: usize,
+    /// 每流初始接收窗(接收侧授信上限的起步值;见
+    /// [`Config::set_initial_stream_receive_window`])。默认
+    /// [`DEFAULT_CREDIT`],即 upstream 原行为。
+    initial_stream_receive_window: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            max_connection_receive_window: Some(GIB),
+            max_num_streams: 512,
+            read_after_close: true,
+            split_send_size: DEFAULT_SPLIT_SEND_SIZE,
+            initial_stream_receive_window: DEFAULT_CREDIT as usize,
+        }
+    }
+}
+
+impl Config {
+    /// Set the upper limit for the total receive window size across all streams of a connection.
+    ///
+    /// Must be `>= 256 KiB * max_num_streams` to allow each stream at least the Yamux default
+    /// window size.
+    ///
+    /// The window of a stream starts at 256 KiB and is increased (auto-tuned) based on the
+    /// connection's round-trip time and the stream's bandwidth (striving for the
+    /// bandwidth-delay-product).
+    ///
+    /// Set to `None` to disable limit, i.e. allow each stream to grow receive window based on
+    /// connection's round-trip time and stream's bandwidth without limit.
+    ///
+    /// ## DOS attack mitigation
+    ///
+    /// A remote node (attacker) might trick the local node (target) into allocating large stream
+    /// receive windows, trying to make the local node run out of memory.
+    ///
+    /// This attack is difficult, as the local node only increases the stream receive window up to
+    /// 2x the bandwidth-delay-product, where bandwidth is the amount of bytes read, not just
+    /// received. In other words, the attacker has to send (and have the local node read)
+    /// significant amount of bytes on a stream over a long period of time to increase the stream
+    /// receive window. E.g. on a 60ms 10Gbit/s connection the bandwidth-delay-product is ~75 MiB
+    /// and thus the local node will at most allocate ~150 MiB (2x bandwidth-delay-product) per
+    /// stream.
+    ///
+    /// Despite the difficulty of the attack one should choose a reasonable
+    /// `max_connection_receive_window` to protect against this attack, especially since an attacker
+    /// might use more than one stream per connection.
+    pub fn set_max_connection_receive_window(&mut self, n: Option<usize>) -> &mut Self {
+        self.max_connection_receive_window = n;
+
+        assert!(
+            self.max_connection_receive_window.unwrap_or(usize::MAX)
+                >= self.max_num_streams.saturating_mul(DEFAULT_CREDIT as usize),
+            "`max_connection_receive_window` must be `>= 256 KiB * max_num_streams` to allow each
+            stream at least the Yamux default window size"
+        );
+
+        self
+    }
+
+    /// Set the max. number of streams per connection.
+    pub fn set_max_num_streams(&mut self, n: usize) -> &mut Self {
+        self.max_num_streams = n;
+
+        assert!(
+            self.max_connection_receive_window.unwrap_or(usize::MAX)
+                >= self.max_num_streams.saturating_mul(DEFAULT_CREDIT as usize),
+            "`max_connection_receive_window` must be `>= 256 KiB * max_num_streams` to allow each
+            stream at least the Yamux default window size"
+        );
+
+        self
+    }
+
+    /// Allow or disallow streams to read from buffered data after
+    /// the connection has been closed.
+    pub fn set_read_after_close(&mut self, b: bool) -> &mut Self {
+        self.read_after_close = b;
+        self
+    }
+
+    /// Set the max. payload size used when sending data frames. Payloads larger
+    /// than the configured max. will be split.
+    pub fn set_split_send_size(&mut self, n: usize) -> &mut Self {
+        self.split_send_size = n;
+        self
+    }
+
+    /// Set the initial per-stream receive window the local side grants.
+    ///
+    /// Wire semantics stay per yamux specification: the remote sender starts
+    /// with [`DEFAULT_CREDIT`] (256 KiB) of credit. What this configures is the
+    /// receiver side: a freshly created stream's `max_receive_window` starts at
+    /// `n` instead of [`DEFAULT_CREDIT`], so the receiver's **first** window
+    /// update poll grants `n - 256 KiB` of additional credit via a regular
+    /// window update frame (upstream-legal for any peer). The pregrant is
+    /// charged against the connection budget
+    /// (`max_connection_receive_window - 256 KiB * max_num_streams`, shared
+    /// with auto-tuning) and clamped when the budget is exhausted, and the
+    /// first window update never triggers BDP doubling (the pregrant is not
+    /// measured receive throughput).
+    ///
+    /// Motivation (rabbithole round-1, measured on the 3-machine testbed,
+    /// `benchmark/runs/goal-repair/round-1/single-stream-medians.txt`): every
+    /// mux protocol stalled single-stream at ~1.05-1.23 Gbit/s up /
+    /// ~1.47-1.96 Gbit/s down regardless of TLS, while 16 concurrent streams
+    /// on the same path reached 2.2-3.0 Gbit/s — consistent with a per-stream
+    /// credit-loop clamp (`256 KiB / credit-loop-latency`), not a per-byte
+    /// cost. Hypothesis (not yet verified on the testbed): the credit loop
+    /// crossing two relay processes exceeds twice the ping RTT, so the
+    /// RTT-gated auto-tuning never fires; the synthetic-RTT experiment
+    /// (`goal_repair_mux.rs::mux_single_stream_credit_stall_under_synthetic_rtt`)
+    /// reproduces the clamp mechanism locally.
+    ///
+    /// Must be `>= 256 KiB` (per-stream spec floor). Memory note: this is a
+    /// credit *limit*, not an allocation; buffering only grows with data the
+    /// remote actually sends and the local side has not yet consumed.
+    pub fn set_initial_stream_receive_window(&mut self, n: usize) -> &mut Self {
+        assert!(
+            n >= DEFAULT_CREDIT as usize,
+            "`initial_stream_receive_window` must be `>= 256 KiB` (yamux spec floor)"
+        );
+        assert!(
+            n <= u32::MAX as usize,
+            "`initial_stream_receive_window` must fit u32"
+        );
+        self.initial_stream_receive_window = n;
+        self
+    }
+}
+
+// Check that we can safely cast a `usize` to a `u64`.
+static_assertions::const_assert! {
+    std::mem::size_of::<usize>() <= std::mem::size_of::<u64>()
+}
+
+// Check that we can safely cast a `u32` to a `usize`.
+static_assertions::const_assert! {
+    std::mem::size_of::<u32>() <= std::mem::size_of::<usize>()
+}
+
+#[cfg(test)]
+impl quickcheck::Arbitrary for Config {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        // quickcheck 1 的 Gen 不暴露底层 rng:用 Arbitrary 取模近似 gen_range
+        fn gr_usize(g: &mut quickcheck::Gen, lo: usize, hi: usize) -> usize {
+            if hi <= lo {
+                return lo;
+            }
+            use quickcheck::Arbitrary;
+            (u64::arbitrary(g) % ((hi - lo) as u64)) as usize + lo
+        }
+
+        let max_num_streams = gr_usize(g, 0, u16::MAX as usize);
+
+        Config {
+            max_connection_receive_window: if bool::arbitrary(g) {
+                Some(gr_usize(
+                    g,
+                    DEFAULT_CREDIT as usize * max_num_streams,
+                    usize::MAX,
+                ))
+            } else {
+                None
+            },
+            max_num_streams,
+            read_after_close: bool::arbitrary(g),
+            split_send_size: gr_usize(g, DEFAULT_SPLIT_SEND_SIZE, usize::MAX),
+            // 随机配置保持 upstream 默认初窗(预授信行为由专项测试显式构造)
+            initial_stream_receive_window: DEFAULT_CREDIT as usize,
+        }
+    }
+}

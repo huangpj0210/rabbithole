@@ -2,7 +2,7 @@
 
 use crate::{
     other_err, BoxedIo, ClientTransportConfig, Incoming, Multiplexer, MultiplexerInner,
-    ServerTransportConfig,
+    ServerTransportConfig, MUX_STREAMS_UNLIMITED,
 };
 use std::io;
 use std::pin::Pin;
@@ -18,13 +18,40 @@ const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const QUIC_KEEPALIVE: Duration = Duration::from_secs(15);
 
-fn transport_config(keepalive: bool) -> quinn::TransportConfig {
+/// quinn 并发流上限的实际上限:大值(≥1<<23)在跨网(非回环)下会让
+/// 握手静默超时(本地回环不复现,机理与 quinn 传输参数编码相关);
+/// 65536 条并发流已远超数据通道实际需求,作为「不限」的落点与钳制上限。
+const QUIC_STREAMS_CAP: u32 = 1 << 16;
+
+/// 并发流上限钳制(R1 红线测试缝):0=不限 → CAP;n → min(n, CAP)。
+fn clamped_streams(max_streams: usize) -> u32 {
+    if max_streams == 0 {
+        QUIC_STREAMS_CAP
+    } else {
+        (max_streams as u32).min(QUIC_STREAMS_CAP)
+    }
+}
+
+fn transport_config(keepalive: bool, max_streams: usize) -> quinn::TransportConfig {
     let mut tc = quinn::TransportConfig::default();
     tc.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
         QUIC_IDLE_TIMEOUT.as_millis() as u32,
     ))));
+    // quinn 默认仅允许 100 条并发流,远低于数据通道并发需求
+    let n = quinn::VarInt::from(clamped_streams(max_streams));
+    tc.max_concurrent_bidi_streams(n);
+    tc.max_concurrent_uni_streams(n);
+    // 实测注记(2026-10,10GbE/0.4ms 三机):receive_window/stream_receive_window
+    // 抬到 8M/2M、开启 DPLPMTUD 对吞吐无可测收益(467 vs 601 Mbps,方差内),
+    // 吞吐瓶颈在单连接驱动任务的逐包用户态处理,不在流控;故保持默认。
     if keepalive {
         tc.keep_alive_interval(Some(QUIC_KEEPALIVE));
+    }
+    // RH_QUIC_CC=bbr 时换 BBR 拥塞控制(默认 cubic;C1/C3 实验用)
+    if std::env::var("RH_QUIC_CC").as_deref() == Ok("bbr") {
+        tc.congestion_controller_factory(std::sync::Arc::new(
+            quinn::congestion::BbrConfig::default(),
+        ));
     }
     tc
 }
@@ -35,19 +62,27 @@ pub struct QuicListener {
     ready: tokio::sync::mpsc::Receiver<Incoming>,
 }
 
-pub fn listen(cfg: &ServerTransportConfig) -> io::Result<QuicListener> {
+/// 服务端流上限在端点构建时固化(quinn 不支持热换端点配置),改动需重启;
+/// yamux 路径(tcp/tls/ws/wss/kcp)无此限制,对新连接即时生效。
+pub fn listen(
+    cfg: &ServerTransportConfig,
+    mux_streams: &std::sync::atomic::AtomicUsize,
+) -> io::Result<QuicListener> {
     let tls = crate::tls::server_config_with_alpn(&cfg.tls, &cfg.alpn)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .map_err(|e| other_err(format!("quic server config: {e}")))?,
     ));
-    server_config.transport_config(Arc::new(transport_config(false)));
+    server_config.transport_config(Arc::new(transport_config(
+        false,
+        mux_streams.load(Ordering::Relaxed),
+    )));
     let endpoint = quinn::Endpoint::server(server_config, cfg.bind_addr)
         .map_err(|e| other_err(format!("quic bind: {e}")))?;
     let local = endpoint
         .local_addr()
         .map_err(|e| other_err(format!("quic local addr: {e}")))?;
-    let (tx, ready) = tokio::sync::mpsc::channel::<Incoming>(64);
+    let (tx, ready) = tokio::sync::mpsc::channel::<Incoming>(512);
     tokio::spawn(async move {
         loop {
             let incoming = match endpoint.accept().await {
@@ -94,7 +129,7 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|e| other_err(format!("quic client config: {e}")))?,
     ));
-    qcfg.transport_config(Arc::new(transport_config(true)));
+    qcfg.transport_config(Arc::new(transport_config(true, MUX_STREAMS_UNLIMITED)));
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .map_err(|e| other_err(format!("quic client bind: {e}")))?;
     endpoint.set_default_client_config(qcfg);
@@ -211,6 +246,25 @@ impl AsyncWrite for BiStream {
 mod tests {
     use crate::{listen, ClientTransportConfig, Protocol, ServerTransportConfig};
 
+    // R1(红线 1 锁):quinn 并发流上限必须保持 65536,且钳制路径
+    // 0=不限 → CAP、n → min(n, CAP)——任何放宽都不得发生。
+    #[test]
+    fn quic_streams_cap_and_clamp() {
+        assert_eq!(
+            super::QUIC_STREAMS_CAP,
+            65536,
+            "quinn 并发流上限红线(65536)"
+        );
+        assert_eq!(super::clamped_streams(0), 65536);
+        assert_eq!(super::clamped_streams(1), 1);
+        assert_eq!(super::clamped_streams(65536), 65536);
+        assert_eq!(
+            super::clamped_streams(1 << 20),
+            65536,
+            "超限值必须钳制到 CAP"
+        );
+    }
+
     #[tokio::test]
     async fn quic_connect_and_stream() {
         let (cert, key) = crate::tls::auto_cert(&Default::default()).unwrap();
@@ -225,7 +279,12 @@ mod tests {
             },
             alpn: vec!["rhtp".into()],
         };
-        let mut listener = listen(&server_cfg).await.unwrap();
+        let mut listener = listen(
+            &server_cfg,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap();
         let addr = listener.local_addr;
 
         let srv = tokio::spawn(async move {

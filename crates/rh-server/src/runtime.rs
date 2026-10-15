@@ -480,7 +480,10 @@ pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
         if !spec.enabled {
             continue;
         }
-        crate::db::normalize_spec(&mut spec, state.cfg.limits.default_pool_size);
+        {
+            let l = state.limits.read().unwrap();
+            crate::db::normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
+        }
         let _rt = spawn_runtime(state, client_id, &spec, revision).await;
         info!(proxy = spec.name, "recovered after client enable");
     }

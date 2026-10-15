@@ -119,6 +119,24 @@ export const FIELD_INFO = {
     '监听网卡地址:127.0.0.1 仅本机抓取;0.0.0.0 对外暴露(端口无鉴权,注意防火墙)。保存即热重启监听器,绑定失败自动回滚',
   'settings.prometheus.port': '独立监听端口,不与管理面共口',
 
+  // ── 设置(并发与限流,0 = 不限) ──
+  'settings.limits.max_mux_streams':
+    '单条复用连接(yamux/QUIC)上的并发流硬顶,数据通道即流;0 = 不限。新会话生效',
+  'settings.limits.max_data_conns_per_client':
+    '每客户端并发数据通道(池+在途+转发中);0 = 不限。立即生效;实际值自动钳制到复用流上限-1024',
+  'settings.limits.max_udp_sessions_per_proxy':
+    '每条 UDP 规则的会话映射数(按源地址);0 = 不限。立即生效,超限丢新会话包、既有会话不受影响',
+  'settings.limits.unauth_conns_per_ip':
+    '每 IP 同时处于认证窗口的连接数,防匿名洪水;0 = 不限(不建议)。立即生效',
+  'settings.limits.max_pool_size': '每规则预热池深度上限;0 = 不限。仅对新建/更新的规则生效',
+  'settings.limits.default_pool_size': '规则未指定池深时使用的默认值(0 = 不预热)',
+  'settings.limits.control_send_queue':
+    '控制连接发送队列深度,满则背压等待(不拒连);须 ≥ 16。新会话生效',
+  'settings.limits.udp_packet_size':
+    'UDP 报文缓冲字节上限;0 = 用默认 64KB;范围 1500-65536。立即生效',
+  'settings.limits.pool_wait_timeout_ms':
+    '用户连接等待池补拨的总时长(毫秒);范围 100-600000。立即生效',
+
   // ── 证书 ──
   'cert.name': '证书条目标识,便于识别',
   'cert.domains': '留空自动从证书 SAN/CN 提取;HTTPS 请求 SNI 命中(含单层通配)即由服务端终结 TLS',

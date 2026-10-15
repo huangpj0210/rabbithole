@@ -398,7 +398,7 @@ async fn forward_accept(
                 let st2 = state.clone();
                 let reg = registered_addr.clone();
                 tokio::spawn(async move {
-                    st2.metrics.totals.lock().unwrap().conns_current += 1;
+                    st2.metrics.conns_current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let ch = match h
                         .channel_open_forwarded_tcpip(
                             reg,
@@ -410,12 +410,12 @@ async fn forward_accept(
                     {
                         Ok(c) => c,
                         Err(_) => {
-                            st2.metrics.totals.lock().unwrap().conns_current -= 1;
+                            st2.metrics.conns_current.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
                     };
                     pump(sock, ch).await;
-                    st2.metrics.totals.lock().unwrap().conns_current -= 1;
+                    st2.metrics.conns_current.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 });
             }
         }

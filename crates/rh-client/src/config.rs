@@ -12,6 +12,9 @@ pub struct ClientConfig {
     pub protocol: String,
     /// tcp/tls/ws/wss 是否启用 yamux 多路复用(与服务端一致)。
     pub multiplex: bool,
+    /// 数据面中继模式:splice(Linux 零拷贝,默认)| copy(用户态拷贝)。
+    /// 仅对两端均裸 TCP(本地目标 + 裸模式明文载体)生效,其余自动回落。
+    pub relay_mode: String,
     pub client_id: String,
     pub secret: String,
     /// TLS。
@@ -34,6 +37,7 @@ impl Default for ClientConfig {
             server_addr: "127.0.0.1:7100".into(),
             protocol: "tcp".into(),
             multiplex: true,
+            relay_mode: "splice".into(),
             client_id: String::new(),
             secret: String::new(),
             trusted_ca_file: None,

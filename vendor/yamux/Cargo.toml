@@ -1,0 +1,35 @@
+# rabbithole 树内 vendor 版 yamux(上游 0.14.1)。
+# 零拷贝改造(协议不变,线格式与上游完全兼容):
+#   a) 发送帧体 Vec::from → 池化 BytesMut→Bytes(消除每帧分配/释放)
+#   b) 帧头+帧体两次 poll_write → Writev 特性一次下发(writev 单 syscall)
+#   c) 接收侧 staging 多帧解析:一次 read 批量入缓冲,帧体为 Bytes 零拷贝切片,
+#      下游 Chunks 直接持有 Bytes(消除每帧 vec![0;len] 分配+memset)
+[package]
+edition = "2021"
+name = "yamux"
+version = "0.14.1"
+authors = ["Parity Technologies <admin@parity.io>"]
+description = "Multiplexer over reliable, ordered connections (vendored by rabbithole with zero-copy data path)"
+keywords = ["network", "protocol"]
+categories = ["network-programming"]
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/paritytech/yamux"
+
+[lib]
+name = "yamux"
+path = "src/lib.rs"
+
+[dependencies]
+futures = { version = "0.3", features = ["std", "executor"], default-features = false }
+log = "0.4"
+nohash-hasher = "0.2"
+parking_lot = "0.12"
+pin-project = "1"
+static_assertions = "1"
+web-time = "1"
+bytes = "1"
+
+[dev-dependencies]
+futures = { version = "0.3", features = ["executor"], default-features = false }
+quickcheck = "1"
+rand = "0.8"

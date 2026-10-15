@@ -5,6 +5,10 @@ bind_addr = "0.0.0.0"
 bind_protocol = "tls"          # 公网建议 tls;本机调试可用 tcp
 bind_port = 7100
 multiplex = true
+# 数据面中继模式:splice(Linux 零拷贝,默认)| copy(用户态拷贝)。
+# splice 仅在两端均为裸 TCP(裸模式明文载体、无压缩包装)时启用,
+# 其余场景自动回落 copy;对吞吐无损,显著降低大流量 CPU(实测约减半)。
+# relay_mode = "splice"
 
 # 追加监听(可选;不同协议/端口)
 # [[listeners]]
@@ -41,10 +45,16 @@ allow_ports = ["10000-40000"]  # 空 = 不限制
 max_services_per_client = 32
 
 [limits]
-max_data_conns_per_client = 256
-pool_wait_timeout_ms = 8000
-default_pool_size = 4
-udp_packet_size = 65536
+# 并发上限默认全部 0 = 不限(交由系统层 fd/内存/端口兜底);均可在控制台热改。
+# max_mux_streams = 0            # 单复用连接并发流硬顶(0=不限;新会话生效;QUIC 需重启)
+# max_data_conns_per_client = 0  # 每客户端并发数据通道(0=不限;立即生效;自动钳制到流上限-1024)
+# max_udp_sessions_per_proxy = 0 # 每规则 UDP 会话数(0=不限;立即生效)
+# max_pool_size = 0              # 每规则池深上限(0=不限;仅新建/更新规则生效)
+default_pool_size = 2
+# control_send_queue = 256       # 控制帧发送队列(满则背压;新会话生效)
+# unauth_conns_per_ip = 64       # 每 IP 认证窗口并发(0=不限;防匿名洪水,不建议关)
+# udp_packet_size = 65536        # UDP 报文缓冲(实际取 max(1500, 此值))
+# pool_wait_timeout_ms = 10000   # 用户连接等池补拨总时长
 
 [nathole]
 # stun_server = ""             # XTCP 打洞;空 = 本机地址候选

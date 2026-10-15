@@ -7,10 +7,11 @@
 use crate::ws;
 use crate::{
     other_err, ClientTransportConfig, Incoming, Multiplexer, MultiplexerInner,
-    ServerTransportConfig,
+    ServerTransportConfig, MUX_STREAMS_UNLIMITED,
 };
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -21,9 +22,27 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 服务端 TCP/TLS/WS/WSS 监听器。
 /// 接受与握手解耦:后台泵逐个 accept TCP,每连接的握手(TLS/WS/peek)
 /// 在独立任务完成,慢握手不得阻塞后续接入(DoS 缓解);就绪连接入队供消费。
+///
+/// 所有权契约:
+/// - 句柄(`TcpListenerShim`)是监听资源的唯一所有者:它持有 accept 泵任务
+///   (JoinHandle)与关停信号;泵持有底层 `TcpListener` 与全部在途验证 child
+///   (JoinSet)。
+/// - drop 句柄 = 关停信号 + abort 泵:泵立即停止 accept(不等下一个连接),
+///   监听 socket 随之释放,原地址可重绑;在途验证 child 随 JoinSet 析构被
+///   中止——它们的结果已无消费者,连同行文 socket 一并回收,有界不泄漏。
+/// - ready 队列里排的是"已验证未交付"的裸 IO(见 [`VerifiedConn`]),mux
+///   延迟到 `accept()` 交付时才构造:未交付连接没有任何 yamux driver,
+///   句柄 drop 时随队列/背压 child 析构直接关闭,不会出现 detached driver
+///   拖住 socket(不触碰 mux 全局析构语义/open_rx 红线)。
+/// - 已通过 `accept()` 交付的 mux 归消费者所有,不受句柄 drop 影响(与
+///   yamux open_rx 释放不杀存量流的约定一致)。
 pub struct TcpListenerShim {
     local: SocketAddr,
-    ready: tokio::sync::mpsc::Receiver<Incoming>,
+    ready: tokio::sync::mpsc::Receiver<VerifiedConn>,
+    /// 电平触发关停信号;Sender 随句柄析构也会令泵的 `changed()` 立即返回。
+    shutdown: tokio::sync::watch::Sender<()>,
+    /// accept 泵任务句柄:唯一所有权,drop 时 abort(有界回收的硬兜底)。
+    pump: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TcpListenerShim {
@@ -32,20 +51,66 @@ impl TcpListenerShim {
     }
 
     pub async fn accept(&mut self) -> io::Result<Incoming> {
-        self.ready
+        let v = self
+            .ready
             .recv()
             .await
-            .ok_or_else(|| other_err("tcp listener closed"))
+            .ok_or_else(|| other_err("tcp listener closed"))?;
+        // 交付即构造 mux:所有权与消费者同步建立。此前连接只是已验证裸 IO
+        // (含 peek 前传字节),accept 之前客户端已发的帧仍缓冲在 IO 里,
+        // 构造后由 driver 正常处理;未交付路径则从不存在 driver。
+        let mux = crate::mux::wrap_stream_as_server(v.io, v.yamux, v.max_streams);
+        Ok(Incoming {
+            mux,
+            remote: v.remote,
+            protocol: v.protocol,
+        })
+    }
+
+    /// 已验证待交付连接的排队数(测试缝:监听生命周期回归用它在 drop 前
+    /// 取得"已入队未消费"的因果证据,替代纯时间猜测;不参与任何运行时逻辑)。
+    #[doc(hidden)]
+    pub fn ready_len(&self) -> usize {
+        self.ready.len()
     }
 }
 
-/// 单连接握手管线:TLS → WS 升级 → 首字节窥探 → mux 包装。
-async fn handshake(
+impl Drop for TcpListenerShim {
+    fn drop(&mut self) {
+        // 1) 电平触发关停:泵的 select 立即唤醒退出,绝不等待下一个连接
+        //    (Sender 析构本身也会触发同样的唤醒,这里显式发送以表达意图)。
+        let _ = self.shutdown.send(());
+        // 2) 有界硬兜底:即便泵因内部缺陷未能观察信号,abort 也会让泵 future
+        //    被析构——监听 socket 与 JoinSet(连同在途握手 child)随之释放。
+        //    回收只需一次取消调度,与是否有新连接到来无关。
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
+    }
+}
+
+/// 已通过全部验证(TLS/WS/peek)、等待 accept 交付的连接。
+/// mux 延迟到 accept() 交付时才构造(见 `TcpListenerShim::accept`):
+/// 未交付期间队列中只有裸 IO,监听句柄 drop 时随队列/背压 child 析构
+/// 直接关闭;yamux driver 只随交付产生、归消费者所有。
+struct VerifiedConn {
+    io: crate::BoxedIo,
+    remote: SocketAddr,
+    protocol: crate::Protocol,
+    /// peek 判定:按 yamux 处理(true)或裸 RHTP/非 multiplex 监听(false)。
+    yamux: bool,
+    /// 物理 accept 时读取的 mux_streams 热改值(保持"对新连接生效"时机不变)。
+    max_streams: usize,
+}
+
+/// 单连接验证管线:TLS → WS 升级 → 首字节窥探。
+/// 只做验证与分类,不构造 mux;验证流程/超时与原实现完全一致。
+async fn verify(
     stream: tokio::net::TcpStream,
     tls: Option<tokio_rustls::TlsAcceptor>,
     ws_upgrade: bool,
     multiplex: bool,
-) -> io::Result<Arc<Multiplexer>> {
+) -> io::Result<(crate::BoxedIo, bool)> {
     stream.set_nodelay(true).ok();
     set_tcp_keepalive(&stream);
     let io: crate::BoxedIo = match tls {
@@ -64,7 +129,7 @@ async fn post_tls(
     io: crate::BoxedIo,
     ws_upgrade: bool,
     multiplex: bool,
-) -> io::Result<Arc<Multiplexer>> {
+) -> io::Result<(crate::BoxedIo, bool)> {
     let io = if ws_upgrade {
         let io = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws::upgrade_server(io, ws::WS_PATH))
             .await
@@ -74,23 +139,14 @@ async fn post_tls(
         io
     };
     if !multiplex {
-        return Ok(crate::mux::wrap_stream_as_server(io, false));
+        return Ok((io, false));
     }
     // 混合接入:multiplex 监听允许裸模式客户端。
     // 窥探首 4 字节:RHTP 魔数 = 裸连接(每连接一流);否则按 yamux 处理。
     // 窥探字节必须前传(两种包装都需要)。
     let (prefix, io) = peek_prefix(io).await?;
-    if prefix == *b"RHTP" {
-        Ok(crate::mux::wrap_stream_as_server(
-            crate::PrependedIo::wrap(io, prefix.to_vec()),
-            false,
-        ))
-    } else {
-        Ok(crate::mux::wrap_stream_as_server(
-            crate::PrependedIo::wrap(io, prefix.to_vec()),
-            true,
-        ))
-    }
+    let yamux = prefix != *b"RHTP";
+    Ok((crate::PrependedIo::wrap(io, prefix.to_vec()), yamux))
 }
 
 /// 窥探首 4 字节(带超时,防慢连接占资源);返回字节与可继续读取的流。
@@ -111,7 +167,11 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     let _ = s.set_tcp_keepalive(&ka);
 }
 
-pub async fn listen_stream(cfg: &ServerTransportConfig) -> io::Result<TcpListenerShim> {
+/// mux_streams:并发流上限的有效值(0 已折算),每连接 accept 时读取 → 热改对新连接生效。
+pub async fn listen_stream(
+    cfg: &ServerTransportConfig,
+    mux_streams: Arc<AtomicUsize>,
+) -> io::Result<TcpListenerShim> {
     let listener = TcpListener::bind(cfg.bind_addr).await?;
     let local = listener.local_addr()?;
     let tls = if matches!(cfg.protocol, crate::Protocol::Tls | crate::Protocol::Wss) {
@@ -127,38 +187,83 @@ pub async fn listen_stream(cfg: &ServerTransportConfig) -> io::Result<TcpListene
     let ws_upgrade = matches!(cfg.protocol, crate::Protocol::Ws | crate::Protocol::Wss);
     let multiplex = cfg.multiplex;
     let protocol = cfg.protocol;
-    // 握手泵:accept 与握手解耦,慢握手不阻塞后续接入
-    let (tx, ready) = tokio::sync::mpsc::channel::<Incoming>(64);
-    tokio::spawn(async move {
+    let mux_limit = mux_streams;
+    // 握手泵:accept 与验证解耦,慢验证不阻塞后续接入。
+    // 队列 512:高并发建连(1024+)时 64 会排队,建连 p99 恶化
+    let (tx, ready) = tokio::sync::mpsc::channel::<VerifiedConn>(512);
+    // 句柄持有 watch Sender:句柄 drop → 泵的 changed() 立即返回 → 停止 accept。
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+    // 握手 child 由泵的 JoinSet 持有:完成即回收(panic/错误可观测,不悬空);
+    // 泵退出时中止全部在途 child(结果已无消费者),连同行文 socket 一并释放。
+    let pump = tokio::spawn(async move {
+        let mut handshakes = tokio::task::JoinSet::new();
         loop {
-            let (stream, remote) = match listener.accept().await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "tcp accept error");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-            };
-            let tx2 = tx.clone();
-            let tls2 = tls.clone();
-            tokio::spawn(async move {
-                match handshake(stream, tls2, ws_upgrade, multiplex).await {
-                    Ok(mux) => {
-                        let inc = Incoming {
-                            mux,
-                            remote,
-                            protocol,
-                        };
-                        let _ = tx2.send(inc).await;
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, %remote, "tcp handshake failed");
+            tokio::select! {
+                biased;
+                // 句柄已 drop(显式信号或 Sender 析构):立即停止,不等下一个连接
+                _ = shutdown_rx.changed() => break,
+                // 回收已完成的握手 child:JoinError(panic/abort)必须被观测,不得悬空
+                Some(res) = handshakes.join_next(), if !handshakes.is_empty() => {
+                    if let Err(e) = res {
+                        if e.is_panic() {
+                            tracing::error!(error = %e, "tcp handshake task panicked");
+                        } else {
+                            tracing::warn!(error = %e, "tcp handshake task aborted");
+                        }
                     }
                 }
-            });
+                res = listener.accept() => {
+                    let (stream, remote) = match res {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "tcp accept error");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
+                    let tx2 = tx.clone();
+                    let tls2 = tls.clone();
+                    let max_streams = mux_limit.load(Ordering::Relaxed);
+                    handshakes.spawn(async move {
+                        match verify(stream, tls2, ws_upgrade, multiplex).await {
+                            Ok((io, yamux)) => {
+                                let vc = VerifiedConn {
+                                    io,
+                                    remote,
+                                    protocol,
+                                    yamux,
+                                    max_streams,
+                                };
+                                // 消费者已走:send 立即失败,已验证裸 IO 随 child
+                                // 析构而关闭(此阶段不存在 mux/driver),不泄漏
+                                let _ = tx2.send(vc).await;
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, %remote, "tcp handshake failed");
+                            }
+                        }
+                    });
+                }
+            }
         }
+        // 停止接新连接后,中止并 join 收尸在途握手(取消有界:child 只在 await
+        // 点被取消,无阻塞段);ready 队列随接收端析构而消亡。
+        handshakes.abort_all();
+        while let Some(res) = handshakes.join_next().await {
+            if let Err(e) = res {
+                if e.is_panic() {
+                    tracing::error!(error = %e, "tcp handshake task panicked");
+                }
+            }
+        }
+        // listener 在此析构 → 监听端口释放
     });
-    Ok(TcpListenerShim { local, ready })
+    Ok(TcpListenerShim {
+        local,
+        ready,
+        shutdown: shutdown_tx,
+        pump: Some(pump),
+    })
 }
 
 /// 客户端:建立一条物理连接并握手。多路复用时返回 yamux mux;
@@ -166,7 +271,13 @@ pub async fn listen_stream(cfg: &ServerTransportConfig) -> io::Result<TcpListene
 pub async fn connect_stream(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>> {
     if cfg.multiplex || cfg.protocol.always_muxed() {
         let io = dial_io(cfg).await?;
-        Ok(crate::mux::wrap_stream_as_client(io, true))
+        // 客户端为开流方:超限是单流报错(不杀会话),取"不限制"即可,
+        // 真正的策略上限由服务端在 DATA_CHANNEL_HELLO 处执行
+        Ok(crate::mux::wrap_stream_as_client(
+            io,
+            true,
+            MUX_STREAMS_UNLIMITED,
+        ))
     } else {
         // 裸模式:开流即拨号
         Ok(Arc::new(Multiplexer {

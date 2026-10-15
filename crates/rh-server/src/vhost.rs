@@ -786,8 +786,10 @@ async fn serve_tcpmux(
     // 标准模式:服务端在用户连接上终结 yamux,每个入站流 = 一次独立数据通道转发
     sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
         .await?;
-    let mux =
-        rh_transport::mux::tcpmux_server_mux(rh_transport::PrependedIo::wrap(Box::new(sock), tail));
+    let mux = rh_transport::mux::tcpmux_server_mux(
+        rh_transport::PrependedIo::wrap(Box::new(sock), tail),
+        state.mux_streams.load(std::sync::atomic::Ordering::Relaxed),
+    );
     loop {
         let stream = match mux.accept().await {
             Ok(s) => s,

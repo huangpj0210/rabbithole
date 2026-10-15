@@ -803,10 +803,13 @@ impl EventRow {
     }
 }
 
-/// ProxySpec 默认值归一化。
-pub fn normalize_spec(spec: &mut ProxySpec, default_pool: u8) {
+/// ProxySpec 默认值归一化。max_pool:池深上限(0 = 不限),超出即钳制。
+pub fn normalize_spec(spec: &mut ProxySpec, default_pool: u8, max_pool: u8) {
     if spec.pool_size == 0 {
         spec.pool_size = default_pool;
+    }
+    if max_pool > 0 && spec.pool_size > max_pool {
+        spec.pool_size = max_pool;
     }
     if spec.bind_ip.is_empty() {
         spec.bind_ip = "0.0.0.0".into();
@@ -857,7 +860,7 @@ mod tests {
             xtcp: None,
             tcpmux: None,
         };
-        normalize_spec(&mut spec, 2);
+        normalize_spec(&mut spec, 2, 0);
         let id = db
             .insert_proxy("cid-1", &spec, false, "console")
             .await

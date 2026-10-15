@@ -100,6 +100,10 @@ bind_port = 2222
 auto_range = "20000-21000"
 allow_ports = ["10000-40000"]
 
+[limits]
+# 并发上限默认 0 = 不限;控制台「设置 → 并发与限流」可热改
+default_pool_size = 2
+
 [log]
 level = "info"
 EOF
@@ -120,6 +124,8 @@ Type=simple
 ExecStart=$PREFIX/bin/rh-server --config $CONF_DIR/server.toml
 Restart=on-failure
 RestartSec=3
+# 需内核 fs.nr_open >= 1000000(默认 1048576)
+LimitNOFILE=1000000
 # 数据库与证书在配置同目录:/etc/rabbithole/
 
 [Install]
