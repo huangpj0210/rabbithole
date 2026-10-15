@@ -53,18 +53,6 @@ export default defineConfig({
         }
         defaultHandler(warning);
       },
-      output: {
-        /**
-         * 拆 vendor:内嵌产物没有 CDN,拆包主要是让浏览器并行解析、
-         * 并让升级时的缓存失效面更小。recharts 只被总览页用到,单独成块。
-         */
-        manualChunks: {
-          react: ['react', 'react-dom', 'react-router'],
-          query: ['@tanstack/react-query', '@tanstack/react-table'],
-          forms: ['react-hook-form', 'zod', '@hookform/resolvers'],
-          charts: ['recharts'],
-        },
-      },
     },
   },
 });
