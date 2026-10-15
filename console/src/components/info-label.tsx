@@ -32,6 +32,8 @@ export function InfoLabel({
 }) {
   const [open, setOpen] = useState(false);
   const lastPointerTypeRef = useRef('');
+  /** 触屏:记录「本次按下之前是否已展开」——Radix 会在 pointerdown 时先行关闭。 */
+  const wasOpenAtPointerDownRef = useRef(false);
 
   const content = infoKey ? fieldInfo(infoKey) : info;
   const label = typeof title === 'string' ? title : '该项';
@@ -53,11 +55,23 @@ export function InfoLabel({
             className="-m-1.5 inline-flex shrink-0 cursor-help items-center rounded-sm p-1.5 text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
             onPointerDown={(event) => {
               lastPointerTypeRef.current = event.pointerType;
+              if (event.pointerType === 'touch') {
+                // 我的 handler 先于 Radix 执行,此刻拿到的才是「按下前」的真实状态
+                wasOpenAtPointerDownRef.current = open;
+              }
             }}
             onClick={() => {
-              if (lastPointerTypeRef.current === 'touch') {
-                setOpen((prev) => !prev);
-              }
+              if (lastPointerTypeRef.current !== 'touch') return;
+              /*
+               * Radix Tooltip 的 trigger 对 touch 的处理(见 @radix-ui/react-tooltip):
+               *   pointerdown → 若已展开则 onClose();focus → 指针按下期间跳过打开;
+               *   click       → 无条件 onClose()
+               * 也就是「点按」这条路 Radix 自己不会打开,还会把我同步设置的 open 关掉。
+               * 因此这里按「按下前的状态」取反,并延到下一个宏任务再定态 ——
+               * 此时 Radix 的同步 onClose 已经跑完,不会被覆盖。
+               */
+              const next = !wasOpenAtPointerDownRef.current;
+              window.setTimeout(() => setOpen(next), 0);
             }}
           >
             <Info className="size-3.5" aria-hidden="true" />
